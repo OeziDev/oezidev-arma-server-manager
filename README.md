@@ -39,8 +39,12 @@ Developed by OeziDev — [Discord](https://discord.gg/JNnkdBN5GP)
 
 ## Kurulum (Windows)
 
-`OeziDev-Arma-Server-Manager-Setup-1.0.0.exe` dosyasını çalıştır ya da kurulum istemiyorsan `...-portable.exe` kullan.
+[Releases](https://github.com/OeziDev/oezi-arma-server-manager/releases) sayfasından `OeziDev-Arma-Server-Manager-Setup-<sürüm>.exe` dosyasını indirip çalıştır.
 Uygulama imzalı olmadığı için Windows SmartScreen "Bilinmeyen yayıncı" uyarısı verebilir: **Ek bilgi → Yine de çalıştır**.
+
+**Otomatik güncelleme:** kurulu sürüm açılışta ve 6 saatte bir GitHub Releases'ı kontrol eder, yeni sürümü arka planda indirir ve
+"Yeniden başlat ve güncelle" der (Ayarlar → Güncellemeler). Güncelleme sırasında sadece uygulama yeniden başlar; çalışan Arma sunucuları kapanmaz.
+Portable exe otomatik güncellenmez; verilerini exe'nin yanındaki `OeziArmaManager-data` klasöründe tutar.
 
 ## İlk adımlar
 
@@ -68,6 +72,7 @@ npm test                                   # çekirdek testleri (config, RCON, S
 npm run build -w packages/app              # arayüz + ana süreç
 npm start -w packages/app                  # uygulamayı çalıştır
 npm run dist:win -w packages/app           # Windows kurulum + portable exe (Linux'ta Wine gerekir)
+git tag v1.0.2 && git push --tags          # GitHub Actions derleyip Release'e koyar; kurulu uygulamalar kendini günceller
 xvfb-run -a env E2E=1 npx vitest run packages/app/test/e2e.test.ts   # uçtan uca arayüz testi
 ```
 

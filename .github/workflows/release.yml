@@ -1,0 +1,48 @@
+name: Release
+
+# "v1.2.3" etiketi pushlanınca testleri çalıştırır, Windows kurulumunu derler ve
+# GitHub Release'e yükler. Uygulamanın otomatik güncellemesi bu Release'teki latest.yml'yi okur.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Sürüm etiketle aynı mı
+        shell: bash
+        run: |
+          v=$(node -p "require('./packages/app/package.json').version")
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "v$v" != "${GITHUB_REF_NAME}" ]; then
+            echo "packages/app/package.json sürümü ($v) etiketle ($GITHUB_REF_NAME) uyuşmuyor"; exit 1
+          fi
+      - run: npm run build -w packages/app
+      - name: Derle ve Release'e yükle
+        working-directory: packages/app
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx electron-builder --win --x64 --publish always

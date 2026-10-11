@@ -1,7 +1,7 @@
 {
   "name": "oezi-arma-manager-app",
   "productName": "OeziDev Arma Server Manager",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Arma 3 dedicated server manager by OeziDev",
   "author": "OeziDev",
   "main": "dist/main/main.cjs",
@@ -29,7 +29,7 @@
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
     "vite": "^8.3.4",
-    "@oezi/arma-core": "^1.0.0"
+    "@oezi/arma-core": "^1.0.1"
   },
   "build": {
     "appId": "dev.oezi.armamanager",
