@@ -1,4 +1,6 @@
 // Ana süreç ve preload'u tek dosyaya paketler (node_modules gerekmez).
+// electron-updater da pakete gömülür (saf JS; yerel modül yok). Dışarıda kalanlar: electron ve
+// ssh2'nin isteğe bağlı yerel hızlandırıcıları (*.node, cpu-features; yoksa ssh2 JS'e düşer).
 import { build, context } from 'esbuild';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';

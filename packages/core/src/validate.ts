@@ -1,7 +1,7 @@
 import { ConfigSyntaxError, parseExtraLines } from './config/generators.js';
-import { findDuplicateNames } from './config/armaConfig.js';
+import { findDuplicateNames, parseConfig } from './config/armaConfig.js';
 import { type ServerProfile, effectiveRconPort, usedPorts } from './model/profile.js';
-import type { HostOs } from './launch/paths.js';
+import { type HostOs, pathLib, resolvePaths } from './launch/paths.js';
 import { splitArgs } from './launch/commandLine.js';
 
 export type Severity = 'error' | 'warning' | 'info';
@@ -51,6 +51,15 @@ export function validateProfile(p: ServerProfile, os?: HostOs, others: ServerPro
   } else if (p.general.passwordAdmin.length < 10) {
     out.push(issue('adminPassword.weak', 'warning', 'Admin şifresi kısa (10 karakterden az).', 'Admin password is short (less than 10 characters).', 'general.passwordAdmin'));
   }
+  for (const [key, label] of [
+    ['allowedLoadFileExtensions', 'loadFile'],
+    ['allowedPreprocessFileExtensions', 'preprocessFile'],
+    ['allowedHTMLLoadExtensions', 'htmlLoad'],
+  ] as const) {
+    if (!p.security[key].length) {
+      out.push(issue('extensions.empty', 'warning', `${key} listesi boş: boş liste "hiçbir uzantıya izin yok" demektir; görevlerin ${label} çağrıları (ör. preprocessFile/loadFile) bütün dosyalarda başarısız olur. Varsayılan listeyi geri yükle.`, `${key} is empty: an empty list means "no extension allowed", so every mission ${label} call (e.g. preprocessFile/loadFile) fails for all files. Restore the default list.`, `security.${key}`));
+    }
+  }
   if (p.general.passwordAdmin && p.general.passwordAdmin === p.general.password) {
     out.push(issue('adminPassword.sameAsJoin', 'error', 'Admin şifresi sunucu giriş şifresiyle aynı olamaz.', 'Admin password must differ from the join password.', 'general.passwordAdmin'));
   }
@@ -99,8 +108,10 @@ export function validateProfile(p: ServerProfile, os?: HostOs, others: ServerPro
     if (!hc.allowedIps.includes(hc.connectIp)) {
       out.push(issue('headless.ipNotAllowed', 'error', `Headless client ${hc.connectIp} adresinden bağlanacak ama bu IP headlessClients[] listesinde yok.`, `Headless clients connect from ${hc.connectIp} but that IP is not in headlessClients[].`, 'headless.allowedIps'));
     }
-    if (p.general.maxPlayers + hc.count > 1024) {
-      out.push(issue('headless.slots', 'info', 'Headless client\'lar da oyuncu slotu kullanır.', 'Headless clients also use player slots.', 'headless.count'));
+    out.push(issue('headless.slots', 'info', `Headless client'lar da oyuncu slotu kullanır: maxPlayers (${p.general.maxPlayers}) oyuncu sayısı + ${hc.count} HC olacak şekilde ayarlanmalı.`, `Headless clients also use player slots: maxPlayers (${p.general.maxPlayers}) should cover your players + ${hc.count} HC.`, 'general.maxPlayers'));
+    const bind = p.network.bindIp.trim();
+    if (bind && bind !== '0.0.0.0' && !isLoopback(bind) && isLoopback(hc.connectIp)) {
+      out.push(issue('headless.bindIp', 'warning', `Sunucu sadece ${bind} adresini dinliyor (-ip) ama headless client'lar ${hc.connectIp} adresine bağlanıyor; bağlanamazlar. HC bağlantı IP'sini ${bind} yap ve headlessClients[] listesine ekle.`, `The server only listens on ${bind} (-ip) but headless clients connect to ${hc.connectIp}; they cannot connect. Set the HC connect IP to ${bind} and add it to headlessClients[].`, 'headless.connectIp'));
     }
   }
 
@@ -152,7 +163,17 @@ export function validateProfile(p: ServerProfile, os?: HostOs, others: ServerPro
       }
     } catch (err) {
       if (err instanceof ConfigSyntaxError) {
-        out.push(issue('extra.syntax', 'error', `Ek ${label} satırlarında hata: ${err.details.map((d) => `satır ${d.line}: ${d.message}`).join('; ')}`, `Error in extra ${label} lines: ${err.details.map((d) => `line ${d.line}: ${d.message}`).join('; ')}`, path));
+        out.push(issue('extra.syntax', 'error', `Ek ${label} satırlarında hata: ${err.details.map((d) => `satır ${d.line}: ${d.message}`).join('; ')}`, `Error in extra ${label} lines: ${err.details.map((d) => `line ${d.line}: ${d.messageEn ?? d.message}`).join('; ')}`, path));
+      }
+    }
+    if (text.trim()) {
+      // Ayrıştırıcı uyarıları (eksik ';', kaçırılmamış tırnak ...) ve önişlemci satırları
+      for (const w of parseConfig(text).issues.filter((i) => i.severity === 'warning')) {
+        if (w.preprocessor) {
+          out.push(issue('extra.preprocessor', 'error', `Ek ${label} satırları, satır ${w.line}: #include/#define gibi önişlemci satırları desteklenmez; üretilen dosyadan sessizce düşer. Satırı sil ya da içeriğini doğrudan yaz.`, `Extra ${label} lines, line ${w.line}: preprocessor lines such as #include/#define are not supported and would be silently dropped from the generated file. Remove the line or write its content directly.`, path));
+        } else {
+          out.push(issue('extra.parseWarning', 'warning', `Ek ${label} satırları, satır ${w.line}: ${w.message}`, `Extra ${label} lines, line ${w.line}: ${w.messageEn ?? w.message}`, path));
+        }
       }
     }
   }
@@ -183,7 +204,33 @@ export function validateProfile(p: ServerProfile, os?: HostOs, others: ServerPro
     }
   }
 
+  // Aynı makinede iki profil aynı -profiles klasörünü kullanamaz (cfg, log ve PID dosyaları çakışır).
+  if (os) {
+    const dirKey = (prof: ServerProfile): string | undefined => {
+      try {
+        const dir = pathLib(os).normalize(resolvePaths(prof, os).profilesDir).replace(/[\\/]+$/, '');
+        return os === 'windows' ? dir.toLowerCase() : dir;
+      } catch {
+        return undefined;
+      }
+    };
+    const myDir = dirKey(p);
+    if (myDir) {
+      for (const other of others) {
+        if (other.id === p.id || other.hostId !== p.hostId) continue;
+        if (dirKey(other) === myDir) {
+          out.push(issue('profilesDir.clash', 'error', `"${other.name}" ile aynı profil klasörü kullanılıyor (${myDir}); config, log ve durum dosyaları birbirinin üzerine yazılır. Farklı bir profil klasörü seç.`, `Uses the same profiles folder as "${other.name}" (${myDir}); config, log and state files would overwrite each other. Choose a different profiles folder.`, 'paths.profilesDir'));
+        }
+      }
+    }
+  }
+
   return out;
+}
+
+function isLoopback(ip: string): boolean {
+  const s = ip.trim().toLowerCase();
+  return s === 'localhost' || s === '::1' || /^127\./.test(s);
 }
 
 export function hasBlockingIssues(issues: Issue[]): boolean {

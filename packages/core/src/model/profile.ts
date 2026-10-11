@@ -61,7 +61,9 @@ const difficultyOptionsShape = Object.fromEntries(
 ) as { [K in DifficultyOptionKey]: z.ZodDefault<z.ZodNumber> };
 
 export const ServerProfileSchema = z.object({
-  schemaVersion: z.literal(1).default(1),
+  // Daha yeni bir sürümün kaydettiği profil de açılabilsin: bilinmeyen anahtarlar atılır
+  // (z.object varsayılanı), sürüm numarası 1'e çekilir. Eksik alanlar varsayılanla dolar.
+  schemaVersion: z.literal(1).default(1).catch(1),
   id: z.string().default(() => randomUUID()),
   /** Uygulamada görünen ad */
   name: z.string().min(1).default('Yeni Sunucu'),

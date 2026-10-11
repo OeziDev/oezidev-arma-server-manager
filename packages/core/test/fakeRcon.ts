@@ -6,6 +6,8 @@ export class FakeRconServer {
   readonly socket = dgram.createSocket('udp4');
   port = 0;
   loggedIn = false;
+  /** Gelen giriş paketi sayısı */
+  logins = 0;
   received: string[] = [];
   acks: number[] = [];
   messageSeq = 0;
@@ -35,6 +37,7 @@ export class FakeRconServer {
     if (!pkt) return;
     this.client = { address: rinfo.address, port: rinfo.port };
     if (pkt.type === PacketType.Login) {
+      this.logins++;
       this.loggedIn = pkt.payload.toString('utf8') === this.password;
       this.send(PacketType.Login, Buffer.from([this.loggedIn ? 1 : 0]));
       return;

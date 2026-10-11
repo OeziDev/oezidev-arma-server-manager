@@ -33,6 +33,7 @@ const AVAILABLE = await (async () => {
 
 const FAKE_ARMA = `#!/bin/bash
 echo "FAKE ARMA $*"
+[[ "$*" != *-client* ]] && echo "Host identity created."
 trap 'echo TERM; exit 0' TERM
 while true; do sleep 0.1; done
 `;

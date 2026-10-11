@@ -1,12 +1,11 @@
-import { BrowserWindow, dialog, ipcMain, shell, type IpcMainInvokeEvent } from 'electron';
+import { BrowserWindow, clipboard, dialog, ipcMain, shell, type IpcMainInvokeEvent } from 'electron';
 import fs from 'node:fs';
-import path from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { z } from 'zod';
 import { fetchCollectionItems, fetchWorkshopDetails, parseLauncherPreset } from '@oezi/arma-core';
-import type { AppSettings, HostConfig } from '../shared/api.js';
+import type { AppSettings, HostConfig, UpdateState } from '../shared/api.js';
 import { channel } from '../shared/api.js';
 import { AppServices, UserError } from './services.js';
+import { isOwnFrame } from './frameCheck.js';
 import type { Store } from './store.js';
 
 const Id = z.string().min(1).max(128);
@@ -29,11 +28,12 @@ const HostSchema = z.object({
   passphrase: z.string().max(1000).optional(),
 });
 
-const SettingsSchema = z.object({
-  language: z.enum(['tr', 'en']),
-  minimizeToTray: z.boolean(),
-  localSteamcmdPath: z.string().max(1000),
-  steamUsername: z.string().max(100),
+/** Kısmi ayar: sadece gönderilen alanlar değişir */
+const SettingsPatchSchema = z.object({
+  language: z.enum(['tr', 'en']).optional(),
+  minimizeToTray: z.boolean().optional(),
+  localSteamcmdPath: z.string().max(1000).optional(),
+  steamUsername: z.string().max(100).optional(),
   steamPassword: z.string().max(1000).optional(),
   clearSteamPassword: z.boolean().optional(),
 });
@@ -42,19 +42,39 @@ export const EXTERNAL_ALLOW = [/^https:\/\/discord\.gg\//, /^https:\/\/(www\.)?d
 
 type Handler = (...args: unknown[]) => unknown;
 
-export function registerIpc(opts: { services: AppServices; store: Store; getWindow: () => BrowserWindow | null; version: string; onSettingsChanged: (s: AppSettings) => void }) {
+export interface UpdaterApi {
+  getState(): UpdateState;
+  check(): Promise<UpdateState>;
+  install(): Promise<void>;
+}
+
+export interface IpcOptions {
+  services: AppServices;
+  store: Store;
+  getWindow: () => BrowserWindow | null;
+  version: string;
+  /** Uygulama sayfasının mutlak yolu (loadURL ile yüklenen dosya) */
+  indexHtml: string;
+  /** Sadece paketlenmemiş (geliştirme) sürümde: Vite geliştirme sunucusu adresi */
+  devUrl: string | null;
+  updater: UpdaterApi;
+  setDirty: (dirty: boolean) => void;
+}
+
+export function registerIpc(opts: IpcOptions) {
   const { services: s, store } = opts;
   const picked = new Set<string>();
-  const appPageUrl = pathToFileURL(path.join(__dirname, '..', 'renderer', 'index.html')).href;
 
   const handle = (area: string, method: string, fn: Handler) => {
     ipcMain.handle(channel(area, method), async (event: IpcMainInvokeEvent, ...args: unknown[]) => {
       const win = opts.getWindow();
-      // Sadece uygulamanın kendi sayfası çağırabilir (sürüklenen bir html dosyası değil)
-      const frameUrl = event.senderFrame?.url ?? '';
-      const dev = process.env.VITE_DEV_SERVER_URL;
-      const own = frameUrl.startsWith(appPageUrl) || (!!dev && frameUrl.startsWith(dev));
-      if (!win || event.sender !== win.webContents || !own) return { ok: false, error: 'Yetkisiz istek' };
+      // Sadece uygulamanın kendi sayfası (ana çerçeve) çağırabilir (sürüklenen bir html dosyası / iframe değil)
+      const frame = event.senderFrame;
+      const main = win && !win.isDestroyed() ? win.webContents.mainFrame : null;
+      const sameFrame = !!frame && !!main && (frame === main || (frame.processId === main.processId && frame.frameToken === main.frameToken));
+      if (!win || event.sender !== win.webContents || !sameFrame || !isOwnFrame(frame!.url, opts.indexHtml, opts.devUrl)) {
+        return { ok: false, error: 'Yetkisiz istek' };
+      }
       try {
         return { ok: true, value: await fn(...args) };
       } catch (err) {
@@ -73,13 +93,21 @@ export function registerIpc(opts: { services: AppServices; store: Store; getWind
     platform: process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'mac' : 'linux',
     insecureSecrets: store.insecureSecrets,
     dataDir: store.dir,
+    // Sözleşme dışı ek bilgi: şifre dosyası okunamadı (kopyası alındı, yeni şifre girilene kadar korunuyor)
+    secretsUnreadable: store.secretsUnreadable,
   }));
   handle('app', 'getSettings', () => store.getSettings());
-  handle('app', 'saveSettings', (raw) => {
-    const saved = store.saveSettings(SettingsSchema.parse(raw) as AppSettings);
-    opts.onSettingsChanged(saved);
-    return saved;
+  // Store kaydettikten sonra settings-changed olayını kendisi gönderir
+  handle('app', 'saveSettings', (raw) => store.saveSettings(SettingsPatchSchema.parse(raw ?? {}) as Partial<AppSettings>));
+  handle('app', 'copyText', (text) => {
+    clipboard.writeText(Text.parse(text));
   });
+  handle('app', 'setDirty', (dirty) => {
+    opts.setDirty(z.boolean().parse(dirty));
+  });
+  handle('app', 'updateState', () => opts.updater.getState());
+  handle('app', 'checkForUpdates', () => opts.updater.check());
+  handle('app', 'installUpdate', () => opts.updater.install());
   handle('app', 'openExternal', async (raw) => {
     const url = z.string().url().parse(raw);
     if (!EXTERNAL_ALLOW.some((re) => re.test(url))) throw new UserError('Bu bağlantı açılamaz');
@@ -135,10 +163,10 @@ export function registerIpc(opts: { services: AppServices; store: Store; getWind
   handle('profiles', 'importJson', (text) => s.importJson(Text.parse(text)));
 
   /* server */
-  handle('server', 'start', (id) => s.manager(Id.parse(id)).start());
-  handle('server', 'stop', (id) => s.manager(Id.parse(id)).stop());
-  handle('server', 'restart', (id, update) => s.manager(Id.parse(id)).restart({ update: !!update, reason: 'Elle yeniden başlatma' }));
-  handle('server', 'deploy', (id) => s.manager(Id.parse(id)).deploy());
+  handle('server', 'start', (id) => s.startServer(Id.parse(id)));
+  handle('server', 'stop', (id) => s.stopServer(Id.parse(id)));
+  handle('server', 'restart', (id, update) => s.restartServer(Id.parse(id), !!update));
+  handle('server', 'deploy', (id) => s.deployServer(Id.parse(id)));
   handle('server', 'status', (id) => s.manager(Id.parse(id)).getStatus());
   handle('server', 'logs', (id) => s.manager(Id.parse(id)).getLogBuffer());
 
@@ -173,7 +201,6 @@ export function registerIpc(opts: { services: AppServices; store: Store; getWind
   const Ids = z.array(z.string().regex(/^\d+$/)).max(500);
   handle('steam', 'updateServer', (id) => s.updateServerJob(Id.parse(id)));
   handle('steam', 'syncWorkshop', (id, ids) => s.syncWorkshopJob(Id.parse(id), ids === undefined ? undefined : Ids.parse(ids)));
-  handle('steam', 'removeWorkshopMod', (id, folder) => s.removeWorkshopMod(Id.parse(id), z.string().regex(/^@[^/\\]+$/).parse(folder)));
   handle('steam', 'workshopInfo', (ids) => fetchWorkshopDetails(Ids.parse(ids)));
   handle('steam', 'collection', (cid) => fetchCollectionItems(z.string().regex(/^\d+$/).parse(cid)));
   handle('steam', 'parsePreset', (html) => parseLauncherPreset(Text.parse(html)));

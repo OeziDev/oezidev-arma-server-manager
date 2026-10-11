@@ -131,9 +131,13 @@ export function buildHeadlessLaunch(profile: ServerProfile, os: HostOs, index: n
 /* Gösterim / dışa aktarma biçimleri                                   */
 /* ------------------------------------------------------------------ */
 
-/** Windows komut satırı kuralı (CommandLineToArgvW uyumlu) ile tek argümanı tırnakla. */
+/**
+ * Windows komut satırı kuralı (CommandLineToArgvW uyumlu) ile tek argümanı tırnakla.
+ * cmd.exe'nin özel karakterleri (& | < > ^) de tırnaklanır: gösterilen satır .bat dosyasına kopyalanınca bozulmasın.
+ * ";" ayırıcı değildir (-mod=@a;@b tırnaksız kalabilir), Türkçe karakterler olduğu gibi geçer.
+ */
 export function quoteWindowsArg(arg: string): string {
-  if (arg !== '' && !/[\s"]/.test(arg)) return arg;
+  if (arg !== '' && !/[\s"&|<>^]/.test(arg)) return arg;
   let out = '"';
   let backslashes = 0;
   for (const ch of arg) {

@@ -8,7 +8,7 @@ import { type ServerProfile, effectiveRconPort } from '../model/profile.js';
 import type { Notifier, NotifyEvent } from '../notify/discord.js';
 import { BattlEyeRcon, type RconPlayer, type RconState } from '../rcon/battleye.js';
 import { type Issue, hasBlockingIssues, validateProfile } from '../validate.js';
-import { dueWarning, formatWarning, nextOccurrence } from './scheduler.js';
+import { formatWarning, nextOccurrence, planWarning } from './scheduler.js';
 
 export type ServerStatus = 'stopped' | 'starting' | 'running' | 'stopping' | 'restarting' | 'crashed' | 'updating';
 export type ManagerMode = 'direct' | 'systemd';
@@ -67,11 +67,15 @@ export interface ManagerOptions {
   timers?: Partial<{
     monitorMs: number;
     schedulerMs: number;
+    /** RCON ve log yoksa (hazır olduğu anlaşılamıyorsa) bu süre sonra "çalışıyor" sayılır */
     runningAfterMs: number;
     rconDelayMs: number;
     playersMs: number;
     stopTimeoutMs: number;
+    /** Kullanılmıyor (eski ayar; .rpt dosyası artık süresiz aranır) */
     rptWaitMs: number;
+    /** Windows: yeni .rpt dosyası için klasörün yeniden listelenme aralığı */
+    rptPollMs: number;
     /** Ölü sayılmadan önce art arda kaç "yok" okuması gerekir */
     deadConfirmations: number;
   }>;
@@ -83,8 +87,26 @@ interface DirectState {
   executable: string;
   /** Komut satırında aranacak işaret (aynı exe ile çalışan diğer sunuculardan ayırmak için) */
   marker?: string;
-  headless: { index: number; pid: number }[];
+  /** marker: başlatıldığı andaki işaret (profil yolları sonradan değişse de doğru süreç kapatılsın) */
+  headless: { index: number; pid: number; marker?: string }[];
 }
+
+/** Sunucu başlatılırken kullanılan RCON ayarları (BattlEye bunları bir sonraki başlatmaya kadar kullanır) */
+interface RconSnapshot {
+  enabled: boolean;
+  host: string;
+  port: number;
+  password: string;
+}
+
+interface ReadyNotify {
+  event: NotifyEvent;
+  title: string;
+  description: string;
+}
+
+type CrashKind = 'exit' | 'fatal' | 'timeout';
+type TailKind = 'new' | 'attach' | 'resume';
 
 export class ValidationFailedError extends Error {
   constructor(readonly issues: Issue[]) {
@@ -93,9 +115,35 @@ export class ValidationFailedError extends Error {
   }
 }
 
+/** Süreç durumu sorgulanamadı: kapatıldığından emin olunamadı */
+class ProcessQueryError extends Error {
+  constructor(
+    readonly pid: number,
+    cause: unknown,
+  ) {
+    super(`PID ${pid} sorgulanamadı: ${(cause as Error)?.message ?? String(cause)}`);
+    this.name = 'ProcessQueryError';
+  }
+}
+
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const MAX_LOG = 3000;
 const HC_MAX_RESTARTS_PER_HOUR = 6;
+/** Sunucunun oyunculara hazır olduğunu gösteren log satırları */
+const READY_RES = [/Host identity created/i, /BattlEye Server: Initialized/i];
+/**
+ * Sunucunun ölümcül hata verdiğini gösteren satırlar. Windows'ta Arma bu durumda bir mesaj kutusu
+ * açar ve süreç arkada açık kalır; bu yüzden süreç "yaşıyor" diye çalışıyor sanılmamalı.
+ * Örn. "File C:\...\server.cfg, line 107: .regularCheck: Member already defined."
+ */
+const FATAL_RES = [/\bErrorMessage:/, /^\s*(?:\d+:\d+:\d+(?:\.\d+)?\s+)?File .+, line \d+: /];
+/** journald zamanı VPS saatine göre karşılaştırır; uzak saat bilinmiyorsa bu kadar geriden başla */
+const JOURNAL_MARGIN_SEC = 120;
+
+const fmtTime = (ms: number) => {
+  const d = new Date(ms);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+};
 
 export class ServerManager extends EventEmitter<ManagerEvents> {
   private profile: ServerProfile;
@@ -114,6 +162,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
   private monitorTimer: NodeJS.Timeout | null = null;
   private schedulerTimer: NodeJS.Timeout | null = null;
   private runningTimer: NodeJS.Timeout | null = null;
+  private startTimeoutTimer: NodeJS.Timeout | null = null;
   private rconTimer: NodeJS.Timeout | null = null;
   private playersTimer: NodeJS.Timeout | null = null;
   private tails: TailHandle[] = [];
@@ -128,10 +177,30 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
   private lastLoggedError = { text: '', at: 0 };
   private scheduledFor: number | null = null;
   private warningsSent = new Set<number>();
+  private scheduleNote: { at: number; what: string } | null = null;
   private playerCount = 0;
   private attached = false;
   rcon: BattlEyeRcon | null = null;
   private disposed = false;
+  /** stop/start/restart/dispose ile artar: süren çökme işlemi kullanıcının isteğini ezmesin */
+  private opGen = 0;
+  /** Her başlatma/durdurmada artar: eski çalıştırmanın HC zamanlayıcıları/başlatmaları geçersiz olur */
+  private runId = 0;
+  /** "starting" durumunda hazır olma sinyali (RCON girişi / log satırı) bekleniyor */
+  private awaitingReady = false;
+  private readyNotify: ReadyNotify | null = null;
+  /** Çökme işlemi sürüyor (izleme bu sırada müdahale etmez) */
+  private crashToken: object | null = null;
+  /** Bu çalıştırmada görülen ölümcül hata (otomatik restart yapılmaz) */
+  private fatalDetail: string | null = null;
+  /** Süreç kapandıktan hemen sonra gelen hata satırları da yakalansın */
+  private lateFatalUntil = 0;
+  private recentServerLines: string[] = [];
+  /** Durdurma doğrulanamadı: süreç kapandığında "durdu" say (çökme sayma) */
+  private stopPending = false;
+  private rconCfg: RconSnapshot | null = null;
+  /** Windows: başlatmadan önce klasörlerde var olan .rpt dosyaları (eski çalıştırmanın logu izlenmesin) */
+  private rptSnapshot = new Map<string, Set<string>>();
 
   constructor(private readonly opts: ManagerOptions) {
     super();
@@ -146,6 +215,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       playersMs: 15000,
       stopTimeoutMs: 15000,
       rptWaitMs: 120000,
+      rptPollMs: 2000,
       deadConfirmations: 2,
       ...opts.timers,
     };
@@ -180,16 +250,51 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     return this.profile;
   }
 
+  private rconSnapshotFrom(p: ServerProfile): RconSnapshot {
+    return {
+      enabled: p.rcon.enabled && p.security.battlEye && !!p.rcon.password,
+      host: p.rcon.connectHost || this.opts.defaultRconHost || '127.0.0.1',
+      port: effectiveRconPort(p),
+      password: p.rcon.password,
+    };
+  }
+
+  /** Sunucu süreci var (ya da olması bekleniyor) */
+  private isActive(): boolean {
+    return this.status !== 'stopped' && this.status !== 'crashed';
+  }
+
   /** Yeni ayarlar bir sonraki başlatmada uygulanır; zamanlayıcı hemen güncellenir. */
   updateProfile(p: ServerProfile) {
-    const rconChanged =
-      p.rcon.password !== this.profile.rcon.password || effectiveRconPort(p) !== effectiveRconPort(this.profile) || p.rcon.connectHost !== this.profile.rcon.connectHost;
+    const prev = this.profile;
     this.profile = p;
-    this.scheduledFor = null;
-    this.warningsSent.clear();
-    if (rconChanged && this.rcon) {
-      this.stopRcon();
-      if (this.status === 'running') this.startRcon(0);
+    // Uyarı kayıtları sadece restart saatleri değişince sıfırlanır (her kaydetmede aynı uyarı tekrar gitmesin)
+    if (JSON.stringify(prev.supervisor.scheduledRestarts) !== JSON.stringify(p.supervisor.scheduledRestarts)) {
+      this.scheduledFor = null;
+      this.warningsSent.clear();
+      this.refreshSchedule(new Date());
+    }
+    const before = this.rconSnapshotFrom(prev);
+    const after = this.rconSnapshotFrom(p);
+    // Sunucu çalışmıyorsa bir sonraki başlatma yeni ayarları alır
+    if (!this.isActive()) this.rconCfg = null;
+    else if (this.rconCfg) {
+      // BattlEye şifre/port/açık-kapalı ayarını sadece başlarken okur: çalışırken eskisiyle devam et
+      if (before.password !== after.password || before.port !== after.port || before.enabled !== after.enabled) {
+        this.notice(
+          'info',
+          'RCON ayarları sunucu yeniden başlatılınca geçerli olur; o zamana kadar eski ayarlar kullanılıyor.',
+          'RCON settings take effect after the server is restarted; the old settings stay in use until then.',
+        );
+      }
+      // Bağlanılacak adres sadece uygulamayı ilgilendirir: hemen uygula
+      if (after.host !== this.rconCfg.host) {
+        this.rconCfg = { ...this.rconCfg, host: after.host };
+        if (this.rcon) {
+          this.stopRcon();
+          this.startRcon(0);
+        }
+      }
     }
     this.emitStatus();
   }
@@ -218,10 +323,16 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
   private setStatus(s: ServerStatus) {
     if (this.status === s) return;
     this.status = s;
+    // "starting" dışına çıkınca hazır olma beklemesi biter
+    if (s !== 'starting') {
+      this.clearReadiness();
+      this.readyNotify = null;
+    }
     this.emitStatus();
   }
 
   private emitStatus() {
+    if (this.disposed) return;
     this.emit('status', this.getStatus());
   }
 
@@ -243,6 +354,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     this.logBuffer.push(...items);
     if (this.logBuffer.length > MAX_LOG) this.logBuffer.splice(0, this.logBuffer.length - MAX_LOG);
     this.emit('log', items);
+    if (source === 'server') this.inspectServerLines(lines);
   }
 
   private notice(level: Notice['level'], tr: string, en: string) {
@@ -250,7 +362,8 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     this.appLog(`[${level}] ${tr}`);
   }
 
-  private async notify(event: NotifyEvent, title: string, description = '') {
+  /** Discord bildirimi: başlat/durdur akışını asla bekletmez (ateşle ve unut). */
+  private notify(event: NotifyEvent, title: string, description = ''): void {
     const n = this.opts.notifier;
     const prefs = this.profile.notifications;
     const allowed =
@@ -260,27 +373,44 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       (event === 'update' && prefs.onUpdate) ||
       event === 'info';
     if (!n || !allowed) return;
+    let p: Promise<void>;
     try {
-      await n.notify(event, title, description);
+      p = n.notify(event, title, description);
     } catch (err) {
-      this.appLog(`Discord bildirimi gönderilemedi: ${(err as Error).message}`);
+      p = Promise.reject(err);
     }
+    void Promise.resolve(p).catch((err) => this.appLog(`Discord bildirimi gönderilemedi: ${(err as Error)?.message ?? err}`));
   }
 
   /** Aynı anda tek işlem (başlat/durdur/restart) */
   private exclusive(fn: () => Promise<void>): Promise<void> {
     if (this.busy) return Promise.reject(new Error('Sunucu şu an başka bir işlem yapıyor, lütfen bekle'));
     const p = fn().finally(() => {
-      this.busy = null;
+      if (this.busy === p) this.busy = null;
     });
     this.busy = p;
     return p;
+  }
+
+  /** stop()/start()/dispose() bu işlemden sonra çağrıldıysa devam etme */
+  private cancelled(gen: number): boolean {
+    return this.disposed || gen !== this.opGen;
   }
 
   /* ---------------- dağıtım ---------------- */
 
   validate(): Issue[] {
     return validateProfile(this.profile, this.host.os, this.opts.otherProfiles?.() ?? []);
+  }
+
+  /** Şifre içeren dosyalar: Linux'ta sadece sahibi okuyabilsin (host destekliyorsa) */
+  private async writeSecret(file: string, content: string) {
+    // Servis başka bir kullanıcıyla çalışıyorsa (User=) dosyayı okuyamaz hale getirme
+    if (this.host.os === 'linux' && !this.opts.serviceUser) {
+      await this.host.writeFile(file, content, { mode: 0o600 });
+      return;
+    }
+    await this.host.writeFile(file, content);
   }
 
   /** Config dosyalarını (ve gerekirse systemd servislerini) sunucuya yazar. */
@@ -290,11 +420,12 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     const rp = this.paths;
     const L = pathLib(this.host.os);
     const written: string[] = [];
-    const write = async (file: string, content: string) => {
-      await this.host.writeFile(file, content);
+    const write = async (file: string, content: string, secret = false) => {
+      if (secret) await this.writeSecret(file, content);
+      else await this.host.writeFile(file, content);
       written.push(file);
     };
-    await write(rp.serverCfg, generateServerCfg(p));
+    await write(rp.serverCfg, generateServerCfg(p), true);
     await write(rp.basicCfg, generateBasicCfg(p));
     const profileText = generateArma3Profile(p);
     for (const file of rp.arma3Profiles) await write(file, profileText);
@@ -304,7 +435,8 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       for (const e of await this.host.list(rp.beDir).catch(() => [])) {
         if (/^beserver(_x64)?_active_.*\.cfg$/i.test(e.name)) await this.host.remove(L.join(rp.beDir, e.name)).catch(() => undefined);
       }
-      await write(rp.beCfg, generateBeServerCfg(p));
+      await write(rp.beCfg, generateBeServerCfg(p), true);
+      await this.copyBattlEyeLibrary(rp).catch((err) => this.appLog(`BattlEye kütüphanesi kopyalanamadı: ${(err as Error).message}`));
     }
     for (let i = 1; i <= p.headless.count; i++) await this.host.mkdirp(rp.headlessProfilesDir(i));
 
@@ -362,47 +494,87 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     return written;
   }
 
+  /**
+   * -bepath ile verilen klasörde sadece cfg olursa BattlEye kütüphanesini bulamayabilir:
+   * sunucu klasöründeki BEServer_x64.dll / beserver_x64.so'yu oraya kopyala (değiştiyse).
+   */
+  private async copyBattlEyeLibrary(rp: ResolvedPaths) {
+    const L = pathLib(this.host.os);
+    const base = L.basename(rp.beCfg).replace(/\.cfg$/i, '').toLowerCase();
+    const want = `${base}.${this.host.os === 'windows' ? 'dll' : 'so'}`;
+    const srcDirEntry = (await this.host.list(rp.serverDir)).find((e) => e.isDir && /^battleye$/i.test(e.name));
+    if (!srcDirEntry) return;
+    const srcDir = L.join(rp.serverDir, srcDirEntry.name);
+    const norm = (x: string) => (this.host.os === 'windows' ? x.toLowerCase() : x).replace(/[\\/]+$/, '');
+    if (norm(srcDir) === norm(rp.beDir)) return;
+    const src = (await this.host.list(srcDir)).find((e) => !e.isDir && e.name.toLowerCase() === want);
+    if (!src) return;
+    const dest = L.join(rp.beDir, src.name);
+    const st = await this.host.stat(dest).catch(() => null);
+    if (st && !st.isDir && st.size === src.size && st.mtimeMs >= src.mtimeMs) return;
+    await this.host.copyFile(L.join(srcDir, src.name), dest);
+    this.appLog(`BattlEye kütüphanesi kopyalandı: ${dest}`);
+  }
+
   /* ---------------- başlat / durdur ---------------- */
 
   start(): Promise<void> {
     return this.exclusive(async () => {
+      this.opGen++;
       // Uygulama açılışında makineye ulaşılamadıysa, önce çalışan bir sunucu var mı bak (çift başlatma olmasın)
       if (!this.attached) {
         await this.attachInner();
+        if (this.disposed) return;
         if (this.status === 'running' || this.status === 'starting') return;
       }
-      await this.doStart();
+      await this.doStart({ event: 'start', title: 'Sunucu başlatıldı', description: '' });
     });
   }
 
   stop(): Promise<void> {
     return this.exclusive(async () => {
+      this.opGen++;
       if (!this.attached) await this.attachInner().catch(() => undefined);
+      if (this.disposed) return;
       await this.doStop('manual');
     });
   }
 
   restart(opts: { update?: boolean; reason?: string } = {}): Promise<void> {
     return this.exclusive(async () => {
+      this.opGen++;
+      // Önce makineye ulaşılabildiğini doğrula: #shutdown gidip sonra systemctl/deploy başarısız olursa sunucu kapalı kalır
+      try {
+        await this.host.connect();
+        await this.isServerAlive();
+      } catch (err) {
+        const msg = (err as Error).message;
+        this.notice('error', `Yeniden başlatma iptal edildi: makineye ulaşılamıyor (${msg})`, `Restart aborted: the machine is unreachable (${msg})`);
+        throw err;
+      }
+      if (this.disposed) return;
       this.setStatus('restarting');
       await this.doStop(opts.reason ?? 'restart', true);
+      if (this.disposed) return;
       if (opts.update && this.opts.updater) {
         this.setStatus('updating');
         try {
           await this.opts.updater(this.profile, (l) => this.appLog(l));
-          await this.notify('update', 'Güncellendi', 'Sunucu ve modlar güncellendi.');
+          this.notify('update', 'Güncellendi', 'Sunucu ve modlar güncellendi.');
         } catch (err) {
           // Güncelleme başarısız olsa bile sunucu kapalı kalmasın
           this.notice('error', `Güncelleme başarısız, sunucu güncellenmeden başlatılıyor: ${(err as Error).message}`, `Update failed, starting without update: ${(err as Error).message}`);
         }
+        if (this.disposed) return;
       }
-      await this.doStart(true);
-      await this.notify('restart', 'Yeniden başlatıldı', opts.reason ?? '');
+      await this.doStart({ event: 'restart', title: 'Yeniden başlatıldı', description: opts.reason ?? '' });
     });
   }
 
-  private async doStart(silent = false): Promise<void> {
+  /** readyNotify: sunucu hazır olunca gönderilecek Discord bildirimi (otomatik restartta yok) */
+  private async doStart(readyNotify: ReadyNotify | null): Promise<void> {
     if (this.status === 'running' || this.status === 'starting') return;
+    this.clearHcTimers();
     this.lastError = undefined;
     const issues = this.validate();
     if (hasBlockingIssues(issues)) {
@@ -410,28 +582,34 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       this.setStatus('stopped');
       throw new ValidationFailedError(issues);
     }
+    this.runId++;
+    this.fatalDetail = null;
+    this.lateFatalUntil = 0;
+    this.recentServerLines = [];
+    this.stopPending = false;
+    this.rconCfg = this.rconSnapshotFrom(this.profile);
     this.setStatus('starting');
     this.deadStreak = 0;
     try {
       await this.deploy();
+      if (this.disposed) return;
       const rp = this.paths;
       if (this.mode === 'systemd') {
         const sd = this.host.systemd!;
         await sd.action('reset-failed', this.unitName, ...this.hcUnits).catch(() => undefined);
+        if (this.disposed) return;
         await sd.action('start', this.unitName);
-        // Sunucu VPS yeniden başlarsa da açılsın
-        await sd.action('enable', this.unitName).catch((err) => this.appLog(`systemctl enable: ${(err as Error).message}`));
-        if (this.hcUnits.length) {
-          // HC'ler ExecStartPre ile bekler: kuyruğa al, bekleme
-          await sd.startNoBlock(...this.hcUnits).catch((err) =>
-            this.notice('warning', `Headless client'lar başlatılamadı: ${(err as Error).message}`, `Headless clients failed to start: ${(err as Error).message}`),
-          );
-        }
+        if (this.disposed) return;
+        // Sunucu VPS yeniden başlarsa da açılsın (headless client'lar dahil)
+        await sd.action('enable', this.unitName, ...this.hcUnits).catch((err) => this.appLog(`systemctl enable: ${(err as Error).message}`));
         const st = await sd.status(this.unitName);
+        if (this.disposed) return;
         this.systemdRestarts = st.restarts;
         this.startedAt = st.startedAt || Date.now();
       } else {
         await this.rotateLogs();
+        await this.snapshotRpts();
+        if (this.disposed) return;
         const spec = buildServerLaunch(this.profile, this.host.os, rp);
         spec.warnings.forEach((w) => this.appLog(w));
         this.appLog(`Başlatılıyor: ${spec.executable} ${spec.args.map((a) => (/^-password=/i.test(a) ? '-password=***' : a)).join(' ')}`);
@@ -443,16 +621,14 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
         this.startedAt = Date.now();
         this.direct = { pid, startedAt: this.startedAt, executable: spec.executable, marker: this.markerFor(), headless: [] };
         await this.saveState();
-        this.scheduleHeadless();
+        if (this.disposed) return;
       }
       this.attached = true;
-      this.startTails(false);
+      this.readyNotify = readyNotify;
+      this.startTails('new');
       this.startMonitor();
-      this.runningTimer = setTimeout(() => {
-        if (this.status === 'starting') this.setStatus('running');
-      }, this.t.runningAfterMs);
       this.startRcon(this.t.rconDelayMs);
-      if (!silent) await this.notify('start', 'Sunucu başlatıldı');
+      this.armReadiness();
     } catch (err) {
       this.lastError = (err as Error).message;
       this.setStatus('stopped');
@@ -470,17 +646,162 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     }
   }
 
-  private scheduleHeadless() {
+  /** Windows: başlatmadan önce var olan .rpt dosyalarını not et; sadece yeni oluşan izlensin. */
+  private async snapshotRpts() {
+    this.rptSnapshot.clear();
+    if (this.host.os !== 'windows') return;
+    const rp = this.paths;
+    const dirs = [rp.rptDir, ...Array.from({ length: this.profile.headless.count }, (_, i) => rp.headlessProfilesDir(i + 1))];
+    for (const dir of dirs) {
+      const entries = await this.host.list(dir).catch(() => []);
+      this.rptSnapshot.set(dir, new Set(entries.filter((e) => !e.isDir && /\.rpt$/i.test(e.name)).map((e) => e.name)));
+    }
+  }
+
+  /* ---------------- hazır olma / ölümcül hata ---------------- */
+
+  /**
+   * "starting" → "running" geçişi: RCON girişi başarılı olunca ya da sunucu logunda
+   * "Host identity created" / "BattlEye Server: Initialized" görülünce. RCON ve log yoksa eski
+   * sabit süre kullanılır. startTimeoutSec içinde hazır olmazsa başlatma başarısız sayılır.
+   */
+  private armReadiness() {
+    if (this.disposed) return;
+    this.clearReadiness();
+    if (this.status !== 'starting') return;
+    this.awaitingReady = true;
+    const rc = this.rconCfg ?? this.rconSnapshotFrom(this.profile);
+    const logAvailable = !this.profile.launch.noLogs;
+    if (!rc.enabled && !logAvailable) {
+      this.runningTimer = setTimeout(() => this.markReady('süre doldu; RCON ve log yok'), this.t.runningAfterMs);
+    }
+    const sec = this.profile.supervisor.startTimeoutSec ?? 300;
+    if (sec > 0) {
+      const runId = this.runId;
+      this.startTimeoutTimer = setTimeout(() => void this.onStartTimeout(sec, runId), sec * 1000);
+    }
+  }
+
+  private clearReadiness() {
+    this.awaitingReady = false;
+    if (this.runningTimer) clearTimeout(this.runningTimer);
+    if (this.startTimeoutTimer) clearTimeout(this.startTimeoutTimer);
+    this.runningTimer = null;
+    this.startTimeoutTimer = null;
+  }
+
+  private markReady(source: string) {
+    if (!this.awaitingReady || this.status !== 'starting' || this.fatalDetail || this.crashToken || this.disposed) return;
+    const n = this.readyNotify;
+    const runId = this.runId;
+    this.setStatus('running');
+    this.appLog(`Sunucu hazır (${source})`);
+    if (n) this.notify(n.event, n.title, n.description);
+    this.startHeadlessClients(runId);
+  }
+
+  private inspectServerLines(lines: string[]) {
+    for (const line of lines) {
+      const prev = this.recentServerLines.filter((l) => l.trim()).slice(-2);
+      this.recentServerLines.push(line);
+      if (this.recentServerLines.length > 6) this.recentServerLines.splice(0, this.recentServerLines.length - 6);
+      if (FATAL_RES.some((re) => re.test(line))) {
+        this.onFatal([...prev, line].join('\n'));
+        continue;
+      }
+      if (this.awaitingReady && READY_RES.some((re) => re.test(line))) this.markReady('log');
+    }
+  }
+
+  private onFatal(detail: string) {
+    if (this.disposed) return;
+    if (this.status === 'starting' || this.status === 'running') {
+      if (this.fatalDetail) return;
+      this.fatalDetail = detail;
+      void this.handleCrash('fatal', detail);
+      return;
+    }
+    // Süreç kendi kapandı (Linux) ve izleme bunu hata satırından önce gördü
+    if ((this.status === 'stopped' || this.status === 'crashed') && Date.now() < this.lateFatalUntil && !this.crashToken) {
+      this.lateFatalUntil = 0;
+      this.fatalDetail = detail;
+      this.lastError = detail;
+      this.notice('error', `Sunucu hata vererek kapandı: ${detail}`, `Server exited with a fatal error: ${detail}`);
+      this.notify('crash', 'Sunucu hata verdi', detail);
+      this.setStatus('crashed');
+      this.emitStatus();
+    }
+  }
+
+  private async onStartTimeout(sec: number, runId: number) {
+    this.startTimeoutTimer = null;
+    if (this.disposed || runId !== this.runId || !this.awaitingReady || this.status !== 'starting' || this.crashToken) return;
+    let alive: boolean;
+    try {
+      alive = await this.isServerAlive();
+    } catch {
+      // Sorgulanamadı: biraz sonra tekrar dene
+      if (runId === this.runId && this.awaitingReady && !this.disposed) {
+        this.startTimeoutTimer = setTimeout(() => void this.onStartTimeout(sec, runId), 10_000);
+      }
+      return;
+    }
+    // Süreç yoksa izleme (çökme) halleder
+    if (!alive || runId !== this.runId || !this.awaitingReady || this.status !== 'starting' || this.disposed) return;
+    const last = [...this.recentServerLines].reverse().find((l) => l.trim());
+    const tr = `Sunucu ${sec} sn içinde hazır olmadı${last ? `\n${last}` : ''}`;
+    const en = `Server was not ready within ${sec} s${last ? `\n${last}` : ''}`;
+    await this.handleCrash('timeout', tr, en);
+  }
+
+  /* ---------------- headless client'lar ---------------- */
+
+  private clearHcTimers() {
+    this.hcTimers.forEach(clearTimeout);
+    this.hcTimers = [];
+  }
+
+  /** Sunucu hazır olduktan sonra headless client'ları başlat */
+  private startHeadlessClients(runId: number) {
+    if (this.disposed || this.profile.headless.count <= 0) return;
+    if (this.mode === 'direct') {
+      this.scheduleHeadless(runId);
+      return;
+    }
+    // systemd: HC'ler ExecStartPre ile bekler; kuyruğa al, bekleme
+    void this.host
+      .systemd!.startNoBlock(...this.hcUnits)
+      .catch((err) =>
+        this.notice('warning', `Headless client'lar başlatılamadı: ${(err as Error).message}`, `Headless clients failed to start: ${(err as Error).message}`),
+      );
+  }
+
+  private scheduleHeadless(runId: number) {
     const p = this.profile;
-    if (this.mode !== 'direct' || p.headless.count <= 0) return;
+    if (this.disposed || this.mode !== 'direct' || p.headless.count <= 0) return;
     const t = setTimeout(() => {
-      for (let i = 1; i <= p.headless.count; i++) void this.startHeadless(i);
+      this.hcTimers = this.hcTimers.filter((x) => x !== t);
+      if (runId !== this.runId || this.disposed) return;
+      for (let i = 1; i <= p.headless.count; i++) void this.startHeadless(i, runId);
     }, p.headless.startDelaySec * 1000);
     this.hcTimers.push(t);
   }
 
-  private async startHeadless(index: number) {
-    if (!this.direct || (this.status !== 'running' && this.status !== 'starting')) return;
+  private async startHeadless(index: number, runId: number) {
+    const d = this.direct;
+    if (this.disposed || !d || runId !== this.runId || (this.status !== 'running' && this.status !== 'starting')) return;
+    const marker = this.markerFor(index);
+    // Aynı indeksteki eski HC hâlâ çalışıyorsa önce kapat (çift HC olmasın)
+    const old = d.headless.find((h) => h.index === index);
+    if (old) {
+      try {
+        await this.killAndWait(old.pid, old.marker ?? marker, d.executable);
+      } catch (err) {
+        this.appLog(`Headless client ${index}: eski süreç doğrulanamadı, yenisi başlatılmadı (${(err as Error).message})`);
+        return;
+      }
+      if (this.disposed || runId !== this.runId || this.direct !== d) return;
+    }
     const rp = this.paths;
     const spec = buildHeadlessLaunch(this.profile, this.host.os, index, rp);
     try {
@@ -489,9 +810,15 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
         logFile: rp.headlessStdoutLog(index),
         showWindow: false,
       });
-      this.direct.headless = this.direct.headless.filter((h) => h.index !== index).concat({ index, pid });
+      if (runId !== this.runId || this.direct !== d) {
+        // Bu arada sunucu çöktü/durdu: yeni HC sahipsiz kalmasın
+        await this.host.killProcess(pid, { force: true }).catch(() => undefined);
+        return;
+      }
+      d.headless = d.headless.filter((h) => h.index !== index).concat({ index, pid, marker });
+      // Önce kaydet (uygulama kapanırsa HC sahipsiz kalmasın), sonra bildir
+      await this.saveState().catch((err) => this.appLog(`Durum dosyası yazılamadı: ${(err as Error).message}`));
       this.hcAlive.set(index, true);
-      await this.saveState();
       this.appLog(`Headless client ${index} başlatıldı (PID ${pid})`);
       this.emitStatus();
     } catch (err) {
@@ -499,13 +826,15 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     }
   }
 
+  /* ---------------- durdurma ---------------- */
+
   private async doStop(reason: string, partOfRestart = false): Promise<void> {
-    if (this.status === 'stopped' && !this.direct && this.mode === 'direct') return;
+    const d = this.direct;
+    if (this.status === 'stopped' && !d && this.mode === 'direct') return;
+    this.runId++;
+    this.clearHcTimers();
     this.setStatus(partOfRestart ? 'restarting' : 'stopping');
     this.stopMonitor();
-    this.hcTimers.forEach(clearTimeout);
-    this.hcTimers = [];
-    if (this.runningTimer) clearTimeout(this.runningTimer);
 
     // 1) Nazik kapatma: RCON #shutdown (Altis Life gibi görevler veriyi kaydedebilsin)
     const graceMs = this.profile.supervisor.gracefulShutdownSec * 1000;
@@ -518,6 +847,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       }
       // Onay gelmese bile komut sunucuya ulaşmış olabilir: süreyi bekle
       await this.waitUntilStopped(graceMs).catch(() => undefined);
+      if (this.disposed) return;
     }
     this.stopRcon();
 
@@ -525,31 +855,68 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     if (this.mode === 'systemd') {
       const sd = this.host.systemd!;
       await sd.action('stop', this.unitName, ...this.hcUnits).catch((err) => this.appLog(`systemctl stop: ${(err as Error).message}`));
-      if (!partOfRestart) await sd.action('disable', this.unitName).catch(() => undefined);
-    } else if (this.direct) {
-      for (const hc of this.direct.headless) await this.killAndWait(hc.pid, this.markerFor(hc.index));
-      await this.killAndWait(this.direct.pid, this.direct.marker);
+      if (this.disposed) return;
+      if (!partOfRestart) await sd.action('disable', this.unitName, ...this.hcUnits).catch(() => undefined);
+    } else if (d) {
+      const failures: string[] = [];
+      const remaining: DirectState['headless'] = [];
+      for (const hc of d.headless) {
+        try {
+          await this.killAndWait(hc.pid, hc.marker ?? this.markerFor(hc.index), d.executable);
+        } catch (err) {
+          failures.push((err as Error).message);
+          remaining.push(hc);
+        }
+        if (this.disposed) return;
+      }
+      try {
+        await this.killAndWait(d.pid, d.marker, d.executable);
+      } catch (err) {
+        failures.push((err as Error).message);
+      }
+      if (this.disposed) return;
+      if (failures.length) {
+        // Kapatıldığı doğrulanamadı: kaydı silme, "durdu" gösterme (sahipsiz süreç kalmasın)
+        d.headless = remaining;
+        this.direct = d;
+        this.stopPending = true;
+        await this.saveState().catch(() => undefined);
+        this.startMonitor();
+        this.startRcon(0);
+        this.setStatus('running');
+        const msg = failures.join('; ');
+        this.notice(
+          'error',
+          `Sunucunun kapandığı doğrulanamadı, durdurulmamış olabilir: ${msg}`,
+          `Could not verify that the server stopped; it may still be running: ${msg}`,
+        );
+        throw new Error(`Sunucunun kapandığı doğrulanamadı; tekrar dene (${msg})`);
+      }
       this.direct = null;
       await this.host.remove(this.paths.stateFile).catch(() => undefined);
     }
+    this.stopPending = false;
     this.hcAlive.clear();
     this.stopTails();
     this.startedAt = 0;
     this.playerCount = 0;
     if (!partOfRestart) {
       this.setStatus('stopped');
-      await this.notify('stop', 'Sunucu durduruldu', reason === 'manual' ? '' : reason);
+      this.notify('stop', 'Sunucu durduruldu', reason === 'manual' ? '' : reason);
     }
   }
 
-  /** PID gerçekten bu profilin süreci mi (komut satırı işaretiyle)? Sonra kapat. */
-  private async killAndWait(pid: number, marker?: string) {
-    const exe = this.direct?.executable ?? this.paths.executable;
+  /**
+   * PID gerçekten bu profilin süreci mi (komut satırı işaretiyle)? Sonra kapat.
+   * Süreç sorgulanamazsa ProcessQueryError fırlatır (yanlış süreci öldürme ya da "durdu" sanma).
+   */
+  private async killAndWait(pid: number, marker: string | undefined, executable?: string) {
+    const exe = executable ?? this.direct?.executable ?? this.paths.executable;
     const alive = async () => processMatches(await this.host.processInfo(pid, { commandLine: !!marker }), exe, marker);
     try {
       if (!(await alive())) return;
-    } catch {
-      return; // sorgulanamıyorsa yanlış süreci öldürme riskine girme
+    } catch (err) {
+      throw new ProcessQueryError(pid, err);
     }
     await this.host.killProcess(pid).catch(() => undefined);
     const until = Date.now() + this.t.stopTimeoutMs;
@@ -560,6 +927,24 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     this.appLog(`PID ${pid} kapanmadı, zorla sonlandırılıyor`);
     await this.host.killProcess(pid, { force: true }).catch(() => undefined);
     await sleep(500);
+  }
+
+  /** Ölümcül hata: nazik kapatma beklemeden zorla kapat (Windows'ta hata penceresi kibar kapatmaya cevap vermez) */
+  private async forceKill(pid: number, marker: string | undefined, executable: string) {
+    const alive = async () => processMatches(await this.host.processInfo(pid, { commandLine: !!marker }), executable, marker);
+    try {
+      if (!(await alive())) return;
+    } catch (err) {
+      // Az önce logunu okuduğumuz süreç: PID'nin bu arada başkasına geçmesi pratikte olmaz
+      this.appLog(`PID ${pid} sorgulanamadı (${(err as Error).message}); yine de zorla kapatılıyor`);
+    }
+    await this.host.killProcess(pid, { force: true }).catch((err) => this.appLog(`PID ${pid} kapatılamadı: ${(err as Error).message}`));
+    const until = Date.now() + this.t.stopTimeoutMs;
+    while (Date.now() < until) {
+      if (!(await alive().catch(() => true))) return;
+      await sleep(300);
+    }
+    this.appLog(`PID ${pid} zorla kapatma sonrası hâlâ çalışıyor`);
   }
 
   private async waitUntilStopped(timeoutMs: number) {
@@ -575,13 +960,37 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       const st = await this.host.systemd!.status(this.unitName);
       return st.activeState === 'active' || st.activeState === 'activating' || st.activeState === 'deactivating';
     }
-    if (!this.direct) return false;
-    return processMatches(await this.host.processInfo(this.direct.pid), this.direct.executable);
+    const d = this.direct;
+    if (!d) return false;
+    return processMatches(await this.host.processInfo(d.pid), d.executable);
   }
+
+  /** Durdurma doğrulanamamıştı; süreç artık yok: durdu say */
+  private async finalizePendingStop() {
+    const d = this.direct;
+    if (d) {
+      for (const hc of d.headless) await this.killAndWait(hc.pid, hc.marker ?? this.markerFor(hc.index), d.executable).catch(() => undefined);
+    }
+    if (this.direct !== d) return;
+    this.direct = null;
+    this.stopPending = false;
+    await this.host.remove(this.paths.stateFile).catch(() => undefined);
+    this.stopRcon();
+    this.hcAlive.clear();
+    this.stopTails();
+    this.startedAt = 0;
+    this.playerCount = 0;
+    this.setStatus('stopped');
+    this.appLog('Sunucu kapandı');
+  }
+
+  /* ---------------- takip (attach) ---------------- */
 
   /** Uygulama açıldığında zaten çalışan sunucuyu bul ve takip etmeye başla. */
   attach(): Promise<void> {
-    return this.attachInner();
+    // Başlat/durdur sürerken ya da zaten takip ediliyorsa bir şey yapma (çift izleme olmasın)
+    if (this.attached || this.busy || this.disposed) return Promise.resolve();
+    return this.exclusive(() => this.attachInner());
   }
 
   private async attachInner(): Promise<void> {
@@ -592,9 +1001,11 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       this.emitStatus();
       throw err;
     }
+    if (this.disposed) return;
     this.unreachable = false;
     if (this.mode === 'systemd') {
       const st = await this.host.systemd!.status(this.unitName);
+      if (this.disposed) return;
       this.attached = true;
       if (!st.exists || (st.activeState !== 'active' && st.activeState !== 'activating')) {
         this.setStatus('stopped');
@@ -602,15 +1013,17 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       }
       this.systemdRestarts = st.restarts;
       this.startedAt = st.startedAt || Date.now();
-      this.setStatus(st.activeState === 'active' ? 'running' : 'starting');
+      this.setStatus(st.activeState === 'active' ? 'running' : st.subState === 'auto-restart' ? 'restarting' : 'starting');
     } else {
       const state = await this.loadState();
+      if (this.disposed) return;
       if (!state) {
         this.attached = true;
         this.setStatus('stopped');
         return;
       }
       const info = await this.host.processInfo(state.pid, { commandLine: !!state.marker });
+      if (this.disposed) return;
       this.attached = true;
       if (!processMatches(info, state.executable, state.marker)) {
         await this.host.remove(this.paths.stateFile).catch(() => undefined);
@@ -621,14 +1034,23 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       this.startedAt = state.startedAt;
       for (const hc of state.headless) {
         const hi = await this.host.processInfo(hc.pid, { commandLine: true }).catch(() => ({ pid: hc.pid, alive: false }));
-        this.hcAlive.set(hc.index, processMatches(hi, state.executable, this.markerFor(hc.index)));
+        this.hcAlive.set(hc.index, processMatches(hi, state.executable, hc.marker ?? this.markerFor(hc.index)));
       }
+      if (this.disposed) return;
       this.setStatus('running');
     }
+    this.fatalDetail = null;
+    this.recentServerLines = [];
+    this.rconCfg = this.rconSnapshotFrom(this.profile);
     this.appLog('Çalışan sunucu bulundu, takip ediliyor');
-    this.startTails(true);
+    this.startTails('attach');
     this.startMonitor();
     this.startRcon(0);
+    // systemd servisi henüz "activating" ise hazır olmasını bekle (yoksa "starting"de kalır)
+    if (this.status === 'starting') {
+      this.readyNotify = null;
+      this.armReadiness();
+    }
   }
 
   private async saveState() {
@@ -656,6 +1078,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
   /* ---------------- izleme ---------------- */
 
   private startMonitor() {
+    if (this.disposed) return;
     this.stopMonitor();
     this.monitorTimer = setInterval(() => void this.monitorTick(), this.t.monitorMs);
   }
@@ -685,8 +1108,9 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
         this.appLogThrottled(`Makineye ulaşılamıyor: ${(err as Error).message}`);
         return;
       }
+      if (this.disposed) return;
       // Bağlantı yenilendiyse log takibini de yenile
-      if (this.tails.length && this.host.generation !== this.tailsGeneration) this.startTails(false, true);
+      if (this.tails.length && this.host.generation !== this.tailsGeneration) this.startTails('resume');
       if (this.mode === 'systemd') await this.monitorSystemd();
       else await this.monitorDirect();
     } catch (err) {
@@ -697,33 +1121,39 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
   }
 
   private async monitorDirect() {
-    if (!this.direct || this.busy) return;
+    const d = this.direct;
+    if (!d || this.busy || this.crashToken) return;
     // processInfo hata fırlatırsa (sorgu başarısız) ölü sayılmaz; üst katman loglar.
-    const alive = processMatches(await this.host.processInfo(this.direct.pid), this.direct.executable);
+    const alive = processMatches(await this.host.processInfo(d.pid), d.executable);
+    if (this.direct !== d || this.busy || this.crashToken || this.disposed) return;
     if (alive) {
       this.deadStreak = 0;
+    } else if (this.stopPending) {
+      await this.finalizePendingStop();
+      return;
     } else if (this.status === 'running' || this.status === 'starting') {
       // Tek bir okuma yetmez: art arda N kez yoksa çöktü say
       this.deadStreak++;
       if (this.deadStreak >= this.t.deadConfirmations) {
         this.deadStreak = 0;
-        await this.handleCrash();
+        await this.handleCrash('exit');
       }
       return;
     }
     let changed = false;
-    for (const hc of this.direct.headless) {
+    for (const hc of d.headless) {
       let hcAlive: boolean;
       try {
-        hcAlive = processMatches(await this.host.processInfo(hc.pid), this.direct.executable);
+        hcAlive = processMatches(await this.host.processInfo(hc.pid), d.executable);
       } catch {
         continue;
       }
+      if (this.direct !== d || this.disposed) return;
       if (this.hcAlive.get(hc.index) !== hcAlive) {
         this.hcAlive.set(hc.index, hcAlive);
         changed = true;
       }
-      if (!hcAlive && this.status === 'running' && this.profile.supervisor.autoRestart) {
+      if (!hcAlive && this.status === 'running' && this.profile.supervisor.autoRestart && !this.stopPending) {
         const now = Date.now();
         const hist = (this.hcRestarts.get(hc.index) ?? []).filter((x) => now - x < 3600_000);
         const last = hist[hist.length - 1] ?? 0;
@@ -731,7 +1161,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
           hist.push(now);
           this.hcRestarts.set(hc.index, hist);
           this.appLog(`Headless client ${hc.index} kapanmış, yeniden başlatılıyor`);
-          await this.startHeadless(hc.index);
+          await this.startHeadless(hc.index, this.runId);
         } else if (hist.length >= HC_MAX_RESTARTS_PER_HOUR) {
           this.appLogThrottled(`Headless client ${hc.index} çok sık kapanıyor; otomatik yeniden başlatma durduruldu`);
         }
@@ -741,13 +1171,14 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
   }
 
   private async monitorSystemd() {
-    if (this.busy) return;
+    if (this.busy || this.crashToken) return;
     const sd = this.host.systemd!;
     const st = await sd.status(this.unitName);
+    if (this.busy || this.crashToken || this.disposed) return;
     if (this.systemdRestarts >= 0 && st.restarts > this.systemdRestarts) {
       this.autoRestarts += st.restarts - this.systemdRestarts;
       this.notice('warning', 'Sunucu çöktü, systemd yeniden başlattı', 'Server crashed and was restarted by systemd');
-      void this.notify('crash', 'Sunucu çöktü', 'systemd otomatik olarak yeniden başlattı.');
+      this.notify('crash', 'Sunucu çöktü', 'systemd otomatik olarak yeniden başlattı.');
     }
     this.systemdRestarts = st.restarts;
     let changed = false;
@@ -760,10 +1191,14 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
         changed = true;
       }
     }
+    if (this.busy || this.crashToken || this.disposed) return;
     const prev = this.status;
     if (st.activeState === 'active') {
       if (st.startedAt) this.startedAt = st.startedAt;
-      if (prev !== 'running' && prev !== 'starting') {
+      if (prev === 'starting') {
+        // Hazır olma sinyali beklenmiyorsa (ör. eski sürümden kalma durum) servis yeterince süredir aktifse çalışıyor say
+        if (!this.awaitingReady && Date.now() - (this.startedAt || Date.now()) >= this.t.runningAfterMs) this.setStatus('running');
+      } else if (prev !== 'running') {
         this.setStatus('running');
         if (!this.rcon) this.startRcon(this.t.rconDelayMs);
       }
@@ -772,48 +1207,120 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     } else if (st.activeState === 'failed') {
       if (prev !== 'crashed') {
         this.notice('error', 'Sunucu çöktü ve systemd yeniden başlatmayı bıraktı (çok fazla çökme).', 'Server crashed and systemd gave up restarting (too many crashes).');
-        void this.notify('crash', 'Sunucu çöktü', 'Çok fazla çökme: otomatik restart durdu.');
+        this.notify('crash', 'Sunucu çöktü', 'Çok fazla çökme: otomatik restart durdu.');
       }
       this.stopRcon();
       this.setStatus('crashed');
     } else if (st.activeState === 'inactive' && (prev === 'running' || prev === 'starting')) {
       this.stopRcon();
+      if (this.fatalDetail) {
+        await this.handleCrash('fatal', this.fatalDetail);
+        return;
+      }
       this.setStatus('stopped');
+      this.lateFatalUntil = Date.now() + 10_000;
       this.appLog('Sunucu kapandı');
     }
     if (changed) this.emitStatus();
   }
 
-  private async handleCrash() {
+  /**
+   * Çökme / ölümcül hata / başlatma zaman aşımı.
+   * - exit: süreç beklenmedik şekilde kapandı → (açıksa) otomatik restart
+   * - fatal: logda ölümcül hata → zorla kapat, otomatik restart YOK (aynı hata tekrarlanır)
+   * - timeout: startTimeoutSec içinde hazır olmadı → zorla kapat, otomatik restart sayılır
+   */
+  private async handleCrash(kind: CrashKind, detail?: string, detailEn?: string) {
+    if (this.crashToken || this.disposed) return;
+    const token = {};
+    this.crashToken = token;
+    try {
+      await this.handleCrashInner(token, kind, detail, detailEn);
+    } finally {
+      if (this.crashToken === token) this.crashToken = null;
+    }
+  }
+
+  private async handleCrashInner(token: object, kind: CrashKind, detail?: string, detailEn?: string) {
+    const gen = this.opGen;
+    if (this.busy) {
+      // Başlatma bitene kadar bekle (durdurma/restart ise o çalıştırma zaten bitti)
+      const runId = this.runId;
+      await this.busy.catch(() => undefined);
+      if (this.cancelled(gen) || runId !== this.runId || (this.status !== 'starting' && this.status !== 'running')) return;
+    }
+    // Bu çalıştırmanın HC zamanlayıcıları ve süren HC başlatmaları geçersiz
+    this.runId++;
+    this.clearHcTimers();
+    this.clearReadiness();
     this.stopRcon();
+    if (kind === 'exit') {
+      this.notice('error', 'Sunucu beklenmedik şekilde kapandı (çöktü)', 'Server stopped unexpectedly (crashed)');
+    } else if (kind === 'fatal') {
+      this.lastError = detail;
+      this.notice('error', `Sunucu hata verdi, kapatılıyor: ${detail}`, `Server reported a fatal error, shutting it down: ${detail}`);
+    } else {
+      this.lastError = detail;
+      this.notice('error', detail ?? 'Sunucu hazır olmadı', detailEn ?? detail ?? 'Server was not ready');
+    }
+    this.emitStatus();
+
+    // Süreçleri kapat
+    const d = this.direct;
+    if (this.mode === 'direct' && d) {
+      if (kind !== 'exit') await this.forceKill(d.pid, d.marker, d.executable);
+      if (this.cancelled(gen)) return;
+      // Headless client'ları da kapat (önce gerçekten bizim süreçlerimiz mi kontrol et)
+      for (const hc of d.headless) {
+        await this.killAndWait(hc.pid, hc.marker ?? this.markerFor(hc.index), d.executable).catch((err) => this.appLog(`Headless client ${hc.index}: ${(err as Error).message}`));
+        if (this.cancelled(gen)) return;
+      }
+    } else if (this.mode === 'systemd' && kind !== 'exit') {
+      await this.host.systemd!.action('stop', this.unitName, ...this.hcUnits).catch((err) => this.appLog(`systemctl stop: ${(err as Error).message}`));
+      if (this.cancelled(gen)) return;
+    }
+    this.hcAlive.clear();
+
+    // Süreç kapanırken gelen hata satırı da hesaba katılsın
+    const fatal = this.fatalDetail;
+    if (fatal && kind !== 'fatal') {
+      this.lastError = fatal;
+      this.notice('error', `Sunucu hata vererek kapandı: ${fatal}`, `Server exited with a fatal error: ${fatal}`);
+    }
+    const sup = this.profile.supervisor;
     const now = Date.now();
     this.restartHistory = this.restartHistory.filter((t) => now - t < 3600_000);
-    const sup = this.profile.supervisor;
-    this.notice('error', 'Sunucu beklenmedik şekilde kapandı (çöktü)', 'Server stopped unexpectedly (crashed)');
-    // Headless client'ları da kapat (önce gerçekten bizim süreçlerimiz mi kontrol et)
-    if (this.direct) for (const hc of this.direct.headless) await this.killAndWait(hc.pid, this.markerFor(hc.index));
-    this.hcAlive.clear();
-    if (sup.autoRestart && this.restartHistory.length < sup.maxRestartsPerHour) {
+    const title = fatal ? 'Sunucu hata verdi' : kind === 'timeout' ? 'Sunucu hazır olmadı' : 'Sunucu çöktü';
+    const text = fatal ?? (kind === 'timeout' ? detail : undefined);
+    if (!fatal && sup.autoRestart && this.restartHistory.length < sup.maxRestartsPerHour) {
       this.restartHistory.push(now);
       this.autoRestarts++;
-      void this.notify('crash', 'Sunucu çöktü', `Otomatik yeniden başlatılıyor (${sup.restartDelaySec} sn).`);
+      this.notify('crash', title, `${text ? `${text}\n` : ''}Otomatik yeniden başlatılıyor (${sup.restartDelaySec} sn).`);
       this.setStatus('restarting');
       this.direct = null;
       await sleep(sup.restartDelaySec * 1000);
-      if (this.disposed || this.status !== 'restarting') return;
+      if (this.cancelled(gen) || this.status !== 'restarting') return;
+      // Yeni çalıştırmanın ölümcül hatası yakalanabilsin
+      if (this.crashToken === token) this.crashToken = null;
       try {
-        await this.exclusive(() => this.doStart(true));
+        await this.exclusive(() => this.doStart(null));
       } catch {
-        this.setStatus('crashed');
+        if (!this.cancelled(gen) && (this.status === 'restarting' || this.status === 'stopped')) this.setStatus('crashed');
       }
     } else {
-      void this.notify('crash', 'Sunucu çöktü', sup.autoRestart ? 'Bir saatte çok fazla çökme: otomatik restart durduruldu.' : 'Otomatik restart kapalı.');
-      if (sup.autoRestart) {
+      this.notify(
+        'crash',
+        title,
+        text ?? (sup.autoRestart ? 'Bir saatte çok fazla çökme: otomatik restart durduruldu.' : 'Otomatik restart kapalı.'),
+      );
+      if (!fatal && sup.autoRestart) {
         this.notice('error', 'Bir saat içinde çok fazla çökme: otomatik restart durduruldu.', 'Too many crashes within an hour: auto restart paused.');
       }
       this.direct = null;
       await this.host.remove(this.paths.stateFile).catch(() => undefined);
+      if (this.cancelled(gen)) return;
       this.stopTails();
+      if (!fatal) this.lateFatalUntil = Date.now() + 10_000;
       this.setStatus('crashed');
     }
   }
@@ -825,69 +1332,160 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     this.tails = [];
   }
 
-  private startTails(attaching: boolean, resume = false) {
+  private startTails(kind: TailKind) {
+    if (this.disposed) return;
     this.stopTails();
     this.tailsGeneration = this.host.generation;
     const rp = this.paths;
     const count = this.profile.headless.count;
     if (this.mode === 'systemd') {
       // journald: dosya yolu/dönüşüm sorunları yok
-      const since = Math.floor((this.startedAt || Date.now()) / 1000) - 2;
-      const follow = (unit: string, source: string, initial: number) => {
-        const base = ['-u', unit, '-f', '-o', 'cat', '--no-pager'];
-        const first = resume ? [...base, '-n', '0'] : attaching ? [...base, '-n', String(initial)] : [...base, '--since', `@${since}`];
-        this.tails.push(this.host.followCommand('journalctl', first, (lines) => this.pushLog(source, lines), { resumeArgs: [...base, '-n', '0'], privileged: true }));
-      };
-      follow(this.unitName, 'server', 300);
-      for (let i = 1; i <= count; i++) follow(this.hcUnitName(i), `hc${i}`, 50);
+      const since = kind === 'resume' ? Promise.resolve(0) : this.journalSince();
+      this.tails.push(this.followJournal(this.unitName, 'server', 300, kind, since));
+      for (let i = 1; i <= count; i++) this.tails.push(this.followJournal(this.hcUnitName(i), `hc${i}`, 50, kind, since));
       return;
     }
     if (this.host.os === 'windows') {
-      void this.tailNewestRpt(rp.rptDir, 'server', attaching || resume);
-      for (let i = 1; i <= count; i++) void this.tailNewestRpt(rp.headlessProfilesDir(i), `hc${i}`, attaching || resume);
+      this.tails.push(this.rptWatcher(rp.rptDir, 'server', kind));
+      for (let i = 1; i <= count; i++) this.tails.push(this.rptWatcher(rp.headlessProfilesDir(i), `hc${i}`, kind));
     } else {
-      const opts = resume ? { initialLines: 0 } : attaching ? { initialLines: 300 } : { fromStart: true };
+      const opts = kind === 'resume' ? { initialLines: 0 } : kind === 'attach' ? { initialLines: 300 } : { fromStart: true };
       this.tails.push(this.host.tail(rp.stdoutLog, (lines) => this.pushLog('server', lines), opts));
       for (let i = 1; i <= count; i++) {
-        this.tails.push(this.host.tail(rp.headlessStdoutLog(i), (lines) => this.pushLog(`hc${i}`, lines), resume ? { initialLines: 0 } : attaching ? { initialLines: 50 } : { fromStart: true }));
+        const hcOpts = kind === 'resume' ? { initialLines: 0 } : kind === 'attach' ? { initialLines: 50 } : { fromStart: true };
+        this.tails.push(this.host.tail(rp.headlessStdoutLog(i), (lines) => this.pushLog(`hc${i}`, lines), hcOpts));
       }
     }
   }
 
-  /** Windows: Arma her başlatmada yeni bir .rpt dosyası açar; en yenisini bulup takip et. */
-  private async tailNewestRpt(dir: string, source: string, attaching: boolean) {
-    const L = pathLib(this.host.os);
-    const since = attaching ? 0 : this.startedAt - 5000;
-    const deadline = Date.now() + this.t.rptWaitMs;
-    const myTails = this.tails;
-    while (Date.now() < deadline && myTails === this.tails && !this.disposed) {
-      const entries = await this.host.list(dir).catch(() => []);
-      const rpts = entries.filter((e) => !e.isDir && /\.rpt$/i.test(e.name) && e.mtimeMs >= since).sort((a, b) => b.mtimeMs - a.mtimeMs);
-      if (rpts[0]) {
-        if (myTails !== this.tails) return;
-        this.tails.push(this.host.tail(L.join(dir, rpts[0].name), (lines) => this.pushLog(source, lines), attaching ? { initialLines: 300 } : { fromStart: true }));
-        return;
+  /** Uzak makine saati ile bu bilgisayarın saati arasındaki fark (ms). Bilinemiyorsa null. */
+  private async remoteClockOffset(): Promise<number | null> {
+    try {
+      const t0 = Date.now();
+      let remote: number;
+      let at: number;
+      if (typeof this.host.getRemoteTime === 'function') {
+        // Host gecikmenin yarısını zaten ekliyor: dönüş anına göre karşılaştır
+        remote = await this.host.getRemoteTime();
+        at = Date.now();
+      } else {
+        const res = await this.host.exec('date', ['+%s%3N'], { timeoutMs: 10_000 });
+        if (res.code !== 0) return null;
+        remote = Number(res.stdout.trim());
+        at = (t0 + Date.now()) / 2;
       }
-      await sleep(2000);
+      if (!Number.isFinite(remote) || remote <= 0) return null;
+      if (remote < 1e11) remote *= 1000; // saniye döndüyse
+      return remote - at;
+    } catch {
+      return null;
     }
+  }
+
+  /** journalctl --since değeri (saniye, VPS saatine göre): bu çalıştırmanın ilk satırları kaçmasın */
+  private async journalSince(): Promise<number> {
+    const base = this.startedAt || Date.now();
+    const offset = await this.remoteClockOffset();
+    if (offset !== null) return Math.floor((base + offset) / 1000) - 2;
+    return Math.floor(base / 1000) - JOURNAL_MARGIN_SEC;
+  }
+
+  private followJournal(unit: string, source: string, initial: number, kind: TailKind, since: Promise<number>): TailHandle {
+    let stopped = false;
+    let inner: TailHandle | null = null;
+    const base = ['-u', unit, '-f', '-o', 'cat', '--no-pager'];
+    const resumeArgs = [...base, '-n', '0'];
+    const begin = (args: string[]) => {
+      if (stopped || this.disposed) return;
+      inner = this.host.followCommand(
+        'journalctl',
+        args,
+        (lines) => {
+          if (!stopped) this.pushLog(source, lines);
+        },
+        { resumeArgs, privileged: true },
+      );
+    };
+    if (kind === 'resume') begin(resumeArgs);
+    else {
+      void since.then((sec) => {
+        // attach: sadece bu çalıştırmanın satırları (önceki çalıştırmanın hatası yeniden yakalanmasın), en fazla N satır
+        begin(kind === 'attach' ? [...base, '--since', `@${sec}`, '-n', String(initial)] : [...base, '--since', `@${sec}`]);
+      });
+    }
+    return {
+      stop: () => {
+        stopped = true;
+        inner?.stop();
+      },
+    };
+  }
+
+  /**
+   * Windows: Arma her başlatmada yeni bir .rpt dosyası açar.
+   * - new: başlatmadan önceki listede olmayan ilk dosya beklenir (önceki çalıştırmanın logu izlenmez)
+   * - attach/resume: en yenisi
+   * Klasör düzenli olarak yeniden listelenir; daha yeni bir .rpt çıkarsa ona geçilir.
+   */
+  private rptWatcher(dir: string, source: string, kind: TailKind): TailHandle {
+    const L = pathLib(this.host.os);
+    let stopped = false;
+    let inner: TailHandle | null = null;
+    let current: string | null = null;
+    const snapshot = kind === 'new' ? (this.rptSnapshot.get(dir) ?? new Set<string>()) : null;
+    const known = new Set<string>();
+    const loop = async () => {
+      let first = true;
+      while (!stopped && !this.disposed) {
+        const entries = await this.host.list(dir).catch(() => null);
+        if (stopped || this.disposed) break;
+        if (entries) {
+          const rpts = entries.filter((e) => !e.isDir && /\.rpt$/i.test(e.name) && !snapshot?.has(e.name));
+          const candidates = current === null ? rpts : rpts.filter((e) => !known.has(e.name));
+          rpts.forEach((e) => known.add(e.name));
+          const pick = candidates.sort((a, b) => b.mtimeMs - a.mtimeMs)[0];
+          if (pick && pick.name !== current) {
+            inner?.stop();
+            const opts = first && kind === 'attach' ? { initialLines: 300 } : first && kind === 'resume' ? { initialLines: 0 } : { fromStart: true };
+            inner = this.host.tail(L.join(dir, pick.name), (lines) => {
+              if (!stopped) this.pushLog(source, lines);
+            }, opts);
+            if (current !== null) this.appLog(`${source}: yeni log dosyası izleniyor (${pick.name})`);
+            current = pick.name;
+            first = false;
+          }
+        }
+        // Dosya bulunduktan sonra daha seyrek bak (yeni .rpt sadece süreç yeniden başlarsa çıkar)
+        await sleep(current ? this.t.rptPollMs * 2.5 : this.t.rptPollMs);
+      }
+    };
+    void loop();
+    return {
+      stop: () => {
+        stopped = true;
+        inner?.stop();
+      },
+    };
   }
 
   /* ---------------- RCON ---------------- */
 
   private startRcon(delayMs: number) {
-    const p = this.profile;
-    if (!p.rcon.enabled || !p.security.battlEye || !p.rcon.password) return;
+    if (this.disposed) return;
+    const c = this.rconCfg ?? this.rconSnapshotFrom(this.profile);
+    if (!c.enabled) return;
     if (this.rconTimer) clearTimeout(this.rconTimer);
     this.rconTimer = setTimeout(() => {
       this.rconTimer = null;
+      if (this.disposed) return;
       if (this.status !== 'running' && this.status !== 'starting') return;
       if (this.rcon) return;
-      const host = p.rcon.connectHost || this.opts.defaultRconHost || '127.0.0.1';
-      const rcon = new BattlEyeRcon({ host, port: effectiveRconPort(p), password: p.rcon.password, reconnect: true, reconnectDelayMs: 10_000 });
+      const rcon = new BattlEyeRcon({ host: c.host, port: c.port, password: c.password, reconnect: true, reconnectDelayMs: 10_000 });
       this.rcon = rcon;
       rcon.on('state', (s, reason) => {
         if (s === 'connected') {
-          this.appLog(`RCON bağlandı (${host}:${effectiveRconPort(p)})`);
+          this.appLog(`RCON bağlandı (${c.host}:${c.port})`);
+          this.markReady('RCON');
           void this.refreshPlayers();
         }
         if (s === 'disconnected' && reason && reason !== 'Kapatıldı') this.appLogThrottled(`RCON bağlantısı yok: ${reason}`);
@@ -899,6 +1497,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
           this.notice('error', 'RCON şifresi kabul edilmedi', 'RCON password rejected');
         }
       });
+      if (this.playersTimer) clearInterval(this.playersTimer);
       this.playersTimer = setInterval(() => void this.refreshPlayers(), this.t.playersMs);
     }, delayMs);
   }
@@ -932,7 +1531,8 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
 
   /* ---------------- zamanlı restart ---------------- */
 
-  private async schedulerTick(now = new Date()) {
+  /** Sıradaki restart zamanını hesapla (gerekirse) */
+  private refreshSchedule(now: Date) {
     const sup = this.profile.supervisor;
     if (!sup.scheduledRestarts.length) {
       if (this.scheduledFor) {
@@ -941,26 +1541,70 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       }
       return;
     }
-    if (!this.scheduledFor || this.scheduledFor < now.getTime() - 60_000) {
+    if (!this.scheduledFor) {
       const next = nextOccurrence(sup.scheduledRestarts, now);
       this.scheduledFor = next ? next.getTime() : null;
       this.warningsSent.clear();
       this.emitStatus();
     }
-    if (!this.scheduledFor || this.status !== 'running') return;
-    const next = new Date(this.scheduledFor);
-    const minutes = dueWarning(next, now, sup.warnMinutes, this.warningsSent);
-    if (minutes !== null && this.rcon?.state === 'connected') {
-      await this.rcon.say(formatWarning(sup.warnMessage, minutes)).catch(() => undefined);
-      this.appLog(`Restart uyarısı gönderildi (${minutes} dk)`);
-    }
-    if (now.getTime() >= this.scheduledFor && !this.busy) {
+  }
+
+  /** Aynı restart için aynı açıklamayı bir kez logla */
+  private scheduleLog(at: number, what: string, line: string) {
+    if (this.scheduleNote?.at === at && this.scheduleNote.what === what) return;
+    this.scheduleNote = { at, what };
+    this.appLog(line);
+  }
+
+  private async schedulerTick(now = new Date()) {
+    if (this.disposed) return;
+    const nowMs = now.getTime();
+    if (this.scheduledFor && nowMs >= this.scheduledFor + 60_000) {
+      // Zamanı geçti ve yapılamadı (bilgisayar uykudaydı, makineye ulaşılamadı, başka işlem sürüyordu...)
+      if (this.status !== 'stopped' && this.status !== 'crashed') {
+        this.appLog(`Zamanlı restart (${fmtTime(this.scheduledFor)}) kaçırıldı (bilgisayar uykuda mıydı / makineye ulaşılamadı mı?); bir sonrakine geçiliyor`);
+      }
       this.scheduledFor = null;
-      this.appLog('Zamanlı restart başlıyor');
-      await this.restart({ update: sup.updateOnScheduledRestart, reason: 'Zamanlı restart' }).catch((err) =>
-        this.notice('error', `Zamanlı restart başarısız: ${(err as Error).message}`, `Scheduled restart failed: ${(err as Error).message}`),
-      );
     }
+    this.refreshSchedule(now);
+    const at = this.scheduledFor;
+    if (!at) return;
+    const sup = this.profile.supervisor;
+
+    // Uyarılar: sadece gerçekten gönderildiyse "gönderildi" say (RCON yeniden bağlanıyorsa sonraki turda tekrar dene)
+    if (this.status === 'running' && nowMs < at) {
+      const plan = planWarning(new Date(at), now, sup.warnMinutes, this.warningsSent);
+      if (plan && this.rcon?.state === 'connected') {
+        try {
+          await this.rcon.say(formatWarning(sup.warnMessage, plan.minutes));
+          if (this.scheduledFor === at) plan.marks.forEach((m) => this.warningsSent.add(m));
+          this.appLog(`Restart uyarısı gönderildi (${plan.minutes} dk)`);
+        } catch (err) {
+          this.appLogThrottled(`Restart uyarısı gönderilemedi, tekrar denenecek: ${(err as Error).message}`);
+        }
+      }
+    }
+    if (nowMs < at || this.disposed) return;
+
+    if (this.status === 'stopped' || this.status === 'crashed') {
+      this.appLog(`Sunucu çalışmıyor; zamanlı restart (${fmtTime(at)}) atlandı`);
+      this.scheduledFor = null;
+      this.emitStatus();
+      return;
+    }
+    if (this.busy || this.status !== 'running') {
+      this.scheduleLog(at, 'busy', `Başka bir işlem sürüyor (${this.status}); zamanlı restart (${fmtTime(at)}) erteleniyor`);
+      return;
+    }
+    if (this.unreachable) {
+      this.scheduleLog(at, 'unreachable', `Makineye ulaşılamıyor; zamanlı restart (${fmtTime(at)}) erteleniyor`);
+      return;
+    }
+    this.scheduledFor = null;
+    this.appLog('Zamanlı restart başlıyor');
+    await this.restart({ update: sup.updateOnScheduledRestart, reason: 'Zamanlı restart' }).catch((err) =>
+      this.notice('error', `Zamanlı restart başarısız: ${(err as Error).message}`, `Scheduled restart failed: ${(err as Error).message}`),
+    );
   }
 
   /** Test ve "şimdi kontrol et" için */
@@ -970,9 +1614,11 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
 
   dispose() {
     this.disposed = true;
+    this.opGen++;
+    this.runId++;
     if (this.schedulerTimer) clearInterval(this.schedulerTimer);
-    if (this.runningTimer) clearTimeout(this.runningTimer);
-    this.hcTimers.forEach(clearTimeout);
+    this.clearReadiness();
+    this.clearHcTimers();
     this.stopMonitor();
     this.stopTails();
     this.stopRcon();

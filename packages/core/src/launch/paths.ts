@@ -39,6 +39,20 @@ export function defaultExecutable(os: HostOs): string {
   return os === 'windows' ? 'arma3server_x64.exe' : 'arma3server_x64';
 }
 
+/**
+ * Sondaki ayraçları atar ("C:\Arma Profiles\" -> "C:\Arma Profiles"); kök ("C:\", "/") korunur.
+ * Windows'ta tırnaklı argümanın sonundaki \ kaçış için ikilenir (..."\\") ve -profiles işareti eşleşmezdi.
+ */
+export function trimTrailingSep(os: HostOs, p: string): string {
+  const L = pathLib(os);
+  let out = p;
+  while (out.length > 1 && /[\\/]$/.test(out) && (os === 'windows' || out.endsWith('/'))) {
+    if (L.parse(out).root === out) break;
+    out = out.slice(0, -1);
+  }
+  return out;
+}
+
 /** Profil klasörü belirtilmemişse kullanılan, profil id'sine bağlı kararlı varsayılan. */
 export function defaultProfilesDir(os: HostOs, serverDir: string, profileId: string): string {
   return pathLib(os).join(serverDir, 'oezi-profiles', profileId.replace(/[^A-Za-z0-9]/g, '').slice(0, 8) || 'default');
@@ -46,7 +60,7 @@ export function defaultProfilesDir(os: HostOs, serverDir: string, profileId: str
 
 export function resolvePaths(profile: ServerProfile, os: HostOs): ResolvedPaths {
   const p = pathLib(os);
-  const serverDir = profile.paths.serverDir.trim();
+  const serverDir = trimTrailingSep(os, profile.paths.serverDir.trim());
   if (!serverDir) throw new Error('Sunucu klasörü (serverDir) ayarlanmamış');
   if (!p.isAbsolute(serverDir)) throw new Error(`Sunucu klasörü mutlak bir yol olmalı: ${serverDir}`);
 
@@ -54,11 +68,14 @@ export function resolvePaths(profile: ServerProfile, os: HostOs): ResolvedPaths 
   const executable = p.isAbsolute(exeSetting) ? exeSetting : p.join(serverDir, exeSetting);
 
   const profilesSetting = profile.paths.profilesDir.trim();
-  const profilesDir = profilesSetting
-    ? p.isAbsolute(profilesSetting)
-      ? profilesSetting
-      : p.join(serverDir, profilesSetting)
-    : defaultProfilesDir(os, serverDir, profile.id);
+  const profilesDir = trimTrailingSep(
+    os,
+    profilesSetting
+      ? p.isAbsolute(profilesSetting)
+        ? profilesSetting
+        : p.join(serverDir, profilesSetting)
+      : defaultProfilesDir(os, serverDir, profile.id),
+  );
 
   const name = profile.paths.profileName;
   const arma3Profiles =
@@ -71,11 +88,14 @@ export function resolvePaths(profile: ServerProfile, os: HostOs): ResolvedPaths 
   const beCfgName = exeBase.includes('_x64') ? 'beserver_x64.cfg' : 'beserver.cfg';
 
   const workshopSetting = profile.steam.workshopDir.trim();
-  const workshopDir = workshopSetting
-    ? p.isAbsolute(workshopSetting)
-      ? workshopSetting
-      : p.join(serverDir, workshopSetting)
-    : p.join(p.dirname(serverDir), 'oezi-workshop');
+  const workshopDir = trimTrailingSep(
+    os,
+    workshopSetting
+      ? p.isAbsolute(workshopSetting)
+        ? workshopSetting
+        : p.join(serverDir, workshopSetting)
+      : p.join(p.dirname(serverDir), 'oezi-workshop'),
+  );
 
   return {
     os,

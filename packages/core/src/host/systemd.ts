@@ -2,7 +2,10 @@ import type { ExecResult, SystemdApi, SystemdStatus } from './types.js';
 import { HostError } from './types.js';
 import { quoteSystemdArg } from '../launch/commandLine.js';
 
-type ExecFn = (file: string, args: string[]) => Promise<ExecResult>;
+type ExecFn = (file: string, args: string[], opts?: { timeoutMs?: number }) => Promise<ExecResult>;
+
+/** systemctl show için üst sınır: bağlantı/systemd takılırsa izleme döngüsü kilitlenmesin */
+export const SYSTEMD_STATUS_TIMEOUT_MS = 20_000;
 
 const UNIT_DIR = '/etc/systemd/system';
 const UNIT_NAME_RE = /^[A-Za-z0-9:_.\\@-]+\.service$/;
@@ -76,7 +79,10 @@ export function createSystemdApi(
     async status(name): Promise<SystemdStatus> {
       check(name);
       const props = 'LoadState,ActiveState,SubState,MainPID,NRestarts,ActiveEnterTimestampMonotonic';
-      const res = await exec('sh', ['-c', `systemctl show "$1" --property=${props} && echo "__UPTIME=$(cut -d' ' -f1 /proc/uptime)"`, 'sh', name]);
+      const res = await exec('sh', ['-c', `systemctl show "$1" --property=${props} && echo "__UPTIME=$(cut -d' ' -f1 /proc/uptime)"`, 'sh', name], {
+        timeoutMs: SYSTEMD_STATUS_TIMEOUT_MS,
+      });
+      if (res.timedOut) throw new HostError(`systemctl show ${name} ${SYSTEMD_STATUS_TIMEOUT_MS / 1000} sn içinde cevap vermedi`, 'systemctl_timeout');
       if (res.code !== 0 || !res.stdout.includes('ActiveState=')) {
         // Sorgu başarısız: "durdu" sanma, hata fırlat (bağlantı kopması vb.)
         throw new HostError(`systemctl show ${name} başarısız: ${(res.stderr || res.stdout).trim() || 'cevap yok'}`, 'systemctl_failed');

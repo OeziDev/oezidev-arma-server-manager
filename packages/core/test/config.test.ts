@@ -66,8 +66,15 @@ describe('armaConfig okuyucu', () => {
     const m1 = findClass(findClass(entries, 'Missions')!.entries, 'M1')!;
     expect(findValue(m1.entries, 'template')).toBe('co10_Escape.Altis');
   });
-  it('TADST\'nin bozuk çıktısını (kaçırılmamış tırnak) hata olarak yakalar', () => {
-    const { issues } = parseConfig('hostName = "[TR] "ArmaTürk" Altis Life";\nmaxPlayers = 10;');
+  it('TADST\'nin bozuk çıktısını (kaçırılmamış tırnak) uyarıyla kurtarır', () => {
+    const { entries, issues } = parseConfig('hostName = "[TR] "ArmaTürk" Altis Life";\nmaxPlayers = 10;');
+    expect(issues.filter((i) => i.severity === 'error')).toEqual([]);
+    expect(issues.some((i) => i.severity === 'warning' && /tırnak/.test(i.message))).toBe(true);
+    expect(findValue(entries, 'hostName')).toBe('[TR] "ArmaTürk" Altis Life');
+    expect(findValue(entries, 'maxPlayers')).toBe(10);
+  });
+  it('string sonrası tırnakla bitmeyen fazlalık hâlâ hatadır', () => {
+    const { issues } = parseConfig('hostName = "abc" def;');
     expect(issues.some((i) => i.severity === 'error')).toBe(true);
   });
   it('kapanmamış class bloğunu hata olarak bildirir', () => {

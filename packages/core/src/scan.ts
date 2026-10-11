@@ -32,9 +32,41 @@ export function islandOf(template: string): string {
   return parts.length > 1 ? parts[parts.length - 1]! : '';
 }
 
-export async function scanMissions(host: Host, serverDir: string): Promise<{ dir: string | null; missions: FoundMission[] }> {
-  const dir = await findDirCaseInsensitive(host, serverDir, 'mpmissions');
-  if (!dir) return { dir: null, missions: [] };
+export interface MissionsDirResult {
+  /** Sunucunun gerçekten okuduğu görev klasörü (yoksa null) */
+  dir: string | null;
+  /** Linux: farklı harfle yazılmış (sunucunun OKUMADIĞI) klasör, ör. ".../MPMissions" */
+  wrongCaseDir?: string;
+  /** Kullanıcıya gösterilecek uyarı */
+  warning?: string;
+}
+
+/**
+ * Görev klasörü. Windows'ta harf duyarsız. Linux sunucusu SADECE küçük harfli "mpmissions" okur:
+ * yalnızca "MPMissions" varsa sessizce kullanılmaz, uyarı döner.
+ */
+export async function findMissionsDir(host: Host, serverDir: string): Promise<MissionsDirResult> {
+  if (host.os === 'windows') return { dir: await findDirCaseInsensitive(host, serverDir, 'mpmissions') };
+  const p = pathLib(host.os);
+  const exact = p.join(serverDir, 'mpmissions');
+  const exactIsDir = !!(await host.stat(exact))?.isDir;
+  const other = (await host.list(serverDir).catch(() => [])).find((e) => e.isDir && e.name !== 'mpmissions' && e.name.toLowerCase() === 'mpmissions');
+  if (!other) return { dir: exactIsDir ? exact : null };
+  const wrongCaseDir = p.join(serverDir, other.name);
+  const warning = exactIsDir
+    ? `"${other.name}" klasöründeki görevler sunucu tarafından okunmaz: Linux sunucusu sadece küçük harfli "mpmissions" klasörünü kullanır.`
+    : `"${other.name}" klasörü bulundu ama Linux sunucusu sadece küçük harfli "mpmissions" klasörünü okur. Klasörün adını "mpmissions" olarak değiştir.`;
+  return { dir: exactIsDir ? exact : null, wrongCaseDir, warning };
+}
+
+export async function scanMissions(
+  host: Host,
+  serverDir: string,
+): Promise<{ dir: string | null; missions: FoundMission[]; warning?: string; wrongCaseDir?: string }> {
+  const found = await findMissionsDir(host, serverDir);
+  const extra = { ...(found.warning ? { warning: found.warning } : {}), ...(found.wrongCaseDir ? { wrongCaseDir: found.wrongCaseDir } : {}) };
+  const dir = found.dir;
+  if (!dir) return { dir: null, missions: [], ...extra };
   const entries = await host.list(dir);
   const missions: FoundMission[] = [];
   for (const e of entries) {
@@ -46,7 +78,7 @@ export async function scanMissions(host: Host, serverDir: string): Promise<{ dir
     }
   }
   missions.sort((a, b) => a.template.localeCompare(b.template));
-  return { dir, missions };
+  return { dir, missions, ...extra };
 }
 
 export interface FoundMod {
@@ -136,10 +168,13 @@ export async function scanMods(host: Host, serverDir: string): Promise<FoundMod[
   return mods;
 }
 
-/** Görev dosyasını yükler; Linux'ta adı küçük harfe çevirir. */
+/** Görev dosyasını yükler; Linux'ta adı küçük harfe çevirir ve her zaman küçük harfli "mpmissions"a yazar. */
 export async function uploadMission(host: Host, serverDir: string, localFile: string, os: HostOs = host.os): Promise<string> {
   const p = pathLib(os);
-  const dir = (await findDirCaseInsensitive(host, serverDir, 'mpmissions')) ?? p.join(serverDir, os === 'windows' ? 'MPMissions' : 'mpmissions');
+  const dir =
+    os === 'windows'
+      ? ((await findDirCaseInsensitive(host, serverDir, 'mpmissions')) ?? p.join(serverDir, 'MPMissions'))
+      : p.join(serverDir, 'mpmissions');
   await host.mkdirp(dir);
   const base = (localFile.split(/[\\/]/).pop() ?? 'mission.pbo');
   const name = os === 'linux' ? base.toLowerCase() : base;

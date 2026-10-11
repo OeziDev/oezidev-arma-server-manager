@@ -13,8 +13,10 @@ import {
   serializeEntries,
 } from './armaConfig.js';
 import {
+  DEFAULT_VOTE_CMDS,
   DIFFICULTY_OPTIONS,
   DIFFICULTY_PRESETS,
+  KNOWN_VOTE_CMDS,
   type DifficultyPreset,
   type ServerProfile,
   ServerProfileSchema,
@@ -61,6 +63,87 @@ function asDifficulty(value: CfgValue | undefined): DifficultyPreset | undefined
  * (yol, port gibi server.cfg'de olmayan ayarlar korunur).
  */
 export function importServerCfg(text: string, base?: ServerProfile): ImportResult {
+  try {
+    return importServerCfgUnsafe(text, base);
+  } catch (err) {
+    // Bozuk girdi asla istisna fırlatmasın: profil değişmeden döner, kullanıcı hatayı görür.
+    return failedImport(err, base);
+  }
+}
+
+function failedImport(err: unknown, base?: ServerProfile): ImportResult {
+  const reason = err instanceof Error ? err.message : String(err);
+  let profile: ServerProfile;
+  try {
+    profile = base ? ServerProfileSchema.parse(structuredClone(base)) : ServerProfileSchema.parse({});
+  } catch {
+    profile = ServerProfileSchema.parse({});
+  }
+  return {
+    profile,
+    issues: [
+      {
+        line: 0,
+        severity: 'error',
+        message: `İçe aktarma başarısız, profil değiştirilmedi: ${reason}`,
+        messageEn: `Import failed, profile left unchanged: ${reason}`,
+      },
+    ],
+    unknownKeys: [],
+  };
+}
+
+/** {komut, önce, sonra} listesi bizim varsayılan listemiz mi (+ isteğe bağlı "admin")? Değilse undefined. */
+function matchDefaultVoteCmds(value: CfgValue | undefined): { allowAdmin: boolean } | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const seen = new Map<string, [boolean, boolean]>();
+  for (const item of value) {
+    const arr = Array.isArray(item) ? item : [item];
+    // Eşik (4. eleman) içeren ya da başka biçimdeki listeler modele sığmaz.
+    if (arr.length < 1 || arr.length > 3 || Array.isArray(arr[0])) return undefined;
+    const cmd = asString(arr[0])?.toLowerCase();
+    if (!cmd || !(KNOWN_VOTE_CMDS as readonly string[]).includes(cmd) || seen.has(cmd)) return undefined;
+    const flags = arr.slice(1).map((x) => (Array.isArray(x) ? undefined : asBool(x)));
+    if (flags.some((f) => f === undefined)) return undefined;
+    seen.set(cmd, [flags[0] ?? true, flags[1] ?? true]);
+  }
+  for (const [cmd, pre, post] of DEFAULT_VOTE_CMDS) {
+    const got = seen.get(cmd);
+    if (!got || got[0] !== pre || got[1] !== post) return undefined;
+  }
+  const allowAdmin = seen.has('admin');
+  if (seen.size !== DEFAULT_VOTE_CMDS.length + (allowAdmin ? 1 : 0)) return undefined;
+  return { allowAdmin };
+}
+
+type Rotation = { template: string; difficulty: DifficultyPreset; enabled: boolean; params: { name: string; value: number }[] };
+
+/** Missions altındaki bir görev class'ı modele birebir aktarılabiliyorsa onu döner. */
+function missionFromClass(m: CfgEntry): Rotation | undefined {
+  if (m.kind !== 'class' || m.base) return undefined;
+  const allowed = new Set(['template', 'difficulty', 'params']);
+  if (m.entries.some((e) => (e.kind === 'value' || e.kind === 'class') && !allowed.has(e.name.toLowerCase()))) return undefined;
+  const templateRaw = findValue(m.entries, 'template');
+  const template = Array.isArray(templateRaw) ? undefined : asString(templateRaw);
+  if (!template) return undefined;
+  const diffRaw = findValue(m.entries, 'difficulty');
+  const difficulty = diffRaw === undefined ? 'regular' : asDifficulty(diffRaw);
+  if (!difficulty) return undefined;
+  const params: { name: string; value: number }[] = [];
+  const paramsClass = findClass(m.entries, 'Params');
+  if (findValue(m.entries, 'Params') !== undefined) return undefined;
+  if (paramsClass) {
+    for (const pe of paramsClass.entries) {
+      if (pe.kind === 'comment' || pe.kind === 'blank') continue;
+      const num = pe.kind === 'value' && !Array.isArray(pe.value) ? asNumber(pe.value) : undefined;
+      if (pe.kind !== 'value' || num === undefined) return undefined;
+      params.push({ name: pe.name, value: num });
+    }
+  }
+  return { template: template.replace(/\.pbo$/i, ''), difficulty, enabled: true, params };
+}
+
+function importServerCfgUnsafe(text: string, base?: ServerProfile): ImportResult {
   const { entries, issues } = parseConfig(text);
   const get = (k: string) => findValue(entries, k);
   const start = base ? structuredClone(base) : ServerProfileSchema.parse({});
@@ -116,9 +199,30 @@ export function importServerCfg(text: string, base?: ServerProfile): ImportResul
   setIf(voting, 'voteMissionPlayers', asNumber(get('voteMissionPlayers')));
   const threshold = asNumber(get('voteThreshold'));
   const voteCmds = get('allowedVoteCmds');
-  const votingOff = (threshold !== undefined && threshold > 1) || (Array.isArray(voteCmds) && voteCmds.length === 0);
-  voting.enabled = !votingOff;
-  if (threshold !== undefined && threshold <= 1) voting.voteThreshold = threshold;
+  const votedAdminCmds = get('allowedVotedAdminCmds');
+  // allowedVoteCmds modele aktarıldıysa (boş liste ya da bizim varsayılan listemiz) ek satırlara gitmez.
+  let voteCmdsMapped = Array.isArray(voteCmds) && voteCmds.length === 0;
+  // Oylama ayarlarına sadece cfg oylamadan bahsediyorsa dokun (mevcut profilin ayarı korunur).
+  if (threshold !== undefined || voteCmds !== undefined) {
+    const votingOff = (threshold !== undefined && threshold > 1) || (Array.isArray(voteCmds) && voteCmds.length === 0);
+    voting.enabled = !votingOff;
+    if (threshold !== undefined && threshold <= 1) voting.voteThreshold = threshold;
+    if (!votingOff) {
+      if (voteCmds === undefined) {
+        // Liste yoksa Arma her oy komutuna, #vote admin dahil, izin verir.
+        voting.allowAdminVote = true;
+      } else {
+        const match = matchDefaultVoteCmds(voteCmds);
+        if (match) {
+          voting.allowAdminVote = match.allowAdmin;
+          voteCmdsMapped = true;
+        }
+      }
+    }
+  }
+  // Boş allowedVotedAdminCmds'i üretici zaten yazıyorsa (oylama açık, admin oylaması kapalı) modelde karşılığı var.
+  const votedAdminMapped =
+    Array.isArray(votedAdminCmds) && votedAdminCmds.length === 0 && voting.enabled === true && voting.allowAdminVote === false;
 
   const von: Patch = { ...p.von };
   setIf(von, 'disabled', asBool(get('disableVoN')));
@@ -152,28 +256,32 @@ export function importServerCfg(text: string, base?: ServerProfile): ImportResul
   if (fd) missions.forcedDifficulty = fd;
   setIf(missions, 'missionWhitelist', asStringArray(get('missionWhitelist')));
   const missionsClass = findClass(entries, 'Missions');
+  let keepMissionsClass = false;
   if (missionsClass) {
-    const rotation: Patch[] = [];
+    const rotation: Rotation[] = [];
     for (const m of missionsClass.entries) {
-      if (m.kind !== 'class') continue;
-      const template = asString(findValue(m.entries, 'template'));
-      if (!template) continue;
-      const params: { name: string; value: number }[] = [];
-      const paramsClass = findClass(m.entries, 'Params');
-      if (paramsClass) {
-        for (const pe of paramsClass.entries) {
-          const num = pe.kind === 'value' ? asNumber(pe.value) : undefined;
-          if (pe.kind === 'value' && num !== undefined) params.push({ name: pe.name, value: num });
-        }
+      if (m.kind === 'comment' || m.kind === 'blank') continue;
+      const mission = missionFromClass(m);
+      if (!mission) {
+        keepMissionsClass = true;
+        break;
       }
-      rotation.push({
-        template: template.replace(/\.pbo$/i, ''),
-        difficulty: asDifficulty(findValue(m.entries, 'difficulty')) ?? 'regular',
-        enabled: true,
-        params,
-      });
+      rotation.push(mission);
     }
-    missions.rotation = rotation;
+    if (keepMissionsClass) {
+      issues.push({
+        line: 0,
+        severity: 'warning',
+        message:
+          'Missions sınıfındaki bazı görevler (template\'siz/kampanya tarzı ya da ek alanlı) modele aktarılamadı; ' +
+          'Missions sınıfının tamamı ek satırlara taşındı, görev rotasyonu değiştirilmedi.',
+        messageEn:
+          'Some entries in class Missions (campaign style without template, or with extra fields) cannot be modelled; ' +
+          'the whole Missions class was moved to the extra lines and the mission rotation was left unchanged.',
+      });
+    } else {
+      missions.rotation = rotation;
+    }
   }
 
   const advanced: Patch = { ...p.advanced };
@@ -184,13 +292,15 @@ export function importServerCfg(text: string, base?: ServerProfile): ImportResul
     setIf(advanced, 'ignoreMissionLoadErrors', asBool(findValue(adv.entries, 'ignoreMissionLoadErrors')));
     setIf(advanced, 'queueSizeLogG', asNumber(findValue(adv.entries, 'queueSizeLogG')));
   }
-  const unknown: CfgEntry[] = entries.filter(
-    (en) =>
-      (en.kind === 'value' || en.kind === 'class') &&
-      !KNOWN_SERVER_KEYS.has(en.name.toLowerCase()) &&
-      // Boş allowedVoteCmds "oylama kapalı" demek (modelde var); dolu liste ise ek satır olarak korunur
-      !(en.kind === 'value' && en.name.toLowerCase() === 'allowedvotecmds' && Array.isArray(en.value) && en.value.length === 0),
-  );
+  const unknown: CfgEntry[] = entries.filter((en) => {
+    if (en.kind !== 'value' && en.kind !== 'class') return false;
+    const key = en.name.toLowerCase();
+    if (key === 'missions') return keepMissionsClass && en.kind === 'class';
+    // Boş ya da varsayılan allowedVoteCmds modelde var; başka listeler ek satır olarak korunur.
+    if (key === 'allowedvotecmds') return !(voteCmdsMapped && en.kind === 'value');
+    if (key === 'allowedvotedadmincmds') return !(votedAdminMapped && en.kind === 'value');
+    return !KNOWN_SERVER_KEYS.has(key);
+  });
   if (unknown.length) {
     advanced.extraServerCfg = mergeExtraLines(String(advanced.extraServerCfg ?? ''), dedupeEntries(unknown));
   }
@@ -206,21 +316,65 @@ export function importServerCfg(text: string, base?: ServerProfile): ImportResul
     missions,
     advanced,
   };
-  const res = ServerProfileSchema.safeParse(merged);
-  if (!res.success) {
-    // Aralık dışı değerleri kullanıcıya bildir, geçersiz alanları varsayılana bırak.
-    const fixed = structuredClone(merged) as Record<string, unknown>;
-    for (const issue of res.error.issues) {
-      issues.push({ line: 0, severity: 'warning', message: `${issue.path.join('.')}: ${issue.message} (varsayılan kullanıldı)` });
-      deletePath(fixed, issue.path as (string | number)[]);
-    }
-    return {
-      profile: ServerProfileSchema.parse(fixed),
-      issues,
-      unknownKeys: unknown.map((u) => (u as { name: string }).name),
-    };
+  return { profile: validateImported(merged, start, issues), issues, unknownKeys: unknown.map((u) => (u as { name: string }).name) };
+}
+
+/** Yolları karşılaştır: sayı indeksleri sayısal, aynı dizideki büyük indeks önce gelecek şekilde (azalan) sırala. */
+function compareIssuePathDesc(a: PropertyKey[], b: PropertyKey[]): number {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    const x = a[i]!;
+    const y = b[i]!;
+    if (x === y) continue;
+    if (typeof x === 'number' && typeof y === 'number') return y - x;
+    return String(y).localeCompare(String(x));
   }
-  return { profile: res.data, issues, unknownKeys: unknown.map((u) => (u as { name: string }).name) };
+  return b.length - a.length;
+}
+
+/**
+ * Şemaya uymayan alanları uyarıyla varsayılana bırakır. Asla istisna fırlatmaz: düzeltilemezse
+ * başlangıç profiline (ya da varsayılanlara) döner.
+ */
+function validateImported(merged: unknown, start: unknown, issues: ParseIssue[]): ServerProfile {
+  const fixed = structuredClone(merged) as Record<string, unknown>;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const res = ServerProfileSchema.safeParse(fixed);
+    if (res.success) return res.data;
+    const paths = res.error.issues.map((i) => i.path as PropertyKey[]).sort(compareIssuePathDesc);
+    if (attempt === 0) {
+      for (const issue of res.error.issues) {
+        const where = issue.path.map(String).join('.');
+        issues.push({
+          line: 0,
+          severity: 'warning',
+          message: `${where}: ${issue.message} (varsayılan kullanıldı)`,
+          messageEn: `${where}: ${issue.message} (default used)`,
+        });
+      }
+    }
+    const seen = new Set<string>();
+    for (const path of paths) {
+      // İlk denemede sadece hatalı alan silinir; yetmezse hatalı dizi elemanının tamamı atılır.
+      let target = path;
+      if (attempt > 0) {
+        const lastIdx = path.map((x) => typeof x === 'number').lastIndexOf(true);
+        if (lastIdx >= 0) target = path.slice(0, lastIdx + 1);
+      }
+      const key = JSON.stringify(target);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deletePath(fixed, target);
+    }
+  }
+  issues.push({
+    line: 0,
+    severity: 'error',
+    message: 'İçe aktarılan değerler düzeltilemedi; mevcut profil korundu.',
+    messageEn: 'Imported values could not be repaired; the existing profile was kept.',
+  });
+  const back = ServerProfileSchema.safeParse(start);
+  return back.success ? back.data : ServerProfileSchema.parse({});
 }
 
 /**
@@ -247,17 +401,17 @@ export function mergeExtraLines(prevText: string, incoming: CfgEntry[]): string 
   return keptText ? keptText + '\n' + add : add;
 }
 
-function deletePath(obj: Record<string, unknown>, path: (string | number)[]): void {
+function deletePath(obj: Record<string, unknown>, path: PropertyKey[]): void {
   if (!path.length) return;
   let cur: unknown = obj;
   for (let i = 0; i < path.length - 1; i++) {
     if (cur === null || typeof cur !== 'object') return;
-    cur = (cur as Record<string | number, unknown>)[path[i]!];
+    cur = (cur as Record<PropertyKey, unknown>)[path[i]!];
   }
   if (cur && typeof cur === 'object') {
     const last = path[path.length - 1]!;
     if (Array.isArray(cur) && typeof last === 'number') cur.splice(last, 1);
-    else delete (cur as Record<string | number, unknown>)[last];
+    else delete (cur as Record<PropertyKey, unknown>)[last];
   }
 }
 
@@ -292,5 +446,57 @@ export function importArma3Profile(text: string, base: ServerProfile): ImportRes
     if (skill !== undefined) p.difficulty.skillAI = Math.min(Math.max(skill, 0), 1);
     if (precision !== undefined) p.difficulty.precisionAI = Math.min(Math.max(precision, 0), 1);
   }
-  return { profile: ServerProfileSchema.parse(p), issues, unknownKeys: [] };
+  // Sunucu görüş mesafesi / arazi detayı profilin en üst seviyesinde durur (modelde p.basic altında).
+  mapViewSettings(entries, p);
+  return { profile: validateImported(p, base, issues), issues, unknownKeys: [] };
+}
+
+/** viewDistance / terrainGrid (Arma3Profile en üst seviye; eski config'lerde basic.cfg) -> p.basic */
+function mapViewSettings(entries: CfgEntry[], p: ServerProfile): void {
+  const vd = asNumber(findValue(entries, 'viewDistance'));
+  if (vd !== undefined && Number.isFinite(vd)) p.basic.viewDistance = Math.min(Math.max(Math.round(vd), 0), 40_000);
+  const tg = asNumber(findValue(entries, 'terrainGrid'));
+  if (tg !== undefined && Number.isFinite(tg)) p.basic.terrainGrid = Math.min(Math.max(tg, 0), 50);
+}
+
+const BASIC_KEYS: [cfgKey: string, field: 'maxMsgSend' | 'maxSizeGuaranteed' | 'maxSizeNonguaranteed' | 'minBandwidth' | 'maxBandwidth' | 'minErrorToSend' | 'minErrorToSendNear' | 'maxCustomFileSize'][] = [
+  ['MaxMsgSend', 'maxMsgSend'],
+  ['MaxSizeGuaranteed', 'maxSizeGuaranteed'],
+  ['MaxSizeNonguaranteed', 'maxSizeNonguaranteed'],
+  ['MinBandwidth', 'minBandwidth'],
+  ['MaxBandwidth', 'maxBandwidth'],
+  ['MinErrorToSend', 'minErrorToSend'],
+  ['MinErrorToSendNear', 'minErrorToSendNear'],
+  ['MaxCustomFileSize', 'maxCustomFileSize'],
+];
+
+/**
+ * Mevcut bir basic.cfg'yi profile aktarır. terrainGrid / viewDistance da modele alınır
+ * (artık Arma3Profile'a yazılırlar). Tanınmayan satırlar "ek basic.cfg satırları"na gider.
+ */
+export function importBasicCfg(text: string, base: ServerProfile): ImportResult {
+  try {
+    const { entries, issues } = parseConfig(text);
+    const p = structuredClone(base);
+    const basic = p.basic as Record<string, unknown>;
+    for (const [key, field] of BASIC_KEYS) {
+      const n = asNumber(findValue(entries, key));
+      if (n !== undefined) basic[field] = n;
+    }
+    mapViewSettings(entries, p);
+    const known = new Set([...BASIC_KEYS.map(([k]) => k.toLowerCase()), 'terraingrid', 'viewdistance', 'sockets']);
+    const unknown: CfgEntry[] = entries.filter((en) => (en.kind === 'value' || en.kind === 'class') && !known.has(en.name.toLowerCase()));
+    const sockets = findClass(entries, 'sockets');
+    if (sockets) {
+      const mps = asNumber(findValue(sockets.entries, 'maxPacketSize'));
+      if (mps !== undefined) basic.maxPacketSize = mps;
+      // sockets içindeki diğer ayarlar (ör. initBandwidth) ek satırlarda kalır; üretilen class'la birleşir.
+      const rest = sockets.entries.filter((e) => !(e.kind === 'value' && e.name.toLowerCase() === 'maxpacketsize'));
+      if (rest.some((e) => e.kind === 'value' || e.kind === 'class')) unknown.push({ ...sockets, entries: rest });
+    }
+    if (unknown.length) basic.extraBasicCfg = mergeExtraLines(String(basic.extraBasicCfg ?? ''), dedupeEntries(unknown));
+    return { profile: validateImported(p, base, issues), issues, unknownKeys: unknown.map((u) => (u as { name: string }).name) };
+  } catch (err) {
+    return failedImport(err, base);
+  }
 }

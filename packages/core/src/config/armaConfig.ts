@@ -125,6 +125,10 @@ export interface ParseIssue {
   line: number;
   message: string;
   severity: 'error' | 'warning';
+  /** İngilizce metin (doğrulama mesajlarında kullanılır); yoksa `message` kullanılır. */
+  messageEn?: string;
+  /** Önişlemci satırı (#include, #define ...) yok sayıldıysa true */
+  preprocessor?: boolean;
 }
 
 export interface ParseResult {
@@ -167,7 +171,13 @@ function tokenize(src: string, issues: ParseIssue[]): Token[] {
     if (ch === '#' && atLineStart) {
       const endLine = src.indexOf('\n', i);
       const text = src.slice(i, endLine === -1 ? n : endLine).trim();
-      issues.push({ line, message: `Önişlemci satırı yok sayıldı: ${text}`, severity: 'warning' });
+      issues.push({
+        line,
+        message: `Önişlemci satırı yok sayıldı: ${text}`,
+        messageEn: `Preprocessor line ignored: ${text}`,
+        severity: 'warning',
+        preprocessor: true,
+      });
       i = endLine === -1 ? n : endLine;
       continue;
     }
@@ -228,7 +238,10 @@ function tokenize(src: string, issues: ParseIssue[]): Token[] {
       const after = src[i + text.length];
       // "12abc" gibi tırnaksız metinleri sayı sanma
       if (after === undefined || !/[A-Za-z_.]/.test(after)) {
-        const value = text.toLowerCase().includes('0x') ? parseInt(text, 16) : Number(text);
+        let value: number | string = text.toLowerCase().includes('0x') ? parseInt(text, 16) : Number(text);
+        // 15 haneden uzun tam sayılar (ör. tırnaksız Steam64 ID) double'a sığmaz; rakamları aynen sakla.
+        // Sonlu olmayan sayılar (1e999) da metin olarak kalır.
+        if (/^-?\d{16,}$/.test(text) || !Number.isFinite(value)) value = text;
         tokens.push({ kind: 'number', text, value, line, start: i, end: i + text.length });
         i += text.length;
         continue;
@@ -287,14 +300,49 @@ class Parser {
     }
   }
 
+  /** Bir değerin satır sonunda kesildiği (sonraki satır yeni ifade olduğu için) bilgisi. */
+  private brokeAtNewline: Token | null = null;
+
   private expectSemicolon(): void {
     const t = this.peek();
+    const broke = this.brokeAtNewline;
+    this.brokeAtNewline = null;
     if (this.isPunct(t, ';')) {
       this.next();
       return;
     }
+    if (broke) {
+      // Değer satır sonunda kesildi: ';' olmadan Arma sonraki satırı değere katar ya da hata verir.
+      this.issues.push({
+        line: broke.line,
+        message: "';' eksik: sonraki satır yeni bir ifade olarak okundu (Arma bu iki satırı tek değer sanar)",
+        messageEn: "Missing ';': the next line was read as a new statement (Arma would merge both lines into one value)",
+        severity: 'error',
+      });
+      return;
+    }
     // Arma eksik ';' karakterini çoğu zaman tolere eder; uyar.
-    this.issues.push({ line: t.line, message: "';' eksik", severity: 'warning' });
+    this.issues.push({ line: t.line, message: "';' eksik", messageEn: "Missing ';'", severity: 'warning' });
+  }
+
+  /** `offset` konumundaki token yeni bir ifade başlatıyor mu? (ad =, ad[] =, ad[] +=, class Ad) */
+  private startsStatement(offset = 0): boolean {
+    const t = this.peek(offset);
+    if (t.kind !== 'ident' || !isIdentifier(t.text)) return false;
+    const n1 = this.peek(offset + 1);
+    if (t.text === 'class') return n1.kind === 'ident' && isIdentifier(n1.text);
+    if (this.isPunct(n1, '=')) return true;
+    if (this.isPunct(n1, '[') && this.isPunct(this.peek(offset + 2), ']')) {
+      const op = this.peek(offset + 3);
+      return this.isPunct(op, '=') || this.isPunct(op, '+=');
+    }
+    return false;
+  }
+
+  /** Bir önceki token'dan sonra satır değişmiş ve yeni bir ifade başlıyor mu? */
+  private newStatementOnNextLine(): boolean {
+    const prev = this.tokens[this.pos - 1];
+    return !!prev && this.peek().line > prev.line && this.startsStatement();
   }
 
   parseEntries(untilBrace: boolean): CfgEntry[] {
@@ -413,6 +461,11 @@ class Parser {
         this.next();
         return items;
       }
+      if (this.newStatementOnNextLine()) {
+        // Dizi kapanmadan sonraki satırda yeni bir ifade başlamış: onu yutma.
+        this.error(open, "Kapanmamış dizi '{'");
+        return items;
+      }
       if (this.isPunct(t, ',')) {
         this.next();
         continue;
@@ -427,33 +480,49 @@ class Parser {
 
   /** Tek bir değer oku. Tırnaksız metinler (ör. template = co10.Altis;) string olarak alınır. */
   private parseScalarUntil(stops: string[]): CfgScalar {
-    const first = this.peek();
-    const second = this.peek(1);
     const isStop = (tok: Token) => tok.kind === 'eof' || (tok.kind === 'punct' && stops.includes(tok.text));
-    if ((first.kind === 'string' || first.kind === 'number') && isStop(second)) {
-      this.next();
-      return first.value as string | number;
+    // Değerin token'larını topla. Satır değişip yeni bir ifade (ad = ...) başlarsa dur:
+    // eksik ';' yüzünden sonraki satırı sessizce yutmayalım.
+    const toks: Token[] = [];
+    while (!isStop(this.peek())) {
+      if (this.newStatementOnNextLine()) {
+        this.brokeAtNewline = this.tokens[this.pos - 1]!;
+        break;
+      }
+      toks.push(this.next());
     }
-    if (first.kind === 'ident' && isStop(second)) {
-      this.next();
+    const first = toks[0];
+    if (!first) {
+      this.error(this.peek(), 'Değer bekleniyordu');
+      return '';
+    }
+    if (toks.length === 1) {
+      if (first.kind === 'string' || first.kind === 'number') return first.value as string | number;
       if (first.text.toLowerCase() === 'true') return true;
       if (first.text.toLowerCase() === 'false') return false;
       return first.text;
     }
+    const last = toks[toks.length - 1]!;
     if (first.kind === 'string') {
-      // "abc" "def" ya da "a "b" c" gibi: içteki tırnak kaçırılmamış.
+      // "a "b" c" gibi (TADST çıktısı): içteki tırnak kaçırılmamış. Değer aynı satırda ve bir
+      // tırnakla bitiyorsa ilk ve son tırnak arasındaki ham metni al ("" -> ").
+      const oneLine = toks.every((tk) => tk.line === first.line) && !this.src.slice(first.start, last.end).includes('\n');
+      if (oneLine && last.kind === 'string' && this.src[last.end - 1] === this.src[first.start]) {
+        const q = this.src[first.start]!;
+        const value = this.src.slice(first.start + 1, last.end - 1).split(q + q).join(q);
+        this.issues.push({
+          line: first.line,
+          message: `String içindeki tırnaklar kaçırılmamış; ilk ve son tırnak arası alındı: ${value} (içteki tırnaklar "" olarak yazılmalı)`,
+          messageEn: `Unescaped quotes inside a string; took the text between the first and last quote: ${value} (inner quotes must be written as "")`,
+          severity: 'warning',
+        });
+        return value;
+      }
+      // "abc" def gibi: ne olduğu belirsiz.
       this.error(first, 'String değerden sonra beklenmeyen ifade (içteki tırnaklar "" olarak yazılmalı)');
     }
     // Tırnaksız ve birden fazla token'a yayılan değer: ham metni al.
-    const startTok = first;
-    let endTok = first;
-    while (!isStop(this.peek())) endTok = this.next();
-    if (startTok === endTok && isStop(startTok)) {
-      this.error(startTok, 'Değer bekleniyordu');
-      return '';
-    }
-    const raw = this.src.slice(startTok.start, endTok.end).trim();
-    return raw;
+    return this.src.slice(first.start, last.end).trim();
   }
 }
 

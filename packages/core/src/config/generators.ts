@@ -11,6 +11,7 @@ import {
   v,
 } from './armaConfig.js';
 import {
+  DEFAULT_VOTE_CMDS,
   DIFFICULTY_OPTIONS,
   type DifficultyOptionKey,
   type ServerProfile,
@@ -47,7 +48,7 @@ export function parseExtraLines(text: string, label: string): CfgEntry[] {
   if (errors.length) {
     throw new ConfigSyntaxError(
       `${label} içinde sözdizimi hatası: ` + errors.map((e) => `satır ${e.line}: ${e.message}`).join('; '),
-      errors.map((e) => ({ line: e.line, message: e.message })),
+      errors.map((e) => ({ line: e.line, message: e.message, ...(e.messageEn ? { messageEn: e.messageEn } : {}) })),
     );
   }
   return entries;
@@ -56,27 +57,73 @@ export function parseExtraLines(text: string, label: string): CfgEntry[] {
 export class ConfigSyntaxError extends Error {
   constructor(
     message: string,
-    readonly details: { line: number; message: string }[],
+    readonly details: { line: number; message: string; messageEn?: string }[],
   ) {
     super(message);
     this.name = 'ConfigSyntaxError';
   }
 }
 
+const named = (e: CfgEntry): e is Extract<CfgEntry, { kind: 'value' | 'class' }> => e.kind === 'value' || e.kind === 'class';
+type ClassEntry = Extract<CfgEntry, { kind: 'class' }>;
+
+/** Aynı adlı iki class'ı birleştirir: ek class'taki üyeler aynı adlı üyelerin yerine geçer, diğerleri kalır. */
+function mergeClass(gen: ClassEntry, extra: ClassEntry): ClassEntry {
+  const base = extra.base ?? gen.base;
+  const merged: ClassEntry = { ...gen, entries: mergeMembers(gen.entries, extra.entries) };
+  if (base) merged.base = base;
+  else delete merged.base;
+  return merged;
+}
+
+/** Class içi birleştirme: aynı adlı class'lar özyinelemeli birleşir; değer (ya da değer/class çakışması) ekten gelir. */
+function mergeMembers(gen: CfgEntry[], extra: CfgEntry[]): CfgEntry[] {
+  const out = [...gen];
+  for (const x of extra) {
+    if (!named(x)) {
+      out.push(x);
+      continue;
+    }
+    const key = x.name.toLowerCase();
+    const idx = out.findIndex((e) => named(e) && e.name.toLowerCase() === key);
+    if (idx === -1) {
+      out.push(x);
+      continue;
+    }
+    const g = out[idx]!;
+    out[idx] = g.kind === 'class' && x.kind === 'class' ? mergeClass(g, x) : x;
+  }
+  return out;
+}
+
 /**
- * Ek satırlarda tanımlanan anahtarlar, üretilen aynı adlı girdilerin yerine geçer.
+ * Ek satırlarda tanımlanan değerler, üretilen aynı adlı değerlerin yerine geçer. Aynı adlı bir
+ * class ise üretilen class'la özyinelemeli birleşir (ör. ek `class sockets { initBandwidth = ...; };`
+ * üretilen maxPacketSize'ı silmez). Değer/class ad çakışmasında ek satır kazanır.
  * Ek satırların kendi içindeki tekrarlar da temizlenir (son tanım kalır); Arma aynı adı
  * iki kez görünce "Member already defined" deyip açılmaz.
  */
 function applyOverrides(generated: CfgEntry[], extra: CfgEntry[]): CfgEntry[] {
   if (!extra.length) return dedupeEntries(generated);
-  const names = new Set(
-    extra.filter((e) => e.kind === 'value' || e.kind === 'class').map((e) => (e as { name: string }).name.toLowerCase()),
-  );
-  const filtered = generated.filter(
-    (e) => !((e.kind === 'value' || e.kind === 'class') && names.has(e.name.toLowerCase())),
-  );
-  return dedupeEntries([...filtered, blank(), comment('Ek satırlar (kullanıcı tanımlı)'), ...extra]);
+  let result = [...generated];
+  const tail: CfgEntry[] = [];
+  for (const x of dedupeEntries(extra)) {
+    if (!named(x)) {
+      tail.push(x);
+      continue;
+    }
+    const key = x.name.toLowerCase();
+    const idx = result.findIndex((e) => named(e) && e.name.toLowerCase() === key);
+    const g = idx === -1 ? undefined : result[idx];
+    if (g && g.kind === 'class' && x.kind === 'class') {
+      result[idx] = mergeClass(g, x);
+      continue;
+    }
+    if (g) result = result.filter((e) => !(named(e) && e.name.toLowerCase() === key));
+    tail.push(x);
+  }
+  if (!tail.some(named)) return dedupeEntries(result);
+  return dedupeEntries([...result, blank(), comment('Ek satırlar (kullanıcı tanımlı)'), ...tail]);
 }
 
 /**
@@ -161,6 +208,13 @@ export function generateServerCfg(p: ServerProfile, opts: GenerateOptions = {}):
   e.push(v('voteMissionPlayers', p.voting.voteMissionPlayers));
   if (p.voting.enabled) {
     e.push(v('voteThreshold', p.voting.voteThreshold));
+    if (!p.voting.allowAdminVote) {
+      // allowedVoteCmds[] yazılmazsa her oy komutu, #vote admin dahil, serbesttir.
+      // Biçim: {komut, görev başlamadan önce, görev başladıktan sonra}.
+      e.push(v('allowedVoteCmds', DEFAULT_VOTE_CMDS.map((c) => [...c]), '#vote admin kapalı'));
+      // Oylamayla seçilmiş admin (eski config'lerden kalma) hiçbir admin komutu kullanamasın.
+      e.push(v('allowedVotedAdminCmds', []));
+    }
   } else {
     // Oylamayı tamamen kapat: izinli oy komutu yok + eşik %150 (ulaşılamaz).
     e.push(v('allowedVoteCmds', []));
@@ -212,7 +266,8 @@ export function generateServerCfg(p: ServerProfile, opts: GenerateOptions = {}):
     cls(
       'Missions',
       missions.map((mission, i) => {
-        const inner: CfgEntry[] = [v('template', mission.template), v('difficulty', mission.difficulty)];
+        // forcedDifficulty doluysa görevin kendi zorluğu onu ezmesin: her göreve aynısı yazılır.
+        const inner: CfgEntry[] = [v('template', mission.template), v('difficulty', m.forcedDifficulty || mission.difficulty)];
         if (mission.params.length) inner.push(cls('Params', mission.params.map((pp) => v(pp.name, pp.value))));
         return cls(`Mission_${i + 1}`, inner);
       }),
@@ -250,8 +305,7 @@ export function generateBasicCfg(p: ServerProfile, opts: GenerateOptions = {}): 
   e.push(v('MinErrorToSendNear', bc.minErrorToSendNear));
   e.push(v('MaxCustomFileSize', bc.maxCustomFileSize));
   e.push(cls('sockets', [v('maxPacketSize', bc.maxPacketSize)]));
-  if (bc.terrainGrid > 0) e.push(v('terrainGrid', bc.terrainGrid));
-  if (bc.viewDistance > 0) e.push(v('viewDistance', bc.viewDistance));
+  // terrainGrid / viewDistance basic.cfg'de değil, Arma3Profile'ın en üst seviyesinde okunur.
   const extra = parseExtraLines(bc.extraBasicCfg, 'Ek basic.cfg satırları');
   return selfCheck(serializeEntries(applyOverrides(e, extra)) + '\n', 'basic.cfg');
 }
@@ -275,6 +329,9 @@ export function generateArma3Profile(p: ServerProfile, opts: GenerateOptions = {
       cls('CustomAILevel', [v('skillAI', d.skillAI), v('precisionAI', d.precisionAI)]),
     ]),
   ];
+  // Sunucu bunları profilin en üst seviyesinden okur (basic.cfg'de yok sayılırlar). Model alanı p.basic'te kalır.
+  if (p.basic.viewDistance > 0) e.push(v('viewDistance', p.basic.viewDistance));
+  if (p.basic.terrainGrid > 0) e.push(v('terrainGrid', p.basic.terrainGrid));
   return selfCheck(serializeEntries(e) + '\n', 'Arma3Profile');
 }
 

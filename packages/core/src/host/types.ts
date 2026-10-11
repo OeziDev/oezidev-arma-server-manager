@@ -12,6 +12,8 @@ export interface ExecResult {
   code: number | null;
   stdout: string;
   stderr: string;
+  /** timeoutMs aşıldı: süreç (grubu) öldürüldü, `code` null döner */
+  timedOut?: boolean;
 }
 
 export interface ExecOptions {
@@ -34,6 +36,14 @@ export interface StreamingProcess {
   wait(): Promise<number | null>;
 }
 
+export interface WriteFileOptions {
+  /**
+   * Dosya izinleri (ör. 0o600: şifre içeren server.cfg / beserver_x64.cfg başkaları tarafından okunmasın).
+   * Verilmezse eski davranış: 0o666 & umask. Windows'ta yok sayılır.
+   */
+  mode?: number;
+}
+
 export interface DetachedOptions {
   cwd: string;
   /** stdout + stderr bu dosyaya eklenir */
@@ -54,14 +64,56 @@ export interface ProcessInfo {
   commandLine?: string;
 }
 
+/** Windows yolu mu? (C:\yol, \\sunucu\pay, ters bölü içeren ya da .exe) */
+function looksWindows(executablePath: string, marker?: string): boolean {
+  return /^[a-z]:[\\/]|\\/i.test(executablePath) || /\.exe$/i.test(executablePath) || (!!marker && /\\|=[a-z]:/i.test(marker));
+}
+
+/**
+ * Komut satırını/işareti karşılaştırma için normalleştirir.
+ * Windows: küçük harf, / -> \, tırnaklar atılır (yollarda " olamaz), çift ayraçlar teklenir.
+ * Her iki sistemde de sınırdan (boşluk, tırnak, son) hemen önceki sondaki ayraç atılır:
+ * "-profiles=C:\yol\" ile "-profiles=C:\yol" aynı sayılır.
+ */
+function normalizeForMatch(s: string, windows: boolean): string {
+  if (windows) {
+    return s
+      .toLowerCase()
+      .replace(/\//g, '\\')
+      .replace(/"/g, '')
+      .replace(/\\{2,}/g, '\\')
+      .replace(/\\(?=\s|$)/g, '');
+  }
+  return s.replace(/\/{2,}/g, '/').replace(/\/(?=["'\s]|$)/g, '');
+}
+
+/**
+ * İşaret komut satırında TAM bir argüman olarak geçiyor mu?
+ * Önünde: satır başı, boşluk veya tırnak. Arkasında: satır sonu, tırnak ya da boşluk + yeni argüman (-...) / satır sonu.
+ * Böylece "-profiles=/p" işareti "-profiles=/p/hc1"i, "hc1" işareti "hc10"u, ".../57-alay" ".../57-alay-test"i eşlemez.
+ */
+export function commandLineHasMarker(commandLine: string, marker: string, windows = false): boolean {
+  const line = normalizeForMatch(commandLine, windows).trim();
+  const m = normalizeForMatch(marker, windows).trim();
+  if (!m) return true;
+  for (let i = line.indexOf(m); i >= 0; i = line.indexOf(m, i + 1)) {
+    const before = i === 0 ? '' : line[i - 1]!;
+    if (before !== '' && !/[\s"']/.test(before)) continue;
+    const rest = line.slice(i + m.length);
+    if (rest === '' || /^["']/.test(rest) || /^\s+(?:$|[-"'])/.test(rest)) return true;
+  }
+  return false;
+}
+
 /** PID'deki süreç bizim başlattığımız çalıştırılabilir dosya mı? (PID yeniden kullanımına karşı) */
 export function processMatches(info: ProcessInfo, executablePath: string, marker?: string): boolean {
   if (!info.alive) return false;
   const base = executablePath.split(/[\\/]/).pop()!.toLowerCase();
   const nameOk = (!info.image && !info.comm) || info.image === base || (info.comm !== undefined && info.comm === base.slice(0, 15));
   if (!nameOk) return false;
-  // Aynı makinede birden fazla sunucu aynı exe ile çalışır: komut satırındaki işaret (ör. -profiles=...) ayırt eder
-  if (marker && info.commandLine !== undefined) return info.commandLine.includes(marker);
+  // Aynı makinede birden fazla sunucu aynı exe ile çalışır: komut satırındaki işaret (ör. -profiles=...) ayırt eder.
+  // Düz alt dize araması yetmez (sunucu işareti HC'leri, hc1 hc10'u eşlerdi): argüman sınırı aranır.
+  if (marker && info.commandLine !== undefined) return commandLineHasMarker(info.commandLine, marker, looksWindows(executablePath, marker));
   return true;
 }
 
@@ -114,8 +166,8 @@ export interface Host {
 
   readFile(path: string): Promise<Buffer>;
   readText(path: string): Promise<string>;
-  /** Atomik yazar (geçici dosya + yeniden adlandırma), üst klasörleri oluşturur. */
-  writeFile(path: string, data: string | Buffer): Promise<void>;
+  /** Atomik yazar (geçici dosya + yeniden adlandırma), üst klasörleri oluşturur. `opts.mode` ile izin verilebilir (ör. 0o600). */
+  writeFile(path: string, data: string | Buffer, opts?: WriteFileOptions): Promise<void>;
   exists(path: string): Promise<boolean>;
   stat(path: string): Promise<{ isDir: boolean; size: number; mtimeMs: number } | null>;
   list(path: string): Promise<DirEntry[]>;
@@ -146,6 +198,11 @@ export interface Host {
   readonly systemd?: SystemdApi;
   /** Her başarılı (yeniden) bağlantıda artar; uzun süreli akışların yenilenmesi için */
   readonly generation: number;
+  /**
+   * Host'un saatine göre şu anki zaman (Unix ms). Yerelde Date.now(); SSH'ta uzak `date` (gecikmenin yarısı eklenir).
+   * journalctl --since gibi uzak saatle karşılaştırılan değerler için (VPS saati kayık olabilir).
+   */
+  getRemoteTime?(): Promise<number>;
 }
 
 export class HostError extends Error {

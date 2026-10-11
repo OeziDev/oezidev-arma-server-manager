@@ -15,6 +15,22 @@ export const DEFAULT_LOAD_EXTENSIONS = [
 ];
 export const DEFAULT_HTML_EXTENSIONS = ['htm', 'html', 'xml', 'txt'];
 
+/**
+ * Oylama açık ve "#vote admin" kapalıyken yazılan izinli oy komutları:
+ * {komut, görev başlamadan önce, görev başladıktan sonra}. "admin" bilinçli olarak yok.
+ * (BI wiki "Arma 3: Mission voting": liste yazılmazsa her komut, admin dahil, serbesttir.)
+ */
+export const DEFAULT_VOTE_CMDS: readonly (readonly [string, boolean, boolean])[] = [
+  ['missions', true, true],
+  ['mission', true, true],
+  ['kick', false, true],
+  ['restart', true, true],
+  ['reassign', true, true],
+];
+
+/** allowedVoteCmds[] içinde tanınan oy komutları. */
+export const KNOWN_VOTE_CMDS = ['admin', 'missions', 'mission', 'kick', 'restart', 'reassign'] as const;
+
 /** Arma 3 CustomDifficulty seçenekleri. Değer aralıkları Bohemia dokümantasyonuna göre. */
 export const DIFFICULTY_OPTIONS = {
   reducedDamage: { max: 1, default: 0, group: 'simulation' },

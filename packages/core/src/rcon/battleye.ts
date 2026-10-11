@@ -105,6 +105,10 @@ export class BattlEyeRcon extends EventEmitter<RconEvents> {
   private loginWaiter: { resolve: () => void; reject: (e: Error) => void } | null = null;
   private recentMessages = new Map<number, number>();
   private closedByUser = false;
+  /** Süren bağlanma denemesi (eşzamanlı connect() çağrıları bunu paylaşır) */
+  private connecting: Promise<void> | null = null;
+  /** Her denemede artar; close() eski denemeleri geçersiz kılar */
+  private attempt = 0;
   private _state: RconState = 'disconnected';
   private readonly opts: Required<RconOptions>;
 
@@ -123,16 +127,33 @@ export class BattlEyeRcon extends EventEmitter<RconEvents> {
     this.emit('state', s, reason);
   }
 
-  async connect(): Promise<void> {
+  /**
+   * Bağlan ve giriş yap. Bağlanma sürerken gelen ikinci çağrı aynı söz'ü (promise) alır;
+   * böylece iki deneme birbirinin soketini kapatmaz ve hiçbir çağrı asılı kalmaz.
+   */
+  connect(): Promise<void> {
     this.closedByUser = false;
-    if (this._state === 'connected') return;
+    if (this._state === 'connected') return Promise.resolve();
+    if (this.connecting) return this.connecting;
+    const p = this.doConnect().finally(() => {
+      if (this.connecting === p) this.connecting = null;
+    });
+    this.connecting = p;
+    return p;
+  }
+
+  private async doConnect(): Promise<void> {
     this.clearReconnect();
+    const attempt = ++this.attempt;
     this.setState('connecting');
     try {
-      await this.openAndLogin();
+      await this.openAndLogin(attempt);
+      if (attempt !== this.attempt) throw new RconError('RCON bağlantısı kapandı', 'closed');
       this.setState('connected');
       this.startTimers();
     } catch (err) {
+      // Bu deneme close() ile geçersizleştirildiyse yeni durumu/soketi bozma
+      if (attempt !== this.attempt) throw err;
       this.teardown();
       this.setState('disconnected', (err as Error).message);
       if (err instanceof RconError && err.code === 'auth_failed') throw err;
@@ -141,23 +162,43 @@ export class BattlEyeRcon extends EventEmitter<RconEvents> {
     }
   }
 
-  private async openAndLogin(): Promise<void> {
+  private async openAndLogin(attempt: number): Promise<void> {
     this.teardown();
     const family = net.isIPv6(this.opts.host) ? 'udp6' : 'udp4';
     const socket = dgram.createSocket(family);
     this.socket = socket;
-    socket.on('message', (msg) => this.onMessage(msg));
-    socket.on('error', (err) => this.onDisconnect(`Soket hatası: ${err.message}`));
-    await new Promise<void>((resolve, reject) => {
-      socket.once('error', reject);
-      socket.connect(this.opts.port, this.opts.host, () => {
-        socket.off('error', reject);
-        resolve();
-      });
+    // Sadece güncel soketin olayları işlenir (eski denemenin soketi yenisini etkilemesin)
+    socket.on('message', (msg) => {
+      if (this.socket === socket) this.onMessage(msg);
     });
+    socket.on('error', (err) => {
+      if (this.socket === socket) this.onDisconnect(`Soket hatası: ${err.message}`);
+    });
+    await new Promise<void>((resolve, reject) => {
+      const onClose = () => reject(new RconError('RCON bağlantısı kapandı', 'closed'));
+      const onError = (err: Error) => {
+        socket.off('close', onClose);
+        reject(err);
+      };
+      socket.once('error', onError);
+      // Bağlanma sırasında soket kapatılırsa connect geri çağrısı hiç gelmez: söz asılı kalmasın
+      socket.once('close', onClose);
+      try {
+        socket.connect(this.opts.port, this.opts.host, () => {
+          socket.off('error', onError);
+          socket.off('close', onClose);
+          resolve();
+        });
+      } catch (err) {
+        socket.off('error', onError);
+        socket.off('close', onClose);
+        reject(err as Error);
+      }
+    });
+    if (attempt !== this.attempt || this.socket !== socket) throw new RconError('RCON bağlantısı kapandı', 'closed');
     const loginPacket = buildPacket(PacketType.Login, Buffer.from(this.opts.password, 'utf8'));
     let lastErr: Error = new RconError('RCON sunucusu cevap vermedi', 'timeout');
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let tries = 0; tries < 3; tries++) {
       try {
         await new Promise<void>((resolve, reject) => {
           const timer = setTimeout(() => {
@@ -174,12 +215,19 @@ export class BattlEyeRcon extends EventEmitter<RconEvents> {
               reject(e);
             },
           };
-          socket.send(loginPacket);
+          try {
+            socket.send(loginPacket);
+          } catch (err) {
+            this.loginWaiter = null;
+            clearTimeout(timer);
+            reject(err as Error);
+          }
         });
         return;
       } catch (err) {
         lastErr = err as Error;
-        if (err instanceof RconError && err.code === 'auth_failed') throw err;
+        if (err instanceof RconError && (err.code === 'auth_failed' || err.code === 'closed')) throw err;
+        if (attempt !== this.attempt || this.socket !== socket) throw new RconError('RCON bağlantısı kapandı', 'closed');
       }
     }
     throw lastErr;
@@ -329,6 +377,8 @@ export class BattlEyeRcon extends EventEmitter<RconEvents> {
 
   close() {
     this.closedByUser = true;
+    this.attempt++;
+    this.connecting = null;
     this.clearReconnect();
     this.teardown();
     this.setState('disconnected', 'Kapatıldı');

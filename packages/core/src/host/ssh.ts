@@ -11,12 +11,12 @@ import {
   type ExecResult,
   type Host,
   HostError,
-  LineSplitter,
   type ProcessInfo,
   type StreamingProcess,
   type SystemdApi,
   type TailHandle,
   type TailOptions,
+  type WriteFileOptions,
 } from './types.js';
 import { createSystemdApi } from './systemd.js';
 import { followWithRestart } from './follow.js';
@@ -48,6 +48,28 @@ function sh(file: string, args: string[]): string {
   return [file, ...args].map(quotePosixArg).join(' ');
 }
 
+/** spawn edilen uzak sürecin PID'ini bildiren ilk satır */
+const PID_MARKER = '__OEZI_PID__';
+const PID_LINE_RE = /^__OEZI_PID__(\d+)\r?$/;
+
+/** Uzak `timeout` süresi: yerel zamanlayıcı önce dolsun, uzak taraf az sonra yine de öldürsün */
+function remoteTimeoutSec(timeoutMs: number): number {
+  return Math.max(1, Math.ceil(timeoutMs / 1000) + 1);
+}
+
+/** `date +%s%3N` / `date +%s` çıktısından Unix ms (GNU dışı date %3N'i desteklemeyebilir) */
+export function parseRemoteDate(stdout: string): number | null {
+  const lines = stdout.split('\n').map((l) => l.trim());
+  if (lines[0] && /^\d{13}$/.test(lines[0])) return Number(lines[0]);
+  const sec = lines.find((l) => /^\d{9,11}$/.test(l));
+  return sec ? Number(sec) * 1000 : null;
+}
+
+interface ActiveRemote {
+  pid: number;
+  privileged: boolean;
+}
+
 /** SSH ile bağlanılan Linux sunucusu. */
 export class SshHost implements Host {
   readonly kind = 'ssh' as const;
@@ -67,6 +89,8 @@ export class SshHost implements Host {
   private streamConn: SshHost | null = null;
   /** İlk bağlantıda öğrenilen parmak izi için geri çağrı (kaydetmek üzere) */
   onFingerprintLearned?: (fp: string) => void;
+  /** spawn ile başlatılıp hâlâ çalışan uzak süreç grupları (kapatırken öldürülür; journalctl -f vb. kalmasın) */
+  private readonly active = new Set<ActiveRemote>();
 
   get generation(): number {
     return this._generation;
@@ -76,7 +100,7 @@ export class SshHost implements Host {
     this.id = cfg.id;
     this.label = cfg.label ?? `${cfg.username}@${cfg.host}`;
     this.systemd = createSystemdApi(
-      (file, args) => this.exec(file, args, { privileged: true } as ExecOptions),
+      (file, args, o) => this.exec(file, args, { ...o, privileged: true }),
       (p, d) => this.writePrivileged(p, d),
       (p) => this.removePrivileged(p),
     );
@@ -125,32 +149,63 @@ export class SshHost implements Host {
     }
     if (this.cfg.password) config.password = this.cfg.password;
 
+    // ssh2, readyTimeout sonrasında ikinci bir 'error' ("Connection lost before handshake") yayabilir:
+    // dinleyici yoksa Electron ana sürecinde yakalanmamış istisna olur. Kalıcı dinleyici bağlantıdan ÖNCE eklenir.
+    let ready = false;
     await new Promise<void>((resolve, reject) => {
-      client
-        .once('ready', () => resolve())
-        .once('error', (err: Error & { level?: string }) => {
-          if (mismatch) {
-            reject(
-              new HostError(
-                `Sunucu kimliği değişmiş! Beklenen ${this.cfg.expectedFingerprint}, gelen ${mismatch}. Sunucuyu yeniden kurmadıysan bağlanma (araya giren biri olabilir).`,
-                'host_key_mismatch',
-              ),
-            );
-          } else if (err.level === 'client-authentication') {
-            reject(new HostError('SSH girişi reddedildi: kullanıcı adı, şifre veya anahtar hatalı.', 'auth_failed'));
-          } else {
-            reject(new HostError(`SSH bağlantısı kurulamadı: ${err.message}`, 'connect_failed'));
-          }
-        })
-        .connect(config);
-    });
-    client.on('close', () => {
-      this.connected = false;
-      this.sftpConn = null;
-      this.client = null;
-    });
-    client.on('error', () => {
-      /* bağlantı sonrası hatalar 'close' ile ele alınır */
+      let settled = false;
+      const fail = (err: HostError) => {
+        if (settled) return;
+        settled = true;
+        try {
+          client.end();
+        } catch {
+          /* zaten kapalı */
+        }
+        reject(err);
+      };
+      client.on('error', (err: Error & { level?: string }) => {
+        if (ready || settled) return; // bağlantı sonrası hatalar 'close' ile ele alınır
+        if (mismatch) {
+          fail(
+            new HostError(
+              `Sunucu kimliği değişmiş! Beklenen ${this.cfg.expectedFingerprint}, gelen ${mismatch}. Sunucuyu yeniden kurmadıysan bağlanma (araya giren biri olabilir).`,
+              'host_key_mismatch',
+            ),
+          );
+        } else if (err.level === 'client-authentication') {
+          fail(new HostError('SSH girişi reddedildi: kullanıcı adı, şifre veya anahtar hatalı.', 'auth_failed'));
+        } else {
+          fail(new HostError(`SSH bağlantısı kurulamadı: ${err.message}`, 'connect_failed'));
+        }
+      });
+      client.on('close', () => {
+        if (!ready) {
+          fail(new HostError('SSH bağlantısı kurulamadı: bağlantı kapandı', 'connect_failed'));
+          return;
+        }
+        // Eski bir istemcinin geç gelen 'close' olayı yeni bağlantıyı silmesin
+        if (this.client === client) {
+          this.connected = false;
+          this.sftpConn = null;
+          this.client = null;
+        }
+      });
+      client.once('ready', () => {
+        if (settled) {
+          client.end();
+          return;
+        }
+        settled = true;
+        ready = true;
+        resolve();
+      });
+      try {
+        client.connect(config);
+      } catch (err) {
+        // ör. özel anahtar ayrıştırılamadı (eşzamanlı fırlatır)
+        fail(new HostError(`SSH bağlantısı kurulamadı: ${(err as Error).message}`, 'connect_failed'));
+      }
     });
     this.client = client;
     this.connected = true;
@@ -176,6 +231,12 @@ export class SshHost implements Host {
       await this.streamConn.close();
       this.streamConn = null;
     }
+    if (this.active.size && this.connected) {
+      // Kanal kapanınca uzak süreç ölmez (pty yok, SIGHUP gitmez): takip edilen grupları öldür, en fazla 5 sn bekle
+      const kills = [...this.active].map((a) => this.killGroup(a.pid, a.privileged));
+      await Promise.race([Promise.allSettled(kills), new Promise((r) => setTimeout(r, 5000))]);
+    }
+    this.active.clear();
     const c = this.client;
     this.connected = false;
     this.sftpConn = null;
@@ -194,14 +255,23 @@ export class SshHost implements Host {
     this.sftpConn = await new Promise<SFTPWrapper>((resolve, reject) =>
       client.sftp((err, s) => (err ? reject(new HostError(`SFTP açılamadı: ${err.message}`, 'sftp_failed')) : resolve(s))),
     );
-    this.sftpConn.on('close', () => {
-      this.sftpConn = null;
+    const conn = this.sftpConn;
+    conn.on('close', () => {
+      if (this.sftpConn === conn) this.sftpConn = null;
     });
-    return this.sftpConn;
+    conn.on('error', () => {
+      if (this.sftpConn === conn) this.sftpConn = null;
+    });
+    return conn;
+  }
+
+  /** Bu komut gerçekten sudo ile mi çalışacak? */
+  private usesSudo(privileged: boolean): boolean {
+    return privileged && !this.isRoot && !!this.cfg.useSudo;
   }
 
   private withPrivilege(cmd: string, privileged: boolean): string {
-    if (!privileged || this.isRoot || !this.cfg.useSudo) return cmd;
+    if (!this.usesSudo(privileged)) return cmd;
     return `sudo -n sh -c ${quotePosixArg(cmd)}`;
   }
 
@@ -211,41 +281,73 @@ export class SshHost implements Host {
       const envs = Object.entries(opts.env).map(([k, val]) => `${k}=${quotePosixArg(val)}`);
       cmd = `env ${envs.join(' ')} ${cmd}`;
     }
+    // Uzak tarafta da süre sınırı: kanal kapansa/bağlantı kopsa bile süreç (grubu) öldürülür.
+    // sudo'nun İÇİNDE olmalı: kullanıcı yetkisiyle root süreçleri öldürülemez.
+    if (opts.timeoutMs) cmd = `timeout -s KILL ${remoteTimeoutSec(opts.timeoutMs)} ${cmd}`;
     if (opts.cwd) cmd = `cd ${quotePosixArg(opts.cwd)} && ${cmd}`;
     return this.withPrivilege(cmd, !!opts.privileged);
   }
 
   private openExec(command: string, pty = false): Promise<ClientChannel> {
     const client = this.requireClient();
-    return new Promise((resolve, reject) =>
-      client.exec(command, pty ? { pty: true } : {}, (err, stream) =>
-        err ? reject(new HostError(`Komut çalıştırılamadı: ${err.message}`, 'exec_failed')) : resolve(stream),
-      ),
-    );
+    return new Promise((resolve, reject) => {
+      try {
+        client.exec(command, pty ? { pty: true } : {}, (err, stream) =>
+          err ? reject(new HostError(`Komut çalıştırılamadı: ${err.message}`, 'exec_failed')) : resolve(stream),
+        );
+      } catch (err) {
+        reject(new HostError(`Komut çalıştırılamadı: ${(err as Error).message}`, 'exec_failed'));
+      }
+    });
   }
 
+  /**
+   * Kabuk komutu çalıştırır. `timeoutMs` verilirse komut uzakta `timeout -s KILL` ile sarılır ve süre dolunca
+   * hemen { code: null, timedOut: true } döner (kanal kapatılır, KILL sinyali gönderilir).
+   */
   async runShell(command: string, opts: { timeoutMs?: number; input?: string } = {}): Promise<ExecResult> {
+    const cmd = opts.timeoutMs ? `timeout -s KILL ${remoteTimeoutSec(opts.timeoutMs)} sh -c ${quotePosixArg(command)}` : command;
+    return this.runRaw(cmd, opts);
+  }
+
+  private async runRaw(command: string, opts: { timeoutMs?: number; input?: string } = {}): Promise<ExecResult> {
     const stream = await this.openExec(command);
     return new Promise((resolve) => {
       let stdout = '';
       let stderr = '';
       let timer: NodeJS.Timeout | undefined;
+      let settled = false;
+      const finish = (r: ExecResult) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        resolve(r);
+      };
       stream.setEncoding('utf8');
       stream.stderr.setEncoding('utf8');
+      stream.on('error', () => undefined);
+      stream.stderr.on('error', () => undefined);
       stream.on('data', (c: string) => {
         if (stdout.length < 64 * 1024 * 1024) stdout += c;
       });
       stream.stderr.on('data', (c: string) => {
         if (stderr.length < 16 * 1024 * 1024) stderr += c;
       });
-      stream.on('close', (code: number | null) => {
-        if (timer) clearTimeout(timer);
-        resolve({ code: code ?? null, stdout, stderr });
-      });
+      stream.on('close', (code: number | null) => finish({ code: code ?? null, stdout, stderr }));
       if (opts.timeoutMs) {
         timer = setTimeout(() => {
-          stderr += '\n[zaman aşımı]';
-          stream.close();
+          // Kanalı kapatmak uzak süreci durdurmaz; asıl öldürme uzak `timeout` ile olur. Beklemeden dön.
+          try {
+            stream.signal('KILL');
+          } catch {
+            /* desteklenmiyor */
+          }
+          try {
+            stream.close();
+          } catch {
+            /* zaten kapalı */
+          }
+          finish({ code: null, stdout, stderr: `${stderr}\n[zaman aşımı]`, timedOut: true });
         }, opts.timeoutMs);
       }
       if (opts.input !== undefined) stream.end(opts.input);
@@ -254,7 +356,17 @@ export class SshHost implements Host {
   }
 
   exec(file: string, args: string[], opts: ExecOptions & { privileged?: boolean } = {}): Promise<ExecResult> {
-    return this.runShell(this.buildCommand(file, args, opts), opts);
+    return this.runRaw(this.buildCommand(file, args, opts), opts);
+  }
+
+  /** Host saatine göre şu an (Unix ms); ağ gecikmesinin yarısı eklenir. */
+  async getRemoteTime(): Promise<number> {
+    const t0 = Date.now();
+    const res = await this.runShell('date +%s%3N; date +%s', { timeoutMs: 15000 });
+    const t1 = Date.now();
+    const remote = res.code === 0 ? parseRemoteDate(res.stdout) : null;
+    if (remote === null) throw new HostError(`Sunucu saati okunamadı: ${(res.stderr || res.stdout).trim() || 'cevap yok'}`, 'query_failed');
+    return remote + Math.round((t1 - t0) / 2);
   }
 
   private async check(file: string, args: string[], what: string, privileged = false): Promise<ExecResult> {
@@ -278,15 +390,28 @@ export class SshHost implements Host {
     return (await this.readFile(p)).toString('utf8');
   }
 
-  async writeFile(p: string, data: string | Buffer): Promise<void> {
+  async writeFile(p: string, data: string | Buffer, opts: WriteFileOptions = {}): Promise<void> {
     await this.mkdirp(posix.dirname(p));
     const s = await this.sftp();
     const tmp = `${p}.${randomBytes(4).toString('hex')}.tmp`;
-    await new Promise<void>((resolve, reject) =>
-      s.writeFile(tmp, data, (err: Error | null | undefined) =>
-        err ? reject(new HostError(`${p} yazılamadı: ${err.message}`, 'write_failed')) : resolve(),
-      ),
-    );
+    const fail = (err: Error) => new HostError(`${p} yazılamadı: ${err.message}`, 'write_failed');
+    try {
+      await new Promise<void>((resolve, reject) =>
+        // mode verilirse dosya baştan bu izinle açılır (şifreli cfg bir an bile herkese açık olmasın)
+        s.writeFile(tmp, data, opts.mode !== undefined ? { mode: opts.mode } : {}, (err: Error | null | undefined) =>
+          err ? reject(fail(err)) : resolve(),
+        ),
+      );
+      if (opts.mode !== undefined) {
+        // sftp-server umask'ı uygulayabilir: kesin değeri ayrıca ver
+        await new Promise<void>((resolve, reject) =>
+          s.chmod(tmp, opts.mode!, (err: Error | null | undefined) => (err ? reject(fail(err)) : resolve())),
+        );
+      }
+    } catch (err) {
+      await this.exec('rm', ['-f', tmp]).catch(() => undefined);
+      throw err;
+    }
     await this.check('mv', ['-f', tmp, p], `${p} yazılamadı`);
   }
 
@@ -392,41 +517,83 @@ export class SshHost implements Host {
 
   /* ---------------- süreçler ---------------- */
 
+  /** Uzak süreç grubunu öldürür (sudo ile başlatıldıysa sudo ile). */
+  private async killGroup(pid: number, privileged: boolean, signal: '-KILL' | '-TERM' = '-KILL'): Promise<void> {
+    const n = Math.trunc(pid);
+    if (!(n > 1)) return;
+    // Kabuğun yerleşik kill'i (procps'siz sistemlerde de var); grup yoksa tek süreç. Tek gidiş-dönüş.
+    // Not: dash'in kill'i "--" kabul etmez; "kill -SIG -PGID" hem dash hem bash'te çalışır.
+    const cmd = this.withPrivilege(`kill ${signal} -${n} 2>/dev/null || kill ${signal} ${n}`, privileged);
+    await this.runRaw(`sh -c ${quotePosixArg(cmd)}`, { timeoutMs: 15000 });
+  }
+
   spawn(file: string, args: string[], opts: ExecOptions & { privileged?: boolean } = {}): StreamingProcess {
     // Uzak PID'i öğrenmek için önce $$ yazdırılır, sonra komut exec ile aynı süreçte çalışır.
-    const inner = this.buildCommand(file, args, { ...opts, cwd: undefined, privileged: false });
-    const cdPart = opts.cwd ? `cd ${quotePosixArg(opts.cwd)} && ` : '';
-    const command = this.withPrivilege(`sh -c ${quotePosixArg(`echo __OEZI_PID__$$; ${cdPart}exec ${inner}`)}`, !!opts.privileged);
+    // setsid: süreç kendi grubunun lideri olur; kill() bütün grubu (alt süreçler dahil) öldürür.
+    // -w: setsid çatallanırsa da çıkış kodu korunur.
+    const privileged = this.usesSudo(!!opts.privileged);
+    const inner = this.buildCommand(file, args, { ...opts, cwd: undefined, privileged: false, timeoutMs: undefined });
+    const cdPart = opts.cwd ? `cd ${quotePosixArg(opts.cwd)} || exit 127; ` : '';
+    const script = `echo ${PID_MARKER}$$; ${cdPart}exec ${inner}`;
+    const q = quotePosixArg(script);
+    // Çok eski util-linux'ta -w yok: o zaman setsid'siz çalıştır (kill tek sürece düşer)
+    const launcher = `if setsid -w true 2>/dev/null; then exec setsid -w sh -c ${q}; else exec sh -c ${q}; fi`;
+    const command = this.withPrivilege(`sh -c ${quotePosixArg(launcher)}`, !!opts.privileged);
     const listeners: ((chunk: string, stream: 'stdout' | 'stderr') => void)[] = [];
     let resolvePid!: (pid: number | undefined) => void;
     const pid = new Promise<number | undefined>((r) => (resolvePid = r));
     let channel: ClientChannel | null = null;
     let pidSeen = false;
     let pending = '';
+    let entry: ActiveRemote | null = null;
+    let exited = false;
+    const emit = (c: string, s: 'stdout' | 'stderr') => {
+      if (c) listeners.forEach((l) => l(c, s));
+    };
     const exit = this.openExec(command).then(
       (stream) =>
         new Promise<number | null>((resolve) => {
           channel = stream;
           stream.setEncoding('utf8');
           stream.stderr.setEncoding('utf8');
+          stream.on('error', () => undefined);
+          stream.stderr.on('error', () => undefined);
           stream.on('data', (c: string) => {
             if (!pidSeen) {
               pending += c;
               const nl = pending.indexOf('\n');
-              if (nl < 0) return;
-              const first = pending.slice(0, nl);
-              const m = /__OEZI_PID__(\d+)/.exec(first);
+              if (nl < 0 && pending.length < 64) return;
               pidSeen = true;
-              resolvePid(m ? Number(m[1]) : undefined);
-              c = pending.slice(nl + 1);
+              const first = nl < 0 ? pending : pending.slice(0, nl);
+              const m = PID_LINE_RE.exec(first);
+              if (m) {
+                const n = Number(m[1]);
+                resolvePid(n);
+                if (!exited) {
+                  entry = { pid: n, privileged };
+                  this.active.add(entry);
+                }
+                c = pending.slice(nl + 1);
+              } else {
+                // İşaret satırı yok (ör. sudo hatası): hiçbir çıktı yutulmasın
+                resolvePid(undefined);
+                c = pending;
+              }
               pending = '';
-              if (!c) return;
             }
-            listeners.forEach((l) => l(c, 'stdout'));
+            emit(c, 'stdout');
           });
-          stream.stderr.on('data', (c: string) => listeners.forEach((l) => l(c, 'stderr')));
+          stream.stderr.on('data', (c: string) => emit(c, 'stderr'));
           stream.on('close', (code: number | null) => {
-            if (!pidSeen) resolvePid(undefined);
+            exited = true;
+            if (entry) this.active.delete(entry);
+            if (!pidSeen) {
+              pidSeen = true;
+              resolvePid(undefined);
+              const m = PID_LINE_RE.exec(pending.replace(/\n$/, ''));
+              if (!m) emit(pending, 'stdout');
+              pending = '';
+            }
             resolve(code ?? null);
           });
           if (opts.closeStdin) stream.end(opts.input ?? '');
@@ -434,7 +601,7 @@ export class SshHost implements Host {
         }),
       (err: Error) => {
         resolvePid(undefined);
-        listeners.forEach((l) => l(`${err.message}\n`, 'stderr'));
+        emit(`${err.message}\n`, 'stderr');
         return -1;
       },
     );
@@ -446,8 +613,20 @@ export class SshHost implements Host {
       },
       kill: async () => {
         const p = await pid;
-        if (p) await this.exec('kill', ['-KILL', String(p)]).catch(() => undefined);
-        (channel as ClientChannel | null)?.close();
+        if (p && !exited && this.connected) await this.killGroup(p, privileged).catch(() => undefined);
+        const ch = channel as ClientChannel | null;
+        if (ch && !exited) {
+          try {
+            ch.signal('KILL');
+          } catch {
+            /* desteklenmiyor */
+          }
+          try {
+            ch.close();
+          } catch {
+            /* zaten kapalı */
+          }
+        }
       },
       wait: () => exit,
     };
@@ -476,9 +655,10 @@ export class SshHost implements Host {
   async processInfo(pid: number, opts: { commandLine?: boolean } = {}): Promise<ProcessInfo> {
     if (!pid || pid <= 0) return { pid, alive: false };
     const n = Math.trunc(pid);
-    const cmd = opts.commandLine ? `; tr '\\0' ' ' < /proc/${n}/cmdline; echo` : '';
+    // Süreç sorgu sırasında ölebilir: her okuma ayrı kontrol edilir, kaybolursa "ölü" (7) sayılır, sorgu hatası değil
+    const cmd = opts.commandLine ? `; l=$( { tr '\\0' ' ' < /proc/${n}/cmdline; } 2>/dev/null) || exit 7; echo "$l"` : '';
     const res = await this.runShell(
-      `s=$(cat /proc/${n}/stat 2>/dev/null) || exit 7; echo "$s" | sed 's/.*) //' | cut -d' ' -f1; basename "$(readlink /proc/${n}/exe 2>/dev/null)"; cat /proc/${n}/comm${cmd}`,
+      `s=$(cat /proc/${n}/stat 2>/dev/null) || exit 7; echo "$s" | sed 's/.*) //' | cut -d' ' -f1; basename "$(readlink /proc/${n}/exe 2>/dev/null)"; c=$(cat /proc/${n}/comm 2>/dev/null) || exit 7; echo "$c"${cmd}`,
       { timeoutMs: 20000 },
     );
     if (res.code === 7) return { pid, alive: false };
@@ -496,15 +676,13 @@ export class SshHost implements Host {
   }
 
   async killProcess(pid: number, opts: { force?: boolean } = {}): Promise<void> {
-    const sig = opts.force ? '-KILL' : '-TERM';
     // setsid ile başlatıldığı için süreç grubu lideri: grubu hedefle
-    const res = await this.exec('kill', [sig, '--', `-${pid}`]);
-    if (res.code !== 0) await this.exec('kill', [sig, String(pid)]);
+    await this.killGroup(pid, false, opts.force ? '-KILL' : '-TERM');
   }
 
   private streamHost(): SshHost {
     if (!this.streamConn) {
-      this.streamConn = new SshHost({ ...this.cfg, id: `${this.id}:stream`, ...(this.cfg.expectedFingerprint ? {} : {}) });
+      this.streamConn = new SshHost({ ...this.cfg, id: `${this.id}:stream` });
     }
     return this.streamConn;
   }

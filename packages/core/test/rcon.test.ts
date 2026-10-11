@@ -114,6 +114,26 @@ describe('BattlEye RCon istemcisi', () => {
     expect(server.loggedIn).toBe(true);
   });
 
+  it('eşzamanlı connect() çağrıları aynı denemeyi paylaşır (asılı kalmaz, birbirinin soketini kapatmaz)', async () => {
+    const { server, client } = await setup();
+    const both = Promise.all([client.connect(), client.connect(), client.connect()]);
+    await Promise.race([both, sleep(3000).then(() => Promise.reject(new Error('asılı kaldı')))]);
+    expect(client.state).toBe('connected');
+    expect(server.logins).toBe(1);
+    await expect(client.command('players')).resolves.toContain('Players on server');
+  });
+
+  it('bağlanırken close() çağrılırsa connect() reddedilir (asılı kalmaz), sonra yeniden bağlanılabilir', async () => {
+    const { client } = await setup('pw', 'pw', { host: 'localhost' });
+    const p = client.connect();
+    client.close();
+    const result = await Promise.race([p.then(() => 'resolved', (e: { code?: string }) => e.code ?? 'rejected'), sleep(3000).then(() => 'hang')]);
+    expect(result).not.toBe('hang');
+    expect(client.state).toBe('disconnected');
+    await client.connect();
+    expect(client.state).toBe('connected');
+  });
+
   it('geçersiz girdileri reddeder', async () => {
     const { client } = await setup();
     await client.connect();
@@ -128,6 +148,13 @@ describe('RCON çıktı ayrıştırıcıları', () => {
       { id: 0, kind: 'guid', value: 'bec2bd9eb2e1e6a0b5a1c0b2c5e3d0f1', minutesLeft: -1, reason: 'Hile kullanımı' },
       { id: 1, kind: 'guid', value: 'aec2bd9eb2e1e6a0b5a1c0b2c5e3d0f2', minutesLeft: 1440, reason: 'Küfür' },
       { id: 2, kind: 'ip', value: '1.2.3.4', minutesLeft: -1, reason: 'Spam' },
+    ]);
+  });
+  it('süresi dolmuş banlar ("-") atlanmaz, expired işaretlenir', () => {
+    const text = ['GUID Bans:', '[#] [GUID] [Minutes left] [Reason]', '0  bec2bd9eb2e1e6a0b5a1c0b2c5e3d0f1 - Eski ceza', '1  aec2bd9eb2e1e6a0b5a1c0b2c5e3d0f2 perm Hile'].join('\n');
+    expect(parseBans(text)).toEqual([
+      { id: 0, kind: 'guid', value: 'bec2bd9eb2e1e6a0b5a1c0b2c5e3d0f1', minutesLeft: 0, reason: 'Eski ceza', expired: true },
+      { id: 1, kind: 'guid', value: 'aec2bd9eb2e1e6a0b5a1c0b2c5e3d0f2', minutesLeft: -1, reason: 'Hile' },
     ]);
   });
   it('GUID henüz doğrulanmamış (?) oyuncu da listelenir', () => {

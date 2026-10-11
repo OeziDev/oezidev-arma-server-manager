@@ -3,7 +3,6 @@ import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { StringDecoder } from 'node:string_decoder';
 import type { HostOs } from '../launch/paths.js';
 import {
   type DetachedOptions,
@@ -12,17 +11,145 @@ import {
   type ExecResult,
   type Host,
   HostError,
-  LineSplitter,
   type ProcessInfo,
   type StreamingProcess,
   type SystemdApi,
   type TailHandle,
   type TailOptions,
+  type WriteFileOptions,
 } from './types.js';
 import { createSystemdApi } from './systemd.js';
 import { followWithRestart } from './follow.js';
 
 const isWin = process.platform === 'win32';
+
+/** Süreç çıktıktan sonra boruların kapanması için en fazla bu kadar beklenir (yetim alt süreç boruyu tutuyorsa) */
+const CLOSE_GRACE_MS = 5000;
+
+/**
+ * Linux'ta exec/spawn ile başlatılan süreçler kendi süreç grubunda (detached) çalışır; öldürürken
+ * bütün grup hedeflenir (steamcmd.sh -> linux32/steamcmd gibi alt süreçler kalmasın).
+ * Uygulama kapanırken hâlâ çalışanlar da temizlenir.
+ */
+const liveGroups = new Set<number>();
+let exitHookInstalled = false;
+function trackGroup(pid: number | undefined): void {
+  if (isWin || !pid) return;
+  liveGroups.add(pid);
+  if (!exitHookInstalled) {
+    exitHookInstalled = true;
+    process.once('exit', () => {
+      for (const g of liveGroups) {
+        try {
+          process.kill(-g, 'SIGKILL');
+        } catch {
+          /* zaten yok */
+        }
+      }
+    });
+  }
+}
+
+/* ---------------- Windows süreç sorgusu ---------------- */
+
+/**
+ * Windows PowerShell 5.1 boruya OEM kod sayfasıyla yazar; Node UTF-8 okur. "C:\Users\Halit Özcan\..." gibi
+ * yollar bozulur ve -profiles işareti hiç eşleşmezdi. Bu yüzden komut satırı UTF-8 baytlarının base64'ü
+ * olarak (saf ASCII) yazdırılır ve Node tarafında çözülür. Betik -EncodedCommand ile (UTF-16LE base64) verilir:
+ * tırnak/kaçış sorunu da kalmaz.
+ */
+export function winCommandLineScript(pid: number): string {
+  const n = Math.trunc(pid);
+  return (
+    `$ErrorActionPreference='Stop';` +
+    `try{$p=Get-CimInstance Win32_Process -Filter 'ProcessId=${n}'}catch{$p=Get-WmiObject Win32_Process -Filter 'ProcessId=${n}'};` +
+    `if($p -and $p.CommandLine){'B64:'+[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$p.CommandLine))}else{'NONE'}`
+  );
+}
+
+export function encodePowerShellCommand(script: string): string {
+  return Buffer.from(script, 'utf16le').toString('base64');
+}
+
+/** winCommandLineScript çıktısını çözer; komut satırı bilinmiyorsa undefined. */
+export function parseWinCommandLineOutput(stdout: string): string | undefined {
+  const m = /B64:([A-Za-z0-9+/=]+)/.exec(stdout.replace(/\u0000/g, ''));
+  if (!m) return undefined;
+  const text = Buffer.from(m[1]!, 'base64').toString('utf8').trim();
+  return text || undefined;
+}
+
+/* ---------------- log satırları ---------------- */
+
+const utf8Strict = new TextDecoder('utf-8', { fatal: true });
+const ansiDecoder = ((): { decode(b: Uint8Array): string } => {
+  try {
+    // Türkçe Windows'ta ANSI kod sayfası 1254 (ş, ğ, ı); ICU yoksa latin1/1252
+    return new TextDecoder('windows-1254');
+  } catch {
+    return new TextDecoder('latin1');
+  }
+})();
+
+/** Log satırını çözer: önce UTF-8, geçersiz bayt dizisi varsa Windows ANSI (cp1254/cp1252). */
+export function decodeLogLine(buf: Buffer): string {
+  let end = buf.length;
+  if (end > 0 && buf[end - 1] === 0x0d) end--;
+  const b = buf.subarray(0, end);
+  try {
+    return utf8Strict.decode(b);
+  } catch {
+    return ansiDecoder.decode(b);
+  }
+}
+
+/**
+ * Bayt düzeyinde satır bölücü: yarım satırı (ve yarım çok baytlı karakteri) bayt olarak saklar,
+ * tamamlanan her satırı ayrı ayrı çözer (bir satırın kodlaması diğerini bozmaz).
+ */
+export class ByteLineSplitter {
+  private parts: Buffer[] = [];
+  private len = 0;
+  constructor(private readonly maxLine = 1024 * 1024) {}
+
+  push(chunk: Buffer): string[] {
+    const out: string[] = [];
+    let start = 0;
+    for (;;) {
+      const nl = chunk.indexOf(0x0a, start);
+      if (nl < 0) break;
+      const piece = chunk.subarray(start, nl);
+      out.push(decodeLogLine(this.len ? Buffer.concat([...this.parts, piece]) : piece));
+      this.parts = [];
+      this.len = 0;
+      start = nl + 1;
+    }
+    if (start < chunk.length) {
+      const rest = Buffer.from(chunk.subarray(start));
+      this.parts.push(rest);
+      this.len += rest.length;
+      if (this.len >= this.maxLine) out.push(...this.flush());
+    }
+    return out;
+  }
+
+  /** Bekleyen yarım satır var mı? */
+  get hasPartial(): boolean {
+    return this.len > 0;
+  }
+
+  flush(): string[] {
+    if (!this.len) return [];
+    const line = decodeLogLine(Buffer.concat(this.parts));
+    this.reset();
+    return [line];
+  }
+
+  reset(): void {
+    this.parts = [];
+    this.len = 0;
+  }
+}
 
 /** Uygulamanın çalıştığı bilgisayar. */
 export class LocalHost implements Host {
@@ -36,7 +163,7 @@ export class LocalHost implements Host {
   constructor(opts: { label?: string; enableSystemd?: boolean } = {}) {
     this.label = opts.label ?? 'Bu bilgisayar';
     if (!isWin && opts.enableSystemd) {
-      this.systemd = createSystemdApi((file, args) => this.exec(file, args), (p, d) => this.writeFile(p, d), (p) => this.remove(p));
+      this.systemd = createSystemdApi((file, args, o) => this.exec(file, args, o), (p, d) => this.writeFile(p, d), (p) => this.remove(p));
     }
   }
 
@@ -53,10 +180,16 @@ export class LocalHost implements Host {
     return fsp.readFile(p, 'utf8');
   }
 
-  async writeFile(p: string, data: string | Buffer): Promise<void> {
+  async writeFile(p: string, data: string | Buffer, opts: WriteFileOptions = {}): Promise<void> {
     await fsp.mkdir(path.dirname(p), { recursive: true });
     const tmp = `${p}.${randomBytes(4).toString('hex')}.tmp`;
-    await fsp.writeFile(tmp, data);
+    if (opts.mode !== undefined && !isWin) {
+      // Dosya baştan kısıtlı izinle oluşturulur (umask sadece daraltır), sonra kesin değer chmod ile verilir
+      await fsp.writeFile(tmp, data, { mode: opts.mode });
+      await fsp.chmod(tmp, opts.mode);
+    } else {
+      await fsp.writeFile(tmp, data);
+    }
     // Windows'ta antivirüs geçici dosyayı tararken rename EPERM/EBUSY verebilir: birkaç kez dene
     for (let attempt = 0; ; attempt++) {
       try {
@@ -175,12 +308,25 @@ export class LocalHost implements Host {
       let stdout = '';
       let stderr = '';
       let timer: NodeJS.Timeout | undefined;
+      let grace: NodeJS.Timeout | undefined;
+      let settled = false;
+      const finish = (r: ExecResult) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        if (grace) clearTimeout(grace);
+        if (child.pid) liveGroups.delete(child.pid);
+        resolve(r);
+      };
       const child = cpSpawn(file, args, {
         cwd: opts.cwd,
         env: opts.env ? { ...process.env, ...opts.env } : process.env,
         windowsHide: true,
+        // Linux: kendi süreç grubu; zaman aşımında bütün grup öldürülür
+        detached: !isWin,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
+      trackGroup(child.pid);
       child.stdout.setEncoding('utf8');
       child.stderr.setEncoding('utf8');
       child.stdout.on('data', (c: string) => {
@@ -189,16 +335,21 @@ export class LocalHost implements Host {
       child.stderr.on('data', (c: string) => {
         if (stderr.length < 16 * 1024 * 1024) stderr += c;
       });
-      child.on('error', (err) => {
-        if (timer) clearTimeout(timer);
-        resolve({ code: -1, stdout, stderr: stderr + err.message });
-      });
-      child.on('close', (code) => {
-        if (timer) clearTimeout(timer);
-        resolve({ code, stdout, stderr });
+      child.on('error', (err) => finish({ code: -1, stdout, stderr: stderr + err.message }));
+      child.on('close', (code) => finish({ code, stdout, stderr }));
+      child.on('exit', (code) => {
+        // Arka plana atılmış bir torun süreç boruyu açık tutarsa 'close' hiç gelmez: kısa süre sonra yine de bitir
+        grace = setTimeout(() => {
+          child.stdout.destroy();
+          child.stderr.destroy();
+          finish({ code, stdout, stderr });
+        }, CLOSE_GRACE_MS);
       });
       if (opts.timeoutMs) {
-        timer = setTimeout(() => child.kill('SIGKILL'), opts.timeoutMs);
+        timer = setTimeout(() => {
+          if (child.pid) void this.killTree(child.pid);
+          finish({ code: null, stdout, stderr: `${stderr}\n[zaman aşımı]`, timedOut: true });
+        }, opts.timeoutMs);
       }
       child.stdin.on('error', () => undefined); // süreç girdiyi okumadan çıkarsa EPIPE
       if (opts.input !== undefined) child.stdin.end(opts.input);
@@ -206,24 +357,60 @@ export class LocalHost implements Host {
     });
   }
 
+  /** Süreci ve bütün alt süreçlerini zorla öldürür (Linux: süreç grubu, Windows: taskkill /T /F). */
+  private async killTree(pid: number): Promise<void> {
+    if (isWin) {
+      await this.exec('taskkill', ['/PID', String(pid), '/T', '/F'], { timeoutMs: 15000 }).catch(() => undefined);
+      return;
+    }
+    try {
+      process.kill(-pid, 'SIGKILL');
+    } catch {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        /* zaten yok */
+      }
+    }
+  }
+
   spawn(file: string, args: string[], opts: ExecOptions = {}): StreamingProcess {
     const child = cpSpawn(file, args, {
       cwd: opts.cwd,
       env: opts.env ? { ...process.env, ...opts.env } : process.env,
       windowsHide: true,
+      // Linux: süreç grubu lideri olsun ki kill() alt süreçleri de (steamcmd.sh -> steamcmd) öldürsün
+      detached: !isWin,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
+    trackGroup(child.pid);
     const listeners: ((chunk: string, stream: 'stdout' | 'stderr') => void)[] = [];
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
     child.stdout.on('data', (c: string) => listeners.forEach((l) => l(c, 'stdout')));
     child.stderr.on('data', (c: string) => listeners.forEach((l) => l(c, 'stderr')));
+    let closed = false;
     const exit = new Promise<number | null>((resolve) => {
+      let grace: NodeJS.Timeout | undefined;
+      const finish = (code: number | null) => {
+        if (closed) return;
+        closed = true;
+        if (grace) clearTimeout(grace);
+        if (child.pid) liveGroups.delete(child.pid);
+        resolve(code);
+      };
       child.on('error', (err) => {
         listeners.forEach((l) => l(`${err.message}\n`, 'stderr'));
-        resolve(-1);
+        finish(-1);
       });
-      child.on('close', (code) => resolve(code));
+      child.on('close', (code) => finish(code));
+      child.on('exit', (code) => {
+        grace = setTimeout(() => {
+          child.stdout.destroy();
+          child.stderr.destroy();
+          finish(code);
+        }, CLOSE_GRACE_MS);
+      });
     });
     child.stdin.on('error', () => undefined);
     if (opts.closeStdin) child.stdin.end(opts.input ?? '');
@@ -235,7 +422,8 @@ export class LocalHost implements Host {
         if (!child.stdin.destroyed) child.stdin.write(d);
       },
       kill: async () => {
-        if (child.exitCode === null && child.pid) await this.killProcess(child.pid, { force: true }).catch(() => undefined);
+        // exitCode'a bakılmaz: lider çıkmış olsa bile gruptaki alt süreçler boruyu tutabilir
+        if (!closed && child.pid) await this.killTree(child.pid);
       },
       wait: () => exit,
     };
@@ -277,12 +465,11 @@ export class LocalHost implements Host {
       if (opts.commandLine) {
         const ps = await this.exec(
           'powershell',
-          ['-NoProfile', '-NonInteractive', '-Command', `(Get-CimInstance Win32_Process -Filter "ProcessId=${Math.trunc(pid)}").CommandLine`],
+          ['-NoProfile', '-NonInteractive', '-EncodedCommand', encodePowerShellCommand(winCommandLineScript(pid))],
           { timeoutMs: 20000 },
         );
         // PowerShell yoksa/başarısızsa komut satırı bilinmiyor say (boş string "başka süreç" anlamına gelmesin)
-        const out = ps.stdout.replace(/\u0000/g, '').trim();
-        if (ps.code === 0 && out) commandLine = out;
+        if (ps.code === 0) commandLine = parseWinCommandLineOutput(ps.stdout);
       }
       return { pid, alive: true, ...(image ? { image } : {}), ...(commandLine !== undefined ? { commandLine } : {}) };
     }
@@ -309,7 +496,7 @@ export class LocalHost implements Host {
   async killProcess(pid: number, opts: { force?: boolean } = {}): Promise<void> {
     if (isWin) {
       // Konsol uygulamaları WM_CLOSE almaz; Arma'yı nazikçe kapatmak için önce RCON #shutdown kullanılır.
-      await this.exec('taskkill', ['/PID', String(pid), '/T', ...(opts.force ? ['/F'] : [])]);
+      await this.exec('taskkill', ['/PID', String(pid), '/T', ...(opts.force ? ['/F'] : [])], { timeoutMs: 15000 });
       return;
     }
     const sig = opts.force ? 'SIGKILL' : 'SIGTERM';
@@ -329,21 +516,26 @@ export class LocalHost implements Host {
     return followWithRestart((a) => this.spawn(file, a), args, opts.resumeArgs ?? args, onLines);
   }
 
+  async getRemoteTime(): Promise<number> {
+    return Date.now();
+  }
+
   tail(p: string, onLines: (lines: string[]) => void, opts: TailOptions = {}): TailHandle {
     let stopped = false;
     let offset = -1;
-    const splitter = new LineSplitter();
+    let ino: number | undefined;
+    // Bayt düzeyinde bölünür: yarım satır ve yarım çok baytlı karakter (ğ, ş...) bir sonraki okumaya kalır
+    const splitter = new ByteLineSplitter();
     let timer: NodeJS.Timeout | undefined;
+    const CHUNK = 4 * 1024 * 1024;
 
-    // Çok baytlı UTF-8 karakterler (ğ, ş...) okuma sınırında bölünmesin
-    let decoder = new StringDecoder('utf8');
-    const readRange = async (start: number, end: number): Promise<string> => {
+    const readRange = async (start: number, end: number): Promise<Buffer> => {
       const fh = await fsp.open(p, 'r');
       try {
-        const len = end - start;
-        const buf = Buffer.alloc(len);
-        await fh.read(buf, 0, len, start);
-        return decoder.write(buf);
+        const buf = Buffer.alloc(end - start);
+        // Kısa okuma olabilir (dosya bu arada kesildi vb.): sadece okunan baytlar kullanılır, NUL kalmaz
+        const { bytesRead } = await fh.read(buf, 0, end - start, start);
+        return buf.subarray(0, bytesRead);
       } finally {
         await fh.close();
       }
@@ -354,33 +546,34 @@ export class LocalHost implements Host {
       try {
         const st = await fsp.stat(p).catch(() => null);
         if (st) {
+          if (offset >= 0 && (st.size < offset || (ino !== undefined && st.ino !== ino))) {
+            // Dosya kesildi/yeniden oluşturuldu: baştan oku, eski yarım satır yeni içeriğe yapışmasın
+            offset = 0;
+            splitter.reset();
+          }
+          ino = st.ino;
           if (offset < 0 && opts.fromStart) {
             offset = 0;
-            const end = Math.min(st.size, 4 * 1024 * 1024);
-            if (end > 0) {
-              const lines = splitter.push(await readRange(0, end));
-              offset = end;
-              if (lines.length) onLines(lines);
-            }
           } else if (offset < 0) {
-            // İlk okuma: son N satır
+            // İlk okuma: son N satır. Sondaki yarım satır gösterilmez, bölücüde bekler; tamamlanınca tek satır olarak gelir.
             const n = opts.initialLines ?? 200;
             const start = Math.max(0, st.size - 256 * 1024);
-            const text = st.size > 0 ? await readRange(start, st.size) : '';
-            let lines = text.split(/\r?\n/);
-            if (start > 0) lines = lines.slice(1);
-            if (lines.length && lines[lines.length - 1] === '') lines.pop();
+            let buf = st.size > 0 ? await readRange(start, st.size) : Buffer.alloc(0);
+            offset = start + buf.length;
+            if (start > 0) {
+              // Pencerenin başındaki satır kesik: ilk satır sonuna kadar at
+              const nl = buf.indexOf(0x0a);
+              buf = nl >= 0 ? buf.subarray(nl + 1) : Buffer.alloc(0);
+            }
+            const lines = splitter.push(buf);
+            if (stopped) return;
             if (n > 0 && lines.length) onLines(lines.slice(-n));
-            offset = st.size;
-          } else if (st.size < offset) {
-            offset = 0; // dosya kesildi/yeniden oluşturuldu
-            decoder = new StringDecoder('utf8');
-          } else if (st.size > offset) {
-            const end = Math.min(st.size, offset + 4 * 1024 * 1024);
-            const text = await readRange(offset, end);
-            offset = end;
-            const lines = splitter.push(text);
-            if (lines.length) onLines(lines);
+          }
+          if (offset >= 0 && st.size > offset) {
+            const buf = await readRange(offset, Math.min(st.size, offset + CHUNK));
+            offset += buf.length;
+            const lines = splitter.push(buf);
+            if (lines.length && !stopped) onLines(lines);
           }
         }
       } catch {

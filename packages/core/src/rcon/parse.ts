@@ -41,9 +41,11 @@ export interface RconBan {
   id: number;
   kind: 'guid' | 'ip';
   value: string;
-  /** -1 kalıcı */
+  /** -1 kalıcı, süresi dolmuşsa 0 */
   minutesLeft: number;
   reason: string;
+  /** Süresi dolmuş (BattlEye dakika sütununda "-" yazar; bir sonraki loadBans'ta silinir) */
+  expired?: boolean;
 }
 
 export function parseBans(text: string): RconBan[] {
@@ -55,9 +57,11 @@ export function parseBans(text: string): RconBan[] {
     else if (/^IP Bans:/i.test(line)) kind = 'ip';
     const m = /^(\d+)\s+(\S+)\s+(\S+)\s*(.*)$/.exec(line);
     if (!m) continue;
-    const minutes = m[3]!.toLowerCase() === 'perm' ? -1 : Number(m[3]);
+    const col = m[3]!.toLowerCase();
+    const expired = col === '-';
+    const minutes = col === 'perm' ? -1 : expired ? 0 : Number(col);
     if (Number.isNaN(minutes)) continue;
-    out.push({ id: Number(m[1]), kind, value: m[2]!, minutesLeft: minutes, reason: m[4]!.trim() });
+    out.push({ id: Number(m[1]), kind, value: m[2]!, minutesLeft: minutes, reason: m[4]!.trim(), ...(expired ? { expired: true } : {}) });
   }
   return out;
 }

@@ -12,7 +12,49 @@ import {
   validateProfile,
 } from '../src/index.js';
 import { generateSystemdUnit, parseSystemdShow } from '../src/host/systemd.js';
-import { processMatches } from '../src/host/types.js';
+import { commandLineHasMarker, processMatches } from '../src/host/types.js';
+
+/** CommandLineToArgvW kuralları (MSVC) ile komut satırını böler: quoteWindowsArg'in tersi. */
+function parseWindowsCommandLine(line: string): string[] {
+  const out: string[] = [];
+  let i = 0;
+  while (i < line.length) {
+    while (line[i] === ' ' || line[i] === '\t') i++;
+    if (i >= line.length) break;
+    let cur = '';
+    let inQuote = false;
+    for (; i < line.length; i++) {
+      const ch = line[i]!;
+      if (ch === '\\') {
+        let n = 0;
+        while (line[i] === '\\') {
+          n++;
+          i++;
+        }
+        if (line[i] === '"') {
+          cur += '\\'.repeat(Math.floor(n / 2));
+          if (n % 2 === 1) cur += '"';
+          else inQuote = !inQuote;
+        } else {
+          cur += '\\'.repeat(n);
+          i--;
+        }
+        continue;
+      }
+      if (ch === '"') {
+        if (inQuote && line[i + 1] === '"') {
+          cur += '"';
+          i++;
+        } else inQuote = !inQuote;
+        continue;
+      }
+      if (!inQuote && (ch === ' ' || ch === '\t')) break;
+      cur += ch;
+    }
+    out.push(cur);
+  }
+  return out;
+}
 
 describe('yollar', () => {
   it('Windows ve Linux için doğru dosya yolları', () => {
@@ -97,6 +139,46 @@ describe('komut satırı', () => {
     expect(quoteWindowsArg('-port=2302')).toBe('-port=2302');
   });
 
+  it('Windows tırnaklama: zor yollar CommandLineToArgvW ile aynen geri okunur', () => {
+    const args = [
+      'C:\\Program Files (x86)\\Steam\\steamapps\\common\\Arma 3 Server\\arma3server_x64.exe',
+      '-profiles=C:\\Users\\Halit Özcan\\Arma Profilleri\\',
+      '-profiles=C:\\yol\\',
+      'C:\\yol sonu\\\\',
+      '-mod=@cba_a3;@ace;@Türk Ordusu Modu;C:\\mods\\@şğüİı',
+      '-mod=@a;@b',
+      '-name=my server',
+      'a"b',
+      'a\\"b',
+      '\\\\sunucu\\pay\\arma',
+      '-par=R&D <test> | ^',
+      '',
+    ];
+    const line = args.map(quoteWindowsArg).join(' ');
+    expect(parseWindowsCommandLine(line)).toEqual(args);
+    // ";" tek başına tırnak gerektirmez, Türkçe karakter de
+    expect(quoteWindowsArg('-mod=@a;@b')).toBe('-mod=@a;@b');
+    expect(quoteWindowsArg('-name=Türkçe')).toBe('-name=Türkçe');
+    // cmd.exe'ye kopyalanınca bozulmasın
+    expect(quoteWindowsArg('-name=R&D')).toBe('"-name=R&D"');
+  });
+
+  it('Windows: sondaki ters bölü kırpılır, -bepath yine üretilir', () => {
+    const p = createProfile({ paths: { serverDir: 'C:\\Arma 3\\', profilesDir: 'C:\\Users\\Halit Özcan\\Arma Profiles\\' } });
+    const rp = resolvePaths(p, 'windows');
+    expect(rp.serverDir).toBe('C:\\Arma 3');
+    expect(rp.profilesDir).toBe('C:\\Users\\Halit Özcan\\Arma Profiles');
+    const spec = buildServerLaunch(p, 'windows');
+    expect(spec.args).toContain('-profiles=C:\\Users\\Halit Özcan\\Arma Profiles');
+    expect(spec.args).toContain('-bepath=C:\\Users\\Halit Özcan\\Arma Profiles\\BattlEye');
+    expect(formatCommandLine(spec, 'windows')).toContain('"-profiles=C:\\Users\\Halit Özcan\\Arma Profiles" ');
+    // kök klasör korunur
+    expect(resolvePaths(createProfile({ paths: { serverDir: 'D:\\', profilesDir: 'D:\\' } }), 'windows').profilesDir).toBe('D:\\');
+    expect(resolvePaths(createProfile({ paths: { serverDir: '/srv/arma3/', profilesDir: '/srv/p//' } }), 'linux').profilesDir).toBe('/srv/p');
+    // BattlEye kapalıysa -bepath yok
+    expect(buildServerLaunch(createProfile({ paths: { serverDir: 'C:\\a' }, security: { battlEye: false } }), 'windows').args.some((a) => a.startsWith('-bepath'))).toBe(false);
+  });
+
   it('POSIX ve systemd tırnaklama', () => {
     expect(quotePosixArg("it's")).toBe(`'it'\\''s'`);
     expect(quotePosixArg('-mod=@a;@b')).toBe(`'-mod=@a;@b'`);
@@ -150,6 +232,51 @@ describe('systemd unit', () => {
     expect(processMatches(info, '/srv/a/arma3server_x64', '-profiles=/srv/a/oezi-profiles/a')).toBe(false);
     expect(processMatches(info, '/srv/a/arma3server_x64', '-profiles=/srv/a/oezi-profiles/b')).toBe(true);
     expect(processMatches({ ...info, image: 'bash' }, '/srv/a/arma3server_x64')).toBe(false);
+  });
+
+  it('süreç eşleşmesi: işaret tam argüman olmalı (hc1/hc10, sunucu/HC, 57-alay/57-alay-test)', () => {
+    const exe = '/srv/a/arma3server_x64';
+    const srv = { pid: 1, alive: true, image: 'arma3server_x64', commandLine: `${exe} -port=2302 -config=/p/server.cfg -profiles=/srv/p -name=server -mod=@a` };
+    const hc1 = { ...srv, commandLine: `${exe} -client -connect=127.0.0.1 -port=2302 -profiles=/srv/p/hc1 -name=hc1` };
+    const hc10 = { ...srv, commandLine: `${exe} -client -connect=127.0.0.1 -port=2302 -profiles=/srv/p/hc10 -name=hc10` };
+    // sunucu işareti HC'yi eşlemez, HC işareti sunucuyu eşlemez
+    expect(processMatches(srv, exe, '-profiles=/srv/p')).toBe(true);
+    expect(processMatches(hc1, exe, '-profiles=/srv/p')).toBe(false);
+    expect(processMatches(srv, exe, '-profiles=/srv/p/hc1')).toBe(false);
+    // hc1 işareti hc10'u eşlemez
+    expect(processMatches(hc1, exe, '-profiles=/srv/p/hc1')).toBe(true);
+    expect(processMatches(hc10, exe, '-profiles=/srv/p/hc1')).toBe(false);
+    expect(processMatches(hc10, exe, '-profiles=/srv/p/hc10')).toBe(true);
+    // önek klasör
+    const test = { ...srv, commandLine: `${exe} -profiles=/srv/57-alay-test -name=server` };
+    expect(processMatches(test, exe, '-profiles=/srv/57-alay')).toBe(false);
+    // boşluklu klasörün öneki ("/srv/my" vs "/srv/my p")
+    const spaced = { ...srv, commandLine: `${exe} -profiles=/srv/my p -name=server` };
+    expect(processMatches(spaced, exe, '-profiles=/srv/my')).toBe(false);
+    expect(processMatches(spaced, exe, '-profiles=/srv/my p')).toBe(true);
+    // satır sonunda
+    expect(commandLineHasMarker(`${exe} -name=x -profiles=/srv/p`, '-profiles=/srv/p')).toBe(true);
+    // Linux büyük/küçük harfe duyarlı
+    expect(processMatches(srv, exe, '-profiles=/SRV/p')).toBe(false);
+  });
+
+  it('süreç eşleşmesi Windows: harf ve ayraç duyarsız, tırnaklı/Türkçe/sondaki ters bölü', () => {
+    const exe = 'C:\\Arma 3\\arma3server_x64.exe';
+    const base = { pid: 1, alive: true, image: 'arma3server_x64.exe' };
+    const cl = '"C:\\Arma 3\\arma3server_x64.exe" -port=2302 "-profiles=C:\\Users\\Halit Özcan\\Arma\\57-alay" -name=server';
+    const marker = '-profiles=C:\\Users\\Halit Özcan\\Arma\\57-alay';
+    expect(processMatches({ ...base, commandLine: cl }, exe, marker)).toBe(true);
+    expect(processMatches({ ...base, commandLine: cl.toUpperCase() }, exe, marker)).toBe(true);
+    expect(processMatches({ ...base, commandLine: cl.replace(/\\/g, '/') }, exe, marker)).toBe(true);
+    expect(processMatches({ ...base, commandLine: cl }, exe, '-profiles=c:/users/halit özcan/arma/57-alay')).toBe(true);
+    // eski sürümün sondaki \ ile başlattığı süreç (Node: "...\\")
+    const trailing = '"C:\\Arma 3\\arma3server_x64.exe" "-profiles=C:\\Users\\Halit Özcan\\Arma\\57-alay\\\\" -name=server';
+    expect(processMatches({ ...base, commandLine: trailing }, exe, marker)).toBe(true);
+    // tırnaksız argüman
+    expect(processMatches({ ...base, commandLine: 'arma3server_x64.exe -profiles=C:\\p -name=x' }, exe, '-profiles=C:\\p')).toBe(true);
+    // önek/HC eşleşmez
+    expect(processMatches({ ...base, commandLine: cl.replace('57-alay', '57-alay-test') }, exe, marker)).toBe(false);
+    expect(processMatches({ ...base, commandLine: cl.replace('57-alay"', '57-alay\\hc1"') }, exe, marker)).toBe(false);
   });
 });
 

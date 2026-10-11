@@ -7,9 +7,11 @@ import { SshHost } from '../src/host/ssh.js';
 import type { Host } from '../src/host/types.js';
 import { scanMissions, scanMods, uploadMission } from '../src/scan.js';
 
+// Test sshd portu (varsayılan 2222); başka portta geçici bir sshd ile denemek için OEZI_SSH_PORT
+const SSH_PORT = Number(process.env.OEZI_SSH_PORT || 2222);
 const SSH_AVAILABLE = await new Promise<boolean>((resolve) => {
   import('node:net').then(({ createConnection }) => {
-    const s = createConnection({ host: '127.0.0.1', port: 2222 }, () => {
+    const s = createConnection({ host: '127.0.0.1', port: SSH_PORT }, () => {
       s.end();
       resolve(true);
     });
@@ -157,6 +159,93 @@ function hostSuite(name: string, makeHost: () => Promise<{ host: Host; root: str
       expect(template).toBe(host.os === 'linux' ? 'kingofthehill.altis' : 'KingOfTheHill.Altis');
       fs.rmSync(local);
     });
+
+    it('writeFile mode: şifreli cfg sadece sahibi tarafından okunur (0600)', async () => {
+      await host.writeFile(j('perm', 'server.cfg'), 'passwordAdmin = "x";\n', { mode: 0o600 });
+      const res = await host.exec('stat', ['-c', '%a', j('perm', 'server.cfg')]);
+      expect(res.stdout.trim()).toBe('600');
+      // üzerine yazınca da 0600 kalır
+      await host.writeFile(j('perm', 'server.cfg'), 'passwordAdmin = "y";\n', { mode: 0o600 });
+      expect((await host.exec('stat', ['-c', '%a', j('perm', 'server.cfg')])).stdout.trim()).toBe('600');
+      expect(await host.readText(j('perm', 'server.cfg'))).toBe('passwordAdmin = "y";\n');
+    });
+
+    it('spawn kill: alt süreçler de ölür, wait() takılmaz (steamcmd.sh -> steamcmd)', async () => {
+      const proc = host.spawn('sh', ['-c', 'sh -c \'echo inner:$$; exec sleep 300\'; echo bitti']);
+      let out = '';
+      proc.onData((c) => (out += c));
+      await waitFor(() => /inner:\d+/.test(out));
+      const inner = Number(/inner:(\d+)/.exec(out)![1]);
+      expect((await host.processInfo(inner)).alive).toBe(true);
+      await proc.kill();
+      const code = await Promise.race([proc.wait(), sleep(4000).then(() => 'takıldı')]);
+      expect(code).not.toBe('takıldı');
+      await waitFor(async () => !(await host.processInfo(inner)).alive);
+      expect(out).not.toContain('__OEZI_PID__');
+    });
+
+    it('exec timeoutMs: hemen döner ve süreç grubunu öldürür', async () => {
+      const start = Date.now();
+      const res = await host.exec('sh', ['-c', 'sleep 300 & echo $!; wait'], { timeoutMs: 800 });
+      expect(Date.now() - start).toBeLessThan(3000);
+      expect(res.timedOut).toBe(true);
+      expect(res.code).toBeNull();
+      const child = Number(res.stdout.trim());
+      expect(child).toBeGreaterThan(0);
+      await waitFor(async () => !(await host.processInfo(child)).alive, 8000);
+      // normal komutta timedOut yok
+      const ok = await host.exec('echo', ['tamam'], { timeoutMs: 5000 });
+      expect(ok).toMatchObject({ code: 0, stdout: 'tamam\n' });
+      expect(ok.timedOut).toBeFalsy();
+    });
+
+    it('followCommand stop: takip edilen süreç ve alt süreçleri kalmaz', async () => {
+      const lines: string[] = [];
+      const t = host.followCommand('sh', ['-c', 'echo pid:$$; while :; do sleep 1; done'], (l) => lines.push(...l));
+      await waitFor(() => lines.some((l) => l.startsWith('pid:')));
+      const pid = Number(lines.find((l) => l.startsWith('pid:'))!.slice(4));
+      expect(lines.some((l) => l.includes('__OEZI_PID__'))).toBe(false);
+      expect((await host.processInfo(pid, { commandLine: true })).commandLine).toContain('while');
+      t.stop();
+      await waitFor(async () => !(await host.processInfo(pid)).alive);
+    });
+
+    it('tail: yarım son satır ayrı satır olarak bölünmez', async () => {
+      const log = j('tail2', 'a.log');
+      await host.writeFile(log, 'bir\niki\nyar');
+      const lines: string[] = [];
+      const t = host.tail(log, (l) => lines.push(...l), { initialLines: 10 });
+      await waitFor(() => lines.includes('iki'));
+      await host.exec('sh', ['-c', 'printf "ım satır\\nüç\\n" >> "$1"', 'sh', log]);
+      await waitFor(() => lines.includes('üç'));
+      t.stop();
+      expect(lines).toEqual(['bir', 'iki', 'yarım satır', 'üç']);
+    });
+
+    it('getRemoteTime: host saati (ms)', async () => {
+      const t = await host.getRemoteTime!();
+      expect(Math.abs(t - Date.now())).toBeLessThan(5000);
+    });
+
+    it('Linux: sadece "MPMissions" varsa kullanılmaz, uyarı döner; yükleme küçük harfli klasöre', async () => {
+      if (host.os !== 'linux') return;
+      const srv = j('case');
+      await host.writeFile(j('case', 'MPMissions', 'eski.Altis.pbo'), 'p');
+      const r = await scanMissions(host, srv);
+      expect(r.dir).toBeNull();
+      expect(r.missions).toEqual([]);
+      expect(r.wrongCaseDir).toBe(j('case', 'MPMissions'));
+      expect(r.warning).toMatch(/mpmissions/);
+      const local = path.join(os.tmpdir(), `Yeni.Altis.pbo`);
+      fs.writeFileSync(local, 'PBO');
+      await uploadMission(host, srv, local);
+      fs.rmSync(local);
+      expect(await host.exists(j('case', 'mpmissions', 'yeni.altis.pbo'))).toBe(true);
+      const r2 = await scanMissions(host, srv);
+      expect(r2.dir).toBe(j('case', 'mpmissions'));
+      expect(r2.missions.map((m) => m.template)).toEqual(['yeni.altis']);
+      expect(r2.warning).toMatch(/okunmaz/);
+    });
   });
 }
 
@@ -167,7 +256,7 @@ hostSuite('LocalHost', async () => {
 
 describe.skipIf(!SSH_AVAILABLE)('SSH', () => {
   hostSuite('SshHost (gerçek sshd)', async () => {
-    const host = new SshHost({ id: 'test', host: '127.0.0.1', port: 2222, username: 'armatest', password: 'TestSifre123!' });
+    const host = new SshHost({ id: 'test', host: '127.0.0.1', port: SSH_PORT, username: 'armatest', password: 'TestSifre123!' });
     const root = `/home/armatest/oezi-test-${Date.now()}`;
     return {
       host,
@@ -178,14 +267,32 @@ describe.skipIf(!SSH_AVAILABLE)('SSH', () => {
     };
   });
 
+  it('close(): takip edilen uzak süreçler (journalctl -f gibi) çalışır halde kalmaz', async () => {
+    const cfg = { host: '127.0.0.1', port: SSH_PORT, username: 'armatest', password: 'TestSifre123!' };
+    const host = new SshHost({ id: 'c1', ...cfg });
+    await host.connect();
+    const lines: string[] = [];
+    host.followCommand('sh', ['-c', 'echo pid:$$; exec sleep 300'], (l) => lines.push(...l));
+    await waitFor(() => lines.some((l) => l.startsWith('pid:')));
+    const pid = Number(lines.find((l) => l.startsWith('pid:'))!.slice(4));
+    await host.close();
+    const check = new SshHost({ id: 'c2', ...cfg });
+    await check.connect();
+    try {
+      await waitFor(async () => !(await check.processInfo(pid)).alive);
+    } finally {
+      await check.close();
+    }
+  });
+
   it('yanlış şifre ve değişmiş parmak izi reddedilir', async () => {
-    const bad = new SshHost({ id: 'x', host: '127.0.0.1', port: 2222, username: 'armatest', password: 'yanlis' });
+    const bad = new SshHost({ id: 'x', host: '127.0.0.1', port: SSH_PORT, username: 'armatest', password: 'yanlis' });
     await expect(bad.connect()).rejects.toMatchObject({ code: 'auth_failed' });
-    const good = new SshHost({ id: 'y', host: '127.0.0.1', port: 2222, username: 'armatest', password: 'TestSifre123!' });
+    const good = new SshHost({ id: 'y', host: '127.0.0.1', port: SSH_PORT, username: 'armatest', password: 'TestSifre123!' });
     await good.connect();
     expect(good.fingerprint).toMatch(/^SHA256:/);
     await good.close();
-    const spoofed = new SshHost({ id: 'z', host: '127.0.0.1', port: 2222, username: 'armatest', password: 'TestSifre123!', expectedFingerprint: 'SHA256:baska' });
+    const spoofed = new SshHost({ id: 'z', host: '127.0.0.1', port: SSH_PORT, username: 'armatest', password: 'TestSifre123!', expectedFingerprint: 'SHA256:baska' });
     await expect(spoofed.connect()).rejects.toMatchObject({ code: 'host_key_mismatch' });
   });
 });
