@@ -7,12 +7,12 @@
 Arma 3 dedicated sunucularını tek yerden kurmak, yapılandırmak, başlatmak ve izlemek için masaüstü uygulaması.<br>
 Windows'ta çalışır; aynı uygulamadan hem bu bilgisayardaki sunucuları hem de SSH ile uzaktaki Linux VPS sunucularını yönetir.
 
-[![Son sürüm](https://img.shields.io/github/v/release/OeziDev/oezi-arma-server-manager?label=s%C3%BCr%C3%BCm&color=e9b44c)](https://github.com/OeziDev/oezi-arma-server-manager/releases/latest)
+[![Son sürüm](https://img.shields.io/github/v/release/OeziDev/oezidev-arma-server-manager?label=s%C3%BCr%C3%BCm&color=e9b44c)](https://github.com/OeziDev/oezidev-arma-server-manager/releases/latest)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-3c4a3e)
 ![Sunucular](https://img.shields.io/badge/sunucular-Windows%20%7C%20Linux-3c4a3e)
 [![Discord](https://img.shields.io/badge/Discord-OeziDev-5865F2?logo=discord&logoColor=white)](https://discord.gg/JNnkdBN5GP)
 
-**[⬇ İndir (Windows kurulum)](https://github.com/OeziDev/oezi-arma-server-manager/releases/latest)**
+**[⬇ İndir (Windows kurulum)](https://github.com/OeziDev/oezidev-arma-server-manager/releases/latest)**
 
 <img src="docs/screenshots/genel-bakis.png" alt="Genel bakış: çalışan sunucu, canlı log ve açılması gereken portlar" width="900">
 
@@ -69,7 +69,7 @@ Windows'ta çalışır; aynı uygulamadan hem bu bilgisayardaki sunucuları hem 
 
 ## Kurulum (Windows)
 
-[Releases](https://github.com/OeziDev/oezi-arma-server-manager/releases) sayfasından `OeziDev-Arma-Server-Manager-Setup-<sürüm>.exe` dosyasını indirip çalıştır.
+[Releases](https://github.com/OeziDev/oezidev-arma-server-manager/releases) sayfasından `OeziDev-Arma-Server-Manager-Setup-<sürüm>.exe` dosyasını indirip çalıştır.
 Uygulama imzalı olmadığı için Windows SmartScreen "Bilinmeyen yayıncı" uyarısı verebilir: **Ek bilgi → Yine de çalıştır**.
 
 **Otomatik güncelleme:** kurulu sürüm açılışta ve 6 saatte bir GitHub Releases'ı kontrol eder, yeni sürümü arka planda indirir ve
