@@ -1,0 +1,129 @@
+import { effectiveRconPort } from '@core-constants';
+import { useState } from 'react';
+import { LinesF, NumberF, PasswordF, TextF, ToggleF, useDraft } from '../components/draft';
+import { Button, Field, Section } from '../components/ui';
+import { useI18n } from '../i18n';
+import { api, attempt } from '../state';
+
+export function LaunchTab({ id, dirty }: { id: string; dirty: boolean }) {
+  const { t } = useI18n();
+  const { draft, set } = useDraft();
+  const [time, setTime] = useState('06:00');
+  const times = draft.supervisor.scheduledRestarts;
+
+  return (
+    <>
+      <Section title={t('ln.params')}>
+        <div className="fields">
+          <ToggleF path="launch.loadMissionToMemory" />
+          <ToggleF path="launch.autoInit" />
+          <NumberF path="launch.limitFPS" />
+          <ToggleF path="launch.enableHT" />
+          <ToggleF path="launch.hugepages" />
+          <NumberF path="launch.maxMem" unit="MB" className="mid" />
+          <NumberF path="launch.cpuCount" />
+          <NumberF path="launch.exThreads" />
+          <TextF path="launch.malloc" mono width="mid" placeholder="mimalloc_v206_LockPages" />
+          <ToggleF path="launch.filePatching" />
+          <ToggleF path="launch.netlog" />
+          <ToggleF path="launch.noLogs" />
+          <ToggleF path="launch.showConsoleWindow" />
+          <TextF path="launch.extraArgs" mono placeholder="-world=empty" />
+        </div>
+      </Section>
+
+      <Section title={t('ln.headless')} intro={t('ln.headlessIntro')}>
+        <div className="fields">
+          <NumberF path="headless.count" />
+          {draft.headless.count > 0 && (
+            <>
+              <LinesF path="headless.allowedIps" mono rows={2} />
+              <LinesF path="headless.localClients" mono rows={2} />
+              <TextF path="headless.connectIp" mono width="mid" />
+              <NumberF path="headless.startDelaySec" unit={t('common.seconds')} />
+              <NumberF path="headless.limitFPS" />
+              <TextF path="headless.extraArgs" mono />
+            </>
+          )}
+        </div>
+      </Section>
+
+      <Section title={t('ln.supervisor')}>
+        <div className="fields">
+          <ToggleF path="supervisor.autoRestart" />
+          <NumberF path="supervisor.restartDelaySec" unit={t('common.seconds')} />
+          <NumberF path="supervisor.maxRestartsPerHour" />
+          <NumberF path="supervisor.gracefulShutdownSec" unit={t('common.seconds')} />
+        </div>
+      </Section>
+
+      <Section title={t('ln.schedule')} intro={t('ln.scheduleIntro')}>
+        <div className="fields">
+          <Field label={t('field.supervisor.scheduledRestarts')}>
+            <div className="hstack">
+              {times.length === 0 && <span className="muted">{t('common.none')}</span>}
+              {times.map((x) => (
+                <span key={x} className="hstack" style={{ gap: 4, border: '1px solid var(--line-strong)', borderRadius: 4, padding: '2px 4px 2px 10px' }}>
+                  <span className="mono">{x}</span>
+                  <button className="btn ghost sm icon" title={t('common.remove')} onClick={() => set('supervisor.scheduledRestarts', times.filter((y) => y !== x))}>
+                    ✕
+                  </button>
+                </span>
+              ))}
+            </div>
+            <div className="input-row">
+              <input type="time" className="input short" value={time} onChange={(e) => setTime(e.target.value)} aria-label={t('ln.addTime')} />
+              <Button size="sm" disabled={!/^\d{2}:\d{2}$/.test(time) || times.includes(time)} onClick={() => set('supervisor.scheduledRestarts', [...times, time].sort())}>
+                {t('ln.addTime')}
+              </Button>
+            </div>
+          </Field>
+          <Field label={t('field.supervisor.warnMinutes')} help={t('help.supervisor.warnMinutes')}>
+            <input
+              className="input mid mono"
+              defaultValue={draft.supervisor.warnMinutes.join(', ')}
+              onChange={(e) => {
+                const nums = e.target.value
+                  .split(/[\s,;]+/)
+                  .map(Number)
+                  .filter((n) => Number.isInteger(n) && n > 0 && n <= 120);
+                set('supervisor.warnMinutes', [...new Set(nums)].sort((a, b) => b - a));
+              }}
+            />
+          </Field>
+          <TextF path="supervisor.warnMessage" />
+          <ToggleF path="supervisor.updateOnScheduledRestart" />
+        </div>
+      </Section>
+
+      <Section title={t('ln.rcon')} intro={t('ln.rconIntro')}>
+        <div className="fields">
+          <ToggleF path="rcon.enabled" />
+          <NumberF path="rcon.port" unit={`→ ${effectiveRconPort(draft)}`} />
+          <PasswordF path="rcon.password" generate={20} />
+          <TextF path="rcon.listenIp" mono width="mid" placeholder="0.0.0.0" />
+          <TextF path="rcon.connectHost" mono width="mid" />
+          <NumberF path="rcon.maxPing" unit="ms" />
+        </div>
+      </Section>
+
+      <Section title={t('ln.notify')}>
+        <div className="fields">
+          <PasswordF path="notifications.discordWebhook" />
+          <ToggleF path="notifications.onStart" />
+          <ToggleF path="notifications.onStop" />
+          <ToggleF path="notifications.onCrash" />
+          <ToggleF path="notifications.onUpdate" />
+          <Field label="">
+            <div className="hstack">
+              <Button size="sm" disabled={dirty || !draft.notifications.discordWebhook} onClick={() => attempt(() => api.notify.test(id), t('ln.testSent'))}>
+                {t('ln.testNotify')}
+              </Button>
+              {dirty && <span className="small muted">{t('common.unsaved')}</span>}
+            </div>
+          </Field>
+        </div>
+      </Section>
+    </>
+  );
+}

@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "types": ["node"],
+    "paths": {
+      "@oezi/arma-core": ["../core/src/index.ts"],
+      "@core-constants": ["../core/src/model/constants.ts"],
+      "@core-naming": ["../core/src/steam/naming.ts"],
+      "@core-rcon": ["../core/src/rcon/parse.ts"]
+    }
+  },
+  "include": ["src"]
+}

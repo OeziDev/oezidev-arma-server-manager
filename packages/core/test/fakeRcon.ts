@@ -18,9 +18,9 @@ export class FakeRconServer {
 
   constructor(readonly password: string) {}
 
-  async start(): Promise<number> {
+  async start(port = 0): Promise<number> {
     this.socket.on('message', (msg, rinfo) => this.onMessage(msg, rinfo));
-    await new Promise<void>((r) => this.socket.bind(0, '127.0.0.1', () => r()));
+    await new Promise<void>((r) => this.socket.bind(port, '127.0.0.1', () => r()));
     this.port = (this.socket.address() as { port: number }).port;
     return this.port;
   }

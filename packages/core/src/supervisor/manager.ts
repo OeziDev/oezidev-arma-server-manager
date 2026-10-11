@@ -737,7 +737,10 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       const rcon = new BattlEyeRcon({ host, port: effectiveRconPort(p), password: p.rcon.password, reconnect: true, reconnectDelayMs: 10_000 });
       this.rcon = rcon;
       rcon.on('state', (s, reason) => {
-        if (s === 'connected') this.appLog(`RCON bağlandı (${host}:${effectiveRconPort(p)})`);
+        if (s === 'connected') {
+          this.appLog(`RCON bağlandı (${host}:${effectiveRconPort(p)})`);
+          void this.refreshPlayers();
+        }
         if (s === 'disconnected' && reason && reason !== 'Kapatıldı') this.appLog(`RCON bağlantısı yok: ${reason}`);
         this.emitStatus();
       });
