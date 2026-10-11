@@ -84,6 +84,19 @@ export interface AppInfo {
   dataDir: string;
 }
 
+export type UpdateStatus = 'idle' | 'disabled' | 'checking' | 'available' | 'downloading' | 'ready' | 'none' | 'error';
+
+export interface UpdateState {
+  status: UpdateStatus;
+  /** Bulunan / indirilen sürüm */
+  version?: string;
+  /** 0-100 */
+  percent?: number;
+  error?: string;
+  /** Kurulu uygulamada değil (geliştirme / portable) ise neden */
+  disabledReason?: 'dev' | 'portable';
+}
+
 export interface SaveResult {
   profile?: ServerProfile;
   errors: { path: string; message: string }[];
@@ -139,13 +152,24 @@ export type AppEvent =
   | { type: 'rconMessage'; profileId: string; message: string; t: number }
   | { type: 'job'; job: JobInfo }
   | { type: 'profiles-changed' }
-  | { type: 'hosts-changed' };
+  | { type: 'hosts-changed' }
+  | { type: 'settings-changed'; settings: AppSettings }
+  | { type: 'update'; update: UpdateState };
 
 export interface OeziApi {
   app: {
     info(): Promise<AppInfo>;
     getSettings(): Promise<AppSettings>;
-    saveSettings(s: AppSettings): Promise<AppSettings>;
+    /** Sadece verilen alanlar değişir (eksik alanlar korunur) */
+    saveSettings(s: Partial<AppSettings>): Promise<AppSettings>;
+    /** Panoya kopyala (ana süreç üzerinden; tarayıcı pano izni gerekmez) */
+    copyText(text: string): Promise<void>;
+    /** Arayüzde kaydedilmemiş değişiklik var mı (çıkışta sormak için) */
+    setDirty(dirty: boolean): Promise<void>;
+    updateState(): Promise<UpdateState>;
+    checkForUpdates(): Promise<UpdateState>;
+    /** İndirilen güncellemeyi kurup uygulamayı yeniden başlatır */
+    installUpdate(): Promise<void>;
     openExternal(url: string): Promise<void>;
     pickFile(opts: { title?: string; filters?: { name: string; extensions: string[] }[] }): Promise<string | null>;
     pickFolder(opts?: { title?: string }): Promise<string | null>;
@@ -204,7 +228,6 @@ export interface OeziApi {
   steam: {
     updateServer(profileId: string): Promise<string>;
     syncWorkshop(profileId: string, ids?: string[]): Promise<string>;
-    removeWorkshopMod(profileId: string, folder: string): Promise<void>;
     workshopInfo(ids: string[]): Promise<WorkshopItemInfo[]>;
     collection(id: string): Promise<string[]>;
     parsePreset(html: string): Promise<PresetMod[]>;

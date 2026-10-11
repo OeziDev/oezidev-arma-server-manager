@@ -30,6 +30,8 @@ export interface StatusInfo {
 }
 
 export interface LogLine {
+  /** Profil içinde artan sıra numarası (arayüzde tekrarları ayıklamak için) */
+  seq: number;
   t: number;
   source: string;
   line: string;
@@ -117,6 +119,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
   private tails: TailHandle[] = [];
   private tailsGeneration = -1;
   private logBuffer: LogLine[] = [];
+  private logSeq = 0;
   private busy: Promise<void> | null = null;
   private monitoring = false;
   private deadStreak = 0;
@@ -236,7 +239,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
 
   private pushLog(source: string, lines: string[]) {
     const t = Date.now();
-    const items = lines.map((line) => ({ t, source, line }));
+    const items = lines.map((line) => ({ seq: ++this.logSeq, t, source, line }));
     this.logBuffer.push(...items);
     if (this.logBuffer.length > MAX_LOG) this.logBuffer.splice(0, this.logBuffer.length - MAX_LOG);
     this.emit('log', items);
