@@ -39,6 +39,8 @@ describe.skipIf(!RUN)('Electron uçtan uca', () => {
   let rcon: FakeRconServer;
   const shot = async (name: string) => {
     fs.mkdirSync(SHOTS, { recursive: true });
+    // README görselleri için: bildirimleri gizle (E2E_CLEAN_SHOTS=1)
+    if (process.env.E2E_CLEAN_SHOTS === '1') await page.addStyleTag({ content: '.toasts { display: none !important; }' });
     await page.waitForTimeout(250);
     await page.screenshot({ path: path.join(SHOTS, `${name}.png`) });
   };

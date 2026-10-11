@@ -1,9 +1,39 @@
+<div align="center">
+
+<img src="packages/app/build/icon.png" width="96" alt="OeziDev Arma Server Manager">
+
 # OeziDev Arma Server Manager
 
-Arma 3 dedicated sunucularını tek yerden kurmak, yapılandırmak, başlatmak ve izlemek için masaüstü uygulaması.
+Arma 3 dedicated sunucularını tek yerden kurmak, yapılandırmak, başlatmak ve izlemek için masaüstü uygulaması.<br>
 Windows'ta çalışır; aynı uygulamadan hem bu bilgisayardaki sunucuları hem de SSH ile uzaktaki Linux VPS sunucularını yönetir.
 
-Developed by OeziDev — [Discord](https://discord.gg/JNnkdBN5GP)
+[![Son sürüm](https://img.shields.io/github/v/release/OeziDev/oezi-arma-server-manager?label=s%C3%BCr%C3%BCm&color=e9b44c)](https://github.com/OeziDev/oezi-arma-server-manager/releases/latest)
+![Platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-3c4a3e)
+![Sunucular](https://img.shields.io/badge/sunucular-Windows%20%7C%20Linux-3c4a3e)
+[![Discord](https://img.shields.io/badge/Discord-OeziDev-5865F2?logo=discord&logoColor=white)](https://discord.gg/JNnkdBN5GP)
+
+**[⬇ İndir (Windows kurulum)](https://github.com/OeziDev/oezi-arma-server-manager/releases/latest)**
+
+<img src="docs/screenshots/genel-bakis.png" alt="Genel bakış: çalışan sunucu, canlı log ve açılması gereken portlar" width="900">
+
+</div>
+
+## Ekran görüntüleri
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/oyuncular.png" alt="Oyuncular"><br><sub><b>Oyuncular ve RCON</b>: ping, GUID, mesaj, kick, ban, sohbet akışı</sub></td>
+    <td width="50%"><img src="docs/screenshots/konsol.png" alt="Konsol"><br><sub><b>Canlı konsol</b>: RPT / journald, filtre, uyarı ve hata renklendirme, RCON komutları</sub></td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/zorluk.png" alt="Zorluk ayarları"><br><sub><b>Yapılandırma</b>: server.cfg, basic.cfg ve zorluk ayarları Arma 3'ün gerçek değerleriyle</sub></td>
+    <td><img src="docs/screenshots/modlar.png" alt="Modlar"><br><sub><b>Workshop modları</b>: bağlantı, koleksiyon ya da Launcher listesiyle ekle, tek tuşla indir</sub></td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/gorevler.png" alt="Görevler"><br><sub><b>Görev rotasyonu</b>: MPMissions taraması, .pbo yükleme, zorluk ve parametreler</sub></td>
+    <td><img src="docs/screenshots/makineler.png" alt="Makineler"><br><sub><b>Uzak Linux VPS</b>: SSH ile bağlan, sunucu systemd servisi olarak çalışsın</sub></td>
+  </tr>
+</table>
 
 ## Özellikler
 
