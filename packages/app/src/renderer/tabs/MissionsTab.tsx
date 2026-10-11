@@ -17,6 +17,7 @@ export function MissionsTab({ id }: { id: string }) {
   const { draft, update, ensureSaved } = useDraft();
   const [found, setFound] = useState<FoundMission[] | null>(null);
   const [dir, setDir] = useState<string | null>(null);
+  const [wrongCase, setWrongCase] = useState<string | null>(null);
   const [filter, setFilter] = useState('');
   const [island, setIsland] = useState('');
   const [manual, setManual] = useState('');
@@ -31,6 +32,7 @@ export function MissionsTab({ id }: { id: string }) {
     if (r) {
       setFound(r.missions);
       setDir(r.dir);
+      setWrongCase(r.wrongCaseDir ?? null);
     }
   };
 
@@ -77,6 +79,11 @@ export function MissionsTab({ id }: { id: string }) {
               {t('ms.upload')}
             </Button>
           </div>
+          {wrongCase && (
+            <div className="banner" data-level="warning">
+              {t(dir ? 'ms.wrongCaseIgnored' : 'ms.wrongCaseOnly', { name: wrongCase.split(/[\\/]/).pop() ?? wrongCase })}
+            </div>
+          )}
           {found === null ? (
             <Empty title={t('ms.notScanned')} />
           ) : dir === null ? (

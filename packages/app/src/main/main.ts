@@ -1,4 +1,5 @@
 import { app, BrowserWindow, dialog, Menu, nativeImage, session, shell, Tray } from 'electron';
+import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { AppEvent, AppSettings } from '../shared/api.js';
@@ -15,7 +16,12 @@ if (process.platform === 'win32') app.setAppUserModelId('dev.oezi.armamanager');
 // Sadece geliştirme: Linux'ta root olarak test ederken (konteyner/CI)
 if (!app.isPackaged && process.env.OEZI_NO_SANDBOX === '1') app.commandLine.appendSwitch('no-sandbox');
 // Portable sürüm: veriler exe'nin yanında kalsın (başka bilgisayara taşınabilsin)
-if (process.env.PORTABLE_EXECUTABLE_DIR) app.setPath('userData', path.join(process.env.PORTABLE_EXECUTABLE_DIR, 'OeziArmaManager-data'));
+if (process.env.PORTABLE_EXECUTABLE_DIR) {
+  const legacy = app.getPath('userData');
+  const portableData = path.join(process.env.PORTABLE_EXECUTABLE_DIR, 'OeziArmaManager-data');
+  migratePortableData(legacy, portableData);
+  app.setPath('userData', portableData);
+}
 if (process.env.OEZI_USER_DATA) app.setPath('userData', process.env.OEZI_USER_DATA);
 
 // Yakalanmamış hatalar: Electron'un hata penceresi yerine günlüğe yaz, uygulama çalışmaya devam etsin
@@ -265,6 +271,11 @@ if (!app.requestSingleInstanceLock()) {
         await svc.prepareForUpdate();
         allowQuit = true;
       },
+      onInstallFailed: async () => {
+        // Uygulama kapanmadı: sunucu takibini geri getir, çıkışta yine sorulsun
+        allowQuit = false;
+        await svc.init();
+      },
     });
     registerIpc({
       services: svc,
@@ -303,3 +314,20 @@ if (!app.requestSingleInstanceLock()) {
     void services?.shutdown();
   });
 }
+
+/**
+ * 1.0.0 portable sürümü verisini %APPDATA%'da tutuyordu; 1.0.1'den itibaren exe'nin yanında.
+ * Yeni klasörde veri yoksa eskisini bir kez kopyala (silmeden), kullanıcı sunucularını kaybolmuş sanmasın.
+ */
+function migratePortableData(from: string, to: string): void {
+  try {
+    if (fs.existsSync(path.join(to, 'data.json')) || !fs.existsSync(path.join(from, 'data.json'))) return;
+    fs.mkdirSync(to, { recursive: true });
+    for (const name of fs.readdirSync(from)) {
+      if (/^(data\.json|secrets\.bin)(\.bak.*)?$/.test(name)) fs.copyFileSync(path.join(from, name), path.join(to, name));
+    }
+  } catch {
+    // Kopyalanamazsa boş başla; eski veri yerinde duruyor
+  }
+}
+

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -302,7 +302,7 @@ describe('ServerManager: hazır olma, ölümcül hata ve yarış durumları', ()
     const pid = mgr.getStatus().pid!;
     expect(mgr.getStatus().status).toBe('starting');
     await waitFor(() => mgr.getStatus().status === 'crashed', 8000, 'crashed');
-    expect(mgr.getStatus().lastError).toMatch(/^Sunucu 1 sn içinde hazır olmadı\nFAKE ARMA/);
+    expect(mgr.getStatus().lastError).toMatch(/^Sunucu hazır olmadan 1 sn boyunca log yazmadı.*\nSon satır: FAKE ARMA/);
     expect(await new LocalHost().processInfo(pid)).toMatchObject({ alive: false });
   });
 
@@ -460,7 +460,14 @@ describe('ServerManager: hazır olma, ölümcül hata ve yarış durumları', ()
     await mgr.runSchedulerTick(new Date(2026, 9, 11, 17, 57));
     expect(rcon.received.filter((c) => c.startsWith('say'))).toEqual(['say -1 4 dk']);
     // Saat değişince sıfırlanır
-    mgr.updateProfile({ ...profile, supervisor: { ...profile.supervisor, scheduledRestarts: ['18:01'] } });
+    // updateProfile bir sonraki restartı gerçek saate göre hesaplar; testte saati sabitle
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date(2026, 9, 11, 17, 57));
+    try {
+      mgr.updateProfile({ ...profile, supervisor: { ...profile.supervisor, scheduledRestarts: ['18:01'] } });
+    } finally {
+      vi.useRealTimers();
+    }
     await mgr.runSchedulerTick(new Date(2026, 9, 11, 17, 57));
     expect(rcon.received.filter((c) => c.startsWith('say'))).toEqual(['say -1 4 dk', 'say -1 4 dk']);
   });

@@ -296,6 +296,8 @@ export const en: Dict = {
   'ms.upload': 'Upload .pbo',
   'ms.addToRotation': 'Add to rotation',
   'ms.inRotation': 'In rotation',
+  'ms.wrongCaseIgnored': 'Missions in "{name}" are not read by the server: the Linux server only uses the lowercase "mpmissions" folder. Move them there.',
+  'ms.wrongCaseOnly': 'Found "{name}", but the Linux server only reads the lowercase "mpmissions" folder. Rename the folder to "mpmissions".',
   'ms.noDir': 'No MPMissions folder in the server folder. It is created when you upload a mission.',
   'ms.empty': 'Rotation is empty',
   'ms.emptyHelp': 'Add missions from the list on the left or type a name.',
@@ -623,8 +625,8 @@ export const en: Dict = {
   // new profile fields
   'field.voting.allowAdminVote': 'Allow voting a player admin (#vote admin)',
   'help.voting.allowAdminVote': 'Dangerous: on a public server a group of players can make one of them admin. Only enable it for closed communities you trust.',
-  'field.supervisor.startTimeoutSec': 'Start timeout',
-  'help.supervisor.startTimeoutSec': 'If the server is not ready in this time (no RCON login, no "Host identity created" in the log), the start counts as failed and the process is killed. 0 = off.',
+  'field.supervisor.startTimeoutSec': 'Stall timeout (while starting)',
+  'help.supervisor.startTimeoutSec': 'If the server writes no log line for this many seconds before it is ready (no RCON login, no "Host identity created"), it is considered stuck (e.g. an error dialog is open): the start counts as failed and the process is killed. The timer restarts while it keeps loading, so big modpacks are fine. 0 = off.',
 
   // machines
   'hosts.deleteConfirm': 'Delete the machine "{name}"? Its saved connection details and password are removed; files on the machine are not touched.',

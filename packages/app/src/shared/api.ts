@@ -117,7 +117,7 @@ export interface PreviewFiles {
 
 export interface ImportResultDto {
   profile: ServerProfile;
-  issues: { line: number; message: string; severity: string }[];
+  issues: { line: number; message: string; messageEn?: string; severity: string }[];
   unknownKeys: string[];
 }
 
@@ -207,7 +207,8 @@ export interface OeziApi {
     logs(id: string): Promise<LogLine[]>;
   };
   missions: {
-    scan(id: string): Promise<{ dir: string | null; missions: FoundMission[] }>;
+    /** wrongCaseDir: Linux'ta sadece büyük harfli (okunmayan) MPMissions klasörü varsa */
+    scan(id: string): Promise<{ dir: string | null; missions: FoundMission[]; warning?: string; wrongCaseDir?: string }>;
     upload(id: string): Promise<string | null>;
   };
   mods: {

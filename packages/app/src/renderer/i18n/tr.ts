@@ -303,6 +303,8 @@ export const tr = {
   'ms.upload': '.pbo yükle',
   'ms.addToRotation': 'Rotasyona ekle',
   'ms.inRotation': 'Rotasyonda',
+  'ms.wrongCaseIgnored': '"{name}" klasöründeki görevler sunucu tarafından okunmaz: Linux sunucusu sadece küçük harfli "mpmissions" klasörünü kullanır. Görevleri oraya taşı.',
+  'ms.wrongCaseOnly': '"{name}" klasörü bulundu ama Linux sunucusu sadece küçük harfli "mpmissions" klasörünü okur. Klasörün adını "mpmissions" olarak değiştir.',
   'ms.noDir': 'Sunucu klasöründe MPMissions bulunamadı. Bir görev yüklediğinde oluşturulur.',
   'ms.empty': 'Rotasyon boş',
   'ms.emptyHelp': 'Soldaki listeden görev ekle ya da adını elle yaz.',
@@ -640,8 +642,8 @@ export const tr = {
   // yeni profil alanları
   'field.voting.allowAdminVote': 'Oylamayla admin seçilebilsin (#vote admin)',
   'help.voting.allowAdminVote': 'Tehlikeli: herkese açık sunucuda bir grup oyuncu kendi aralarından birini admin yapabilir. Sadece güvendiğin kapalı topluluklarda aç.',
-  'field.supervisor.startTimeoutSec': 'Başlatma zaman aşımı',
-  'help.supervisor.startTimeoutSec': 'Sunucu bu sürede hazır olmazsa (RCON girişi yok, logda "Host identity created" yok) başlatma başarısız sayılır ve süreç kapatılır. 0 = kapalı.',
+  'field.supervisor.startTimeoutSec': 'Takılma zaman aşımı (başlatırken)',
+  'help.supervisor.startTimeoutSec': 'Sunucu hazır olmadan (RCON girişi ya da logda "Host identity created" görülmeden) bu kadar saniye hiç log yazmazsa takıldığı (ör. hata penceresi açık) kabul edilir, başlatma başarısız sayılır ve süreç kapatılır. Yükleme sürdükçe süre yeniden başlar; büyük mod paketlerinde sorun olmaz. 0 = kapalı.',
 
   // makineler
   'hosts.deleteConfirm': '"{name}" makinesi silinsin mi? Kayıtlı bağlantı bilgileri ve şifresi silinir; makinedeki dosyalara dokunulmaz.',

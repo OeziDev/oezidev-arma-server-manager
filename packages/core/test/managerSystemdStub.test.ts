@@ -210,7 +210,7 @@ describe('ServerManager (systemd modu, sahte host)', () => {
     await mgr.start();
     await waitFor(() => mgr.getStatus().autoRestarts === 1, 4000, 'restart');
     await waitFor(() => mgr.getStatus().status === 'crashed', 4000, 'crashed');
-    expect(mgr.getStatus().lastError).toMatch(/^Sunucu 1 sn içinde hazır olmadı/);
+    expect(mgr.getStatus().lastError).toMatch(/^Sunucu hazır olmadan 1 sn boyunca log yazmadı/);
     expect(host.actions.filter((a) => a[0] === 'start' && a[1] === mgr.unitName)).toHaveLength(2);
     expect(host.units.get(mgr.unitName)?.activeState).toBe('inactive');
   });

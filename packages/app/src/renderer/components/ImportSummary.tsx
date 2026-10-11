@@ -19,7 +19,7 @@ export function hasImportDetails(d: ImportSummaryData): boolean {
 
 /** server.cfg / Arma3Profile içe aktarma sonucu: bütün uyarı ve hatalar + ek satırlara taşınan anahtarlar. */
 export function ImportSummary({ data, onClose }: { data: ImportSummaryData; onClose: () => void }) {
-  const { t } = useI18n();
+  const { t, lang } = useI18n();
   const order: Record<string, number> = { error: 0, warning: 1, info: 2 };
   const issues = [...data.issues].sort((a, b) => (order[a.severity] ?? 3) - (order[b.severity] ?? 3) || a.line - b.line);
   const errors = issues.filter((i) => i.severity === 'error').length;
@@ -63,7 +63,7 @@ export function ImportSummary({ data, onClose }: { data: ImportSummaryData; onCl
               <li key={n} className="issue" data-sev={i.severity === 'error' || i.severity === 'warning' ? i.severity : 'info'}>
                 <span>
                   {i.line > 0 && <span className="mono muted">{t('imp.line', { n: i.line })} </span>}
-                  {i.message}
+                  {lang === 'en' && i.messageEn ? i.messageEn : i.message}
                 </span>
                 <span />
               </li>

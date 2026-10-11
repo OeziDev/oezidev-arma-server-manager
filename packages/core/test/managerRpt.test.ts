@@ -46,7 +46,7 @@ afterEach(() => managers.splice(0).forEach((m) => m.dispose()));
 
 function make(host: FakeWindowsHost) {
   const profile = createProfile({ name: 'W', paths: { serverDir: 'C:\\server\\A3Server' } });
-  const mgr = new ServerManager({ profile, host: host as unknown as Host, timers: { rptPollMs: 40, schedulerMs: 3_600_000 } });
+  const mgr = new ServerManager({ profile, host: host as unknown as Host, timers: { rptPollMs: 40, schedulerMs: 3_600_000, errorMessageGraceMs: 100 } });
   managers.push(mgr);
   const priv = mgr as unknown as {
     snapshotRpts(): Promise<void>;
@@ -98,8 +98,9 @@ describe('Windows .rpt takibi', () => {
     priv.rptWatcher(dir, 'server', 'new');
     host.addRpt(dir, 'yeni.rpt');
     await waitFor(() => host.active().length === 1, 2000, 'rpt');
-    const internal = mgr as unknown as { status: string; handleCrash: (kind: string, detail?: string) => Promise<void> };
+    const internal = mgr as unknown as { status: string; awaitingReady: boolean; handleCrash: (kind: string, detail?: string) => Promise<void> };
     internal.status = 'starting';
+    internal.awaitingReady = true;
     const calls: [string, string | undefined][] = [];
     internal.handleCrash = async (kind, detail) => void calls.push([kind, detail]);
     host.active()[0]!.push([
@@ -112,13 +113,27 @@ describe('Windows .rpt takibi', () => {
     expect(calls[0]![1]).toContain('Reading server.cfg\n 7:00:01 File C:\\server');
     // Hata görüldükten sonra "hazır" satırı çalışıyor durumuna geçirmez
     expect(internal.status).toBe('starting');
-    // Uyarı satırları ölümcül sayılmaz
+    // Mod/görev config'lerindeki aynı biçimli satırlar zararsızdır (gerçek RPT'lerde bolca var)
     calls.length = 0;
-    internal.status = 'running';
     (mgr as unknown as { fatalDetail: string | null }).fatalDetail = null;
-    host.active()[0]!.push([' 7:10:00 Warning Message: File x.hpp, line 3: bir uyarı', ' 7:10:01 Mission file: altis']);
+    host.active()[0]!.push([
+      " 7:00:02 File @mod\\mod.cpp, line 5: '.action': Missing ';' at the end of line",
+      " 7:00:02 File usaf_all\\config.cpp, line 186: '/CfgVehicles/x/EventHandlers.init': Missing ';' prior '}'",
+      ' 7:00:03 Warning Message: File x.hpp, line 3: bir uyarı',
+    ]);
     expect(calls).toHaveLength(0);
-    host.active()[0]!.push([' 7:10:02 ErrorMessage: Include file x.hpp not found.']);
-    expect(calls.map((c) => c[0])).toEqual(['fatal']);
+    // ErrorMessage: hemen öldürmez, kısa süre içinde hazır olmazsa başarısız sayılır
+    host.active()[0]!.push([' 7:00:04 ErrorMessage: Include file x.hpp not found.']);
+    expect(calls).toHaveLength(0);
+    await waitFor(() => calls.length === 1, 2000, 'grace');
+    expect(calls[0]![0]).toBe('fatal');
+    // Çalışan sunucuda (bağlanırken tekrar okunan eski satırlar dahil) hiçbir satır öldürmez
+    calls.length = 0;
+    (mgr as unknown as { fatalDetail: string | null }).fatalDetail = null;
+    internal.status = 'running';
+    internal.awaitingReady = false;
+    host.active()[0]!.push([' 7:10:02 ErrorMessage: Include file x.hpp not found.', ' 7:10:03 File C:\\x\\server.cfg, line 1: .a: Member already defined.']);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(calls).toHaveLength(0);
   });
 });

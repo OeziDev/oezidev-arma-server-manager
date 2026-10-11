@@ -78,6 +78,8 @@ export interface ManagerOptions {
     rptPollMs: number;
     /** Ölü sayılmadan önce art arda kaç "yok" okuması gerekir */
     deadConfirmations: number;
+    /** Başlatırken "ErrorMessage:" görüldükten sonra hazır olması için tanınan süre */
+    errorMessageGraceMs: number;
   }>;
 }
 
@@ -132,11 +134,17 @@ const HC_MAX_RESTARTS_PER_HOUR = 6;
 /** Sunucunun oyunculara hazır olduğunu gösteren log satırları */
 const READY_RES = [/Host identity created/i, /BattlEye Server: Initialized/i];
 /**
- * Sunucunun ölümcül hata verdiğini gösteren satırlar. Windows'ta Arma bu durumda bir mesaj kutusu
- * açar ve süreç arkada açık kalır; bu yüzden süreç "yaşıyor" diye çalışıyor sanılmamalı.
- * Örn. "File C:\...\server.cfg, line 107: .regularCheck: Member already defined."
+ * Ölümcül hata satırları. Windows'ta Arma bu durumda bir mesaj kutusu açar ve süreç arkada açık
+ * kalır; bu yüzden süreç "yaşıyor" diye çalışıyor sanılmamalı.
+ * - Bizim ürettiğimiz config dosyalarındaki sözdizimi hatası kesin ölümcüldür:
+ *   "File C:\...\server.cfg, line 107: .regularCheck: Member already defined."
+ *   Mod/görev config'lerindeki aynı biçimli satırlar (Missing ';' vb.) zararsız uyarılardır, sayılmaz.
+ * - "ErrorMessage:" çoğu zaman ölümcüldür ama her zaman değil: önce uyarılır, sunucu ardından
+ *   ERROR_MESSAGE_GRACE_MS içinde hazır olmazsa başlatma başarısız sayılır.
  */
-const FATAL_RES = [/\bErrorMessage:/, /^\s*(?:\d+:\d+:\d+(?:\.\d+)?\s+)?File .+, line \d+: /];
+const CFG_ERROR_RE = /^\s*(?:\d+:\d+:\d+(?:\.\d+)?\s+)?File (.+?), line \d+: /;
+const ERROR_MESSAGE_RE = /\bErrorMessage:/;
+const ERROR_MESSAGE_GRACE_MS = 60_000;
 /** journald zamanı VPS saatine göre karşılaştırır; uzak saat bilinmiyorsa bu kadar geriden başla */
 const JOURNAL_MARGIN_SEC = 120;
 
@@ -195,6 +203,8 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
   private fatalDetail: string | null = null;
   /** Süreç kapandıktan hemen sonra gelen hata satırları da yakalansın */
   private lateFatalUntil = 0;
+  private errorMessageTimer: NodeJS.Timeout | null = null;
+  private startTimeoutSec = 0;
   private recentServerLines: string[] = [];
   /** Durdurma doğrulanamadı: süreç kapandığında "durdu" say (çökme sayma) */
   private stopPending = false;
@@ -217,6 +227,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       rptWaitMs: 120000,
       rptPollMs: 2000,
       deadConfirmations: 2,
+      errorMessageGraceMs: ERROR_MESSAGE_GRACE_MS,
       ...opts.timers,
     };
     this.schedulerTimer = setInterval(() => void this.schedulerTick(), this.t.schedulerMs);
@@ -676,6 +687,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       this.runningTimer = setTimeout(() => this.markReady('süre doldu; RCON ve log yok'), this.t.runningAfterMs);
     }
     const sec = this.profile.supervisor.startTimeoutSec ?? 300;
+    this.startTimeoutSec = sec;
     if (sec > 0) {
       const runId = this.runId;
       this.startTimeoutTimer = setTimeout(() => void this.onStartTimeout(sec, runId), sec * 1000);
@@ -684,6 +696,8 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
 
   private clearReadiness() {
     this.awaitingReady = false;
+    if (this.errorMessageTimer) clearTimeout(this.errorMessageTimer);
+    this.errorMessageTimer = null;
     if (this.runningTimer) clearTimeout(this.runningTimer);
     if (this.startTimeoutTimer) clearTimeout(this.startTimeoutTimer);
     this.runningTimer = null;
@@ -700,17 +714,62 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     this.startHeadlessClients(runId);
   }
 
+  /** Satırdaki dosya bizim ürettiğimiz config'lerden biri mi (server.cfg, basic.cfg, *.Arma3Profile) */
+  private isOwnConfigFile(file: string): boolean {
+    const base = file.trim().replace(/^["']|["']$/g, '').split(/[\\/]/).pop()?.toLowerCase() ?? '';
+    const rp = this.paths;
+    const own = [rp.serverCfg, rp.basicCfg, ...rp.arma3Profiles].map((f) => f.split(/[\\/]/).pop()!.toLowerCase());
+    return own.includes(base) || base.endsWith('.arma3profile');
+  }
+
   private inspectServerLines(lines: string[]) {
+    const lateWindow = Date.now() < this.lateFatalUntil;
+    // Ölümcül hata yalnızca başlatma sırasında (ya da süreç kapandıktan hemen sonra) aranır.
+    // Çalışan bir sunucuya bağlanırken tekrar okunan eski satırlar sunucuyu öldürmemeli.
+    if (!this.awaitingReady && !lateWindow) return;
     for (const line of lines) {
       const prev = this.recentServerLines.filter((l) => l.trim()).slice(-2);
       this.recentServerLines.push(line);
       if (this.recentServerLines.length > 6) this.recentServerLines.splice(0, this.recentServerLines.length - 6);
-      if (FATAL_RES.some((re) => re.test(line))) {
-        this.onFatal([...prev, line].join('\n'));
+      const detail = [...prev, line].join('\n');
+      const cfg = CFG_ERROR_RE.exec(line);
+      if (cfg && this.isOwnConfigFile(cfg[1]!)) {
+        this.onFatal(detail);
         continue;
       }
-      if (this.awaitingReady && READY_RES.some((re) => re.test(line))) this.markReady('log');
+      if (ERROR_MESSAGE_RE.test(line)) {
+        if (lateWindow && !this.awaitingReady) this.onFatal(detail);
+        else this.onErrorMessage(detail);
+        continue;
+      }
+      if (this.awaitingReady) {
+        this.touchStartTimeout();
+        if (READY_RES.some((re) => re.test(line))) this.markReady('log');
+      }
     }
+  }
+
+  /** "ErrorMessage:" görüldü: hemen öldürme, kısa süre içinde hazır olmazsa başarısız say. */
+  private onErrorMessage(detail: string) {
+    if (this.errorMessageTimer || this.fatalDetail) return;
+    this.lastError = detail;
+    this.emitStatus();
+    this.notice('warning', `Sunucu logunda hata: ${detail}`, `Error in server log: ${detail}`);
+    const runId = this.runId;
+    this.errorMessageTimer = setTimeout(() => {
+      this.errorMessageTimer = null;
+      if (this.disposed || runId !== this.runId || !this.awaitingReady || this.status !== 'starting') return;
+      this.onFatal(detail);
+    }, this.t.errorMessageGraceMs);
+  }
+
+  /** Başlatma zaman aşımı "hazır olmadan bu kadar süre sessiz kalma" demektir: log geldikçe yeniden kurulur. */
+  private touchStartTimeout() {
+    if (!this.startTimeoutTimer || !this.startTimeoutSec) return;
+    clearTimeout(this.startTimeoutTimer);
+    const runId = this.runId;
+    const sec = this.startTimeoutSec;
+    this.startTimeoutTimer = setTimeout(() => void this.onStartTimeout(sec, runId), sec * 1000);
   }
 
   private onFatal(detail: string) {
@@ -749,8 +808,8 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     // Süreç yoksa izleme (çökme) halleder
     if (!alive || runId !== this.runId || !this.awaitingReady || this.status !== 'starting' || this.disposed) return;
     const last = [...this.recentServerLines].reverse().find((l) => l.trim());
-    const tr = `Sunucu ${sec} sn içinde hazır olmadı${last ? `\n${last}` : ''}`;
-    const en = `Server was not ready within ${sec} s${last ? `\n${last}` : ''}`;
+    const tr = `Sunucu hazır olmadan ${sec} sn boyunca log yazmadı (takıldı ya da bir hata penceresi açık)${last ? `\nSon satır: ${last}` : ''}`;
+    const en = `Server wrote no log for ${sec} s before becoming ready (stuck or an error dialog is open)${last ? `\nLast line: ${last}` : ''}`;
     await this.handleCrash('timeout', tr, en);
   }
 

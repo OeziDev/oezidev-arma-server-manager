@@ -18,6 +18,8 @@ export interface UpdaterOptions {
   lang: () => Lang;
   /** Kurulumdan önce: işleri kontrol et, yöneticileri bırak, SSH'ı kapat, çıkışa izin ver */
   beforeInstall: () => Promise<void>;
+  /** quitAndInstall uygulamayı kapatamadıysa (kurulum dosyası engellendi vb.): yöneticileri geri kur, çıkış izni kaldır */
+  onInstallFailed?: () => Promise<void> | void;
 }
 
 function shortError(err: unknown, lang: Lang): string {
@@ -98,6 +100,10 @@ export class Updater {
     });
     autoUpdater.on('error', (err: Error) => {
       log('warn', '[güncelleme] hata:', err?.message ?? err);
+      if (this.installing) {
+        this.installFailed(err);
+        return;
+      }
       // İndirilmiş bir güncelleme varken sonraki kontrol hatası onu gizlemesin
       if (this.state.status === 'ready') return;
       this.set({ status: 'error', error: shortError(err, this.opts.lang()), ...(this.state.version ? { version: this.state.version } : {}) });
@@ -147,9 +153,31 @@ export class Updater {
     if (!this.enabled) throw new UserError(this.opts.lang() === 'tr' ? 'Bu sürümde otomatik güncelleme yok' : 'Automatic updates are not available in this build');
     if (this.state.status !== 'ready') throw new UserError(this.opts.lang() === 'tr' ? 'Kurulacak indirilmiş bir güncelleme yok' : 'No downloaded update to install');
     await this.opts.beforeInstall();
-    this.stop();
     log('info', `[güncelleme] ${this.state.version ?? ''} kuruluyor, uygulama yeniden başlatılacak`);
+    this.installing = true;
     // Sessiz kurulum, bitince uygulamayı yeniden aç
-    setImmediate(() => autoUpdater.quitAndInstall(true, true));
+    setImmediate(() => {
+      try {
+        autoUpdater.quitAndInstall(true, true);
+      } catch (err) {
+        this.installFailed(err);
+      }
+    });
+    // 30 sn sonra hâlâ çalışıyorsak kurulum başlamadı demektir
+    this.installGuard = setTimeout(() => this.installFailed(new Error('Kurulum başlatılamadı')), 30_000);
+    this.installGuard.unref?.();
+  }
+
+  private installing = false;
+  private installGuard: NodeJS.Timeout | null = null;
+
+  private installFailed(err: unknown) {
+    if (!this.installing) return;
+    this.installing = false;
+    if (this.installGuard) clearTimeout(this.installGuard);
+    this.installGuard = null;
+    log('error', '[güncelleme] kurulum başarısız:', err);
+    this.set({ status: 'error', error: shortError(err, this.opts.lang()), ...(this.state.version ? { version: this.state.version } : {}) });
+    void Promise.resolve(this.opts.onInstallFailed?.()).catch((e) => log('error', '[güncelleme] geri alma başarısız:', e));
   }
 }
