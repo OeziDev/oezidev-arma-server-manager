@@ -1,0 +1,10 @@
+{
+  "name": "oezi-arma-manager-app",
+  "productName": "OeziDev Arma Server Manager",
+  "version": "1.0.0",
+  "description": "Arma 3 dedicated server manager by OeziDev",
+  "author": "OeziDev",
+  "main": "dist/main/main.cjs",
+  "private": true,
+  "scripts": {}
+}

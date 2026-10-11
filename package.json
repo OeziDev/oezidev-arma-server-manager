@@ -1,0 +1,23 @@
+{
+  "name": "oezi-arma-manager",
+  "private": true,
+  "version": "1.0.0",
+  "description": "OeziDev Arma Server Manager",
+  "workspaces": [
+    "packages/core",
+    "packages/app"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc -p packages/core && tsc -p packages/app --noEmit",
+    "build": "npm run build -w packages/app",
+    "dev": "npm run dev -w packages/app",
+    "dist:win": "npm run dist:win -w packages/app"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
+  }
+}
