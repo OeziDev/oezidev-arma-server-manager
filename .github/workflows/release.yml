@@ -26,7 +26,8 @@ jobs:
         run: |
           v=$(node -p "require('./packages/app/package.json').version")
           echo "version=$v" >> "$GITHUB_OUTPUT"
-          if gh release view "v$v" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          # Release var ve latest.yml yüklüyse işimiz yok (yarım kalmış bir Release tamamlanır)
+          if gh release view "v$v" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null | grep -qx latest.yml; then
             echo "v$v zaten yayında, derleme atlanıyor"
             echo "release=false" >> "$GITHUB_OUTPUT"
           else
@@ -66,8 +67,24 @@ jobs:
             echo "packages/app/package.json sürümü ($v) etiketle ($GITHUB_REF_NAME) uyuşmuyor"; exit 1
           fi
       - run: npm run build -w packages/app
-      - name: Derle ve Release'e yükle
+      - name: Derle
         working-directory: packages/app
+        run: npx electron-builder --win --x64 --publish never
+      - name: Release'e yükle
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npx electron-builder --win --x64 --publish always
+        run: |
+          v="${{ needs.check.outputs.version }}"
+          cd packages/app/release
+          ls -la
+          files=("OeziDev-Arma-Server-Manager-Setup-$v.exe" "OeziDev-Arma-Server-Manager-Setup-$v.exe.blockmap" "OeziDev-Arma-Server-Manager-$v-portable.exe")
+          if gh release view "v$v" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "v$v" -R "$GITHUB_REPOSITORY" --clobber "${files[@]}"
+          else
+            gh release create "v$v" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "v$v" \
+              --notes "Kurulum: OeziDev-Arma-Server-Manager-Setup-$v.exe. Kurulu sürümler kendini otomatik günceller." \
+              "${files[@]}"
+          fi
+          # latest.yml en son: güncelleme ancak exe tam yüklendikten sonra görünür
+          gh release upload "v$v" -R "$GITHUB_REPOSITORY" --clobber latest.yml
