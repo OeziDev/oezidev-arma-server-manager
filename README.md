@@ -72,7 +72,8 @@ npm test                                   # çekirdek testleri (config, RCON, S
 npm run build -w packages/app              # arayüz + ana süreç
 npm start -w packages/app                  # uygulamayı çalıştır
 npm run dist:win -w packages/app           # Windows kurulum + portable exe (Linux'ta Wine gerekir)
-git tag v1.0.2 && git push --tags          # GitHub Actions derleyip Release'e koyar; kurulu uygulamalar kendini günceller
+# Yeni sürüm: packages/app/package.json'daki "version"ı artır, main'e pushla → GitHub Actions derleyip Release'e koyar,
+# kurulu uygulamalar kendini günceller
 xvfb-run -a env E2E=1 npx vitest run packages/app/test/e2e.test.ts   # uçtan uca arayüz testi
 ```
 

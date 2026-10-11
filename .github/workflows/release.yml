@@ -1,9 +1,11 @@
 name: Release
 
-# "v1.2.3" etiketi pushlanınca testleri çalıştırır, Windows kurulumunu derler ve
-# GitHub Release'e yükler. Uygulamanın otomatik güncellemesi bu Release'teki latest.yml'yi okur.
+# packages/app/package.json içindeki sürüm artırılıp main'e pushlanınca (ya da "v1.2.3" etiketi
+# pushlanınca) testleri çalıştırır, Windows kurulumunu derler ve GitHub Release'e yükler.
+# O sürümün Release'i zaten varsa hiçbir şey yapmaz. Kurulu uygulamalar bu Release'teki latest.yml'yi okur.
 on:
   push:
+    branches: [main]
     tags: ['v*']
   workflow_dispatch:
 
@@ -11,7 +13,29 @@ permissions:
   contents: write
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.v.outputs.release }}
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          v=$(node -p "require('./packages/app/package.json').version")
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if gh release view "v$v" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "v$v zaten yayında, derleme atlanıyor"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
   test:
+    needs: check
+    if: needs.check.outputs.release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,7 +48,8 @@ jobs:
       - run: npm test
 
   windows:
-    needs: test
+    needs: [check, test]
+    if: needs.check.outputs.release == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
