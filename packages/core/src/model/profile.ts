@@ -148,6 +148,8 @@ export const ServerProfileSchema = z.object({
       enabled: z.boolean().default(true),
       voteMissionPlayers: int(0, 1024).default(1),
       voteThreshold: z.number().min(0).max(1).default(0.33),
+      /** Oyuncular oylamayla birini admin seçebilsin mi (#vote admin). Kapalıyken izinli oy komutları listesinde "admin" yer almaz. */
+      allowAdminVote: z.boolean().default(false),
     })
     .prefault({}),
 
@@ -290,6 +292,8 @@ export const ServerProfileSchema = z.object({
       updateOnScheduledRestart: z.boolean().default(false),
       /** Kapatırken RCON #shutdown sonrası bekleme süresi */
       gracefulShutdownSec: int(0, 300).default(20),
+      /** Sunucu bu süre içinde hazır olmazsa (RCON / "Host identity created") başlatma başarısız sayılır. 0: kapalı */
+      startTimeoutSec: int(0, 3600).default(300),
     })
     .prefault({}),
 

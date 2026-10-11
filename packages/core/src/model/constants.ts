@@ -24,7 +24,7 @@ export const DIFFICULTY_OPTIONS = {
   detectedMines: { max: 2, default: 0, group: 'awareness' },
   commands: { max: 2, default: 1, group: 'awareness' },
   waypoints: { max: 2, default: 1, group: 'awareness' },
-  tacticalPing: { max: 1, default: 0, group: 'awareness' },
+  tacticalPing: { max: 3, default: 0, group: 'awareness' },
   weaponInfo: { max: 2, default: 2, group: 'personal' },
   stanceIndicator: { max: 2, default: 2, group: 'personal' },
   staminaBar: { max: 1, default: 0, group: 'personal' },
