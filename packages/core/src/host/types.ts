@@ -46,6 +46,16 @@ export interface ProcessInfo {
   alive: boolean;
   /** Çalıştırılabilir dosya adı (küçük harf), PID yeniden kullanımını ayırt etmek için */
   image?: string;
+  /** Linux süreç adı (en fazla 15 karakter; betiklerde betik adı) */
+  comm?: string;
+}
+
+/** PID'deki süreç bizim başlattığımız çalıştırılabilir dosya mı? (PID yeniden kullanımına karşı) */
+export function processMatches(info: ProcessInfo, executablePath: string): boolean {
+  if (!info.alive) return false;
+  const base = executablePath.split(/[\\/]/).pop()!.toLowerCase();
+  if (!info.image && !info.comm) return true;
+  return info.image === base || (info.comm !== undefined && info.comm === base.slice(0, 15));
 }
 
 export interface TailHandle {
@@ -55,6 +65,8 @@ export interface TailHandle {
 export interface TailOptions {
   /** Başlangıçta gösterilecek son satır sayısı */
   initialLines?: number;
+  /** Dosyayı baştan oku (yeni başlatılan sunucunun logu için; ilk satırlar kaçmasın) */
+  fromStart?: boolean;
 }
 
 export interface SystemdStatus {

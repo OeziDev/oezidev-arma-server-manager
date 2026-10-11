@@ -261,7 +261,7 @@ export class LocalHost implements Host {
       if (state === 'Z' || state === 'X') return { pid, alive: false };
       const exe = await fsp.readlink(`/proc/${pid}/exe`).catch(() => '');
       const comm = stat.slice(stat.indexOf('(') + 1, close);
-      return { pid, alive: true, image: (exe ? path.basename(exe) : comm).toLowerCase() };
+      return { pid, alive: true, image: (exe ? path.basename(exe) : comm).toLowerCase(), comm: comm.toLowerCase() };
     } catch {
       return { pid, alive: false };
     }
@@ -309,7 +309,15 @@ export class LocalHost implements Host {
       try {
         const st = await fsp.stat(p).catch(() => null);
         if (st) {
-          if (offset < 0) {
+          if (offset < 0 && opts.fromStart) {
+            offset = 0;
+            const end = Math.min(st.size, 4 * 1024 * 1024);
+            if (end > 0) {
+              const lines = splitter.push(await readRange(0, end));
+              offset = end;
+              if (lines.length) onLines(lines);
+            }
+          } else if (offset < 0) {
             // İlk okuma: son N satır
             const n = opts.initialLines ?? 200;
             const start = Math.max(0, st.size - 256 * 1024);

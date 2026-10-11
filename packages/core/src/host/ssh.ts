@@ -455,12 +455,12 @@ export class SshHost implements Host {
   async processInfo(pid: number): Promise<ProcessInfo> {
     if (!pid || pid <= 0) return { pid, alive: false };
     const res = await this.runShell(
-      `s=$(cat /proc/${pid}/stat 2>/dev/null) || exit 1; echo "$s" | sed 's/.*) //' | cut -d' ' -f1; basename "$(readlink /proc/${pid}/exe 2>/dev/null)"`,
+      `s=$(cat /proc/${pid}/stat 2>/dev/null) || exit 1; echo "$s" | sed 's/.*) //' | cut -d' ' -f1; basename "$(readlink /proc/${pid}/exe 2>/dev/null)"; cat /proc/${pid}/comm`,
     );
     if (res.code !== 0) return { pid, alive: false };
-    const [state, image] = res.stdout.trim().split('\n');
+    const [state, image, comm] = res.stdout.split('\n').map((x) => x.trim());
     if (state === 'Z' || state === 'X') return { pid, alive: false };
-    return { pid, alive: true, ...(image ? { image: image.toLowerCase() } : {}) };
+    return { pid, alive: true, ...(image ? { image: image.toLowerCase() } : {}), ...(comm ? { comm: comm.toLowerCase() } : {}) };
   }
 
   async killProcess(pid: number, opts: { force?: boolean } = {}): Promise<void> {
@@ -471,7 +471,7 @@ export class SshHost implements Host {
   }
 
   tail(p: string, onLines: (lines: string[]) => void, opts: TailOptions = {}): TailHandle {
-    const proc = this.spawn('tail', ['-n', String(opts.initialLines ?? 200), '-F', p]);
+    const proc = this.spawn('tail', ['-n', opts.fromStart ? '+1' : String(opts.initialLines ?? 200), '-F', p]);
     const splitter = new LineSplitter();
     let buffered: string[] = [];
     let timer: NodeJS.Timeout | null = null;
