@@ -14,6 +14,7 @@ import {
   parseConfig,
   quoteString,
   serializeEntries,
+  validateProfile,
 } from '../src/index.js';
 
 const fixed = { generatedAt: new Date('2026-10-11T10:00:00Z') };
@@ -288,5 +289,61 @@ class Missions
     expect(profile.difficulty.options.thirdPersonView).toBe(1);
     expect(profile.difficulty.skillAI).toBe(0.75);
     expect(profile.difficulty.aiLevelPreset).toBe(3);
+  });
+
+  it('aynı cfg iki kez içe aktarılınca ek satırlar çoğalmaz (regularCheck "Member already defined")', () => {
+    const tadst = 'hostname = "57. Alay";\nregularCheck = "";\nbattleyeLicense = 1;\n';
+    const first = importServerCfg(tadst, createProfile({ name: '57. Alay' })).profile;
+    const second = importServerCfg(tadst, first).profile;
+    const extra = second.advanced.extraServerCfg;
+    expect(extra.match(/regularCheck/g)).toHaveLength(1);
+    expect(extra.match(/battleyeLicense/g)).toHaveLength(1);
+    const cfg = generateServerCfg(second, fixed);
+    expect(cfg.match(/regularCheck/g)).toHaveLength(1);
+  });
+
+  it('kullanıcının elle yazdığı yorumlar, çakışma yoksa içe aktarmada korunur', () => {
+    const base = createProfile({ advanced: { extraServerCfg: '// benim notum\nfoo = 1;' } });
+    const { profile } = importServerCfg('bar = 2;', base);
+    expect(profile.advanced.extraServerCfg).toContain('// benim notum');
+    expect(profile.advanced.extraServerCfg).toContain('bar = 2;');
+  });
+});
+
+describe('tekrar eden anahtarlar', () => {
+  it('daha önce kaydedilmiş tekrarlı ek satırlarla da sunucu config\'i tek tanımla üretilir', () => {
+    const p = createProfile({
+      advanced: { extraServerCfg: 'regularCheck = "";\nbattleyeLicense = 1;\nregularCheck = "";\nRegularCheck = "x";' },
+    });
+    const cfg = generateServerCfg(p, fixed);
+    expect(cfg.match(/regularCheck/gi)).toHaveLength(1);
+    expect(cfg).toContain('RegularCheck = "x";');
+    const { entries } = parseConfig(cfg);
+    expect(findValue(entries, 'battleyeLicense')).toBe(1);
+  });
+
+  it('ek satırlardaki iç içe tekrarlar da temizlenir', () => {
+    const p = createProfile({ advanced: { extraServerCfg: 'class Foo { a = 1; a = 2; };' } });
+    const cfg = generateServerCfg(p, fixed);
+    expect(cfg).toMatch(/class Foo\s*\{\s*a = 2;\s*\};/);
+  });
+
+  it('doğrulama tekrarlı ek satırı uyarır', () => {
+    const p = createProfile({
+      paths: { serverDir: 'C:\\server' },
+      advanced: { extraServerCfg: 'regularCheck = "";\nregularCheck = "";' },
+      basic: { extraBasicCfg: 'class sockets { maxPacketSize = 1400; maxPacketSize = 1300; };' },
+    });
+    const dup = validateProfile(p, 'windows').filter((i) => i.code === 'extra.duplicate');
+    expect(dup.map((i) => i.path)).toEqual(['advanced.extraServerCfg', 'basic.extraBasicCfg']);
+    expect(dup[1]!.message.tr).toContain('sockets.maxPacketSize');
+  });
+
+  it('aynı görev parametresi iki kez girilse de config bozulmaz', () => {
+    const p = createProfile({
+      missions: { rotation: [{ template: 'a.Altis', difficulty: 'regular', params: [{ name: 'P1', value: 1 }, { name: 'p1', value: 2 }] }] },
+    });
+    const cfg = generateServerCfg(p, fixed);
+    expect(cfg.match(/P1 =/gi)).toHaveLength(1);
   });
 });

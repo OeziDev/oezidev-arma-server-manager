@@ -4,6 +4,8 @@ import {
   blank,
   cls,
   comment,
+  dedupeEntries,
+  findDuplicateNames,
   parseConfig,
   serializeEntries,
   v,
@@ -61,16 +63,37 @@ export class ConfigSyntaxError extends Error {
   }
 }
 
-/** Ek satırlarda tanımlanan anahtarlar, üretilen aynı adlı girdilerin yerine geçer. */
+/**
+ * Ek satırlarda tanımlanan anahtarlar, üretilen aynı adlı girdilerin yerine geçer.
+ * Ek satırların kendi içindeki tekrarlar da temizlenir (son tanım kalır); Arma aynı adı
+ * iki kez görünce "Member already defined" deyip açılmaz.
+ */
 function applyOverrides(generated: CfgEntry[], extra: CfgEntry[]): CfgEntry[] {
-  if (!extra.length) return generated;
+  if (!extra.length) return dedupeEntries(generated);
   const names = new Set(
     extra.filter((e) => e.kind === 'value' || e.kind === 'class').map((e) => (e as { name: string }).name.toLowerCase()),
   );
   const filtered = generated.filter(
     (e) => !((e.kind === 'value' || e.kind === 'class') && names.has(e.name.toLowerCase())),
   );
-  return [...filtered, blank(), comment('Ek satırlar (kullanıcı tanımlı)'), ...extra];
+  return dedupeEntries([...filtered, blank(), comment('Ek satırlar (kullanıcı tanımlı)'), ...extra]);
+}
+
+/**
+ * Son güvenlik ağı: üretilen dosyayı tekrar ayrıştırır. Sözdizimi hatası ya da tekrar eden
+ * ad varsa sunucuyu başlatmadan önce burada durulur (Arma'nın hata penceresine düşmeden).
+ */
+function selfCheck(text: string, label: string): string {
+  const { entries, issues } = parseConfig(text);
+  const errors = issues.filter((i) => i.severity === 'error').map((e) => ({ line: e.line, message: e.message }));
+  for (const d of findDuplicateNames(entries)) errors.push({ line: 0, message: `"${d.path}" ${d.count} kez tanımlı` });
+  if (errors.length) {
+    throw new ConfigSyntaxError(
+      `${label} üretilemedi: ` + errors.map((e) => (e.line ? `satır ${e.line}: ` : '') + e.message).join('; '),
+      errors,
+    );
+  }
+  return text;
 }
 
 /* ------------------------------------------------------------------ */
@@ -208,7 +231,7 @@ export function generateServerCfg(p: ServerProfile, opts: GenerateOptions = {}):
   );
 
   const extra = parseExtraLines(a.extraServerCfg, 'Ek server.cfg satırları');
-  return serializeEntries(applyOverrides(e, extra)) + '\n';
+  return selfCheck(serializeEntries(applyOverrides(e, extra)) + '\n', 'server.cfg');
 }
 
 /* ------------------------------------------------------------------ */
@@ -230,7 +253,7 @@ export function generateBasicCfg(p: ServerProfile, opts: GenerateOptions = {}): 
   if (bc.terrainGrid > 0) e.push(v('terrainGrid', bc.terrainGrid));
   if (bc.viewDistance > 0) e.push(v('viewDistance', bc.viewDistance));
   const extra = parseExtraLines(bc.extraBasicCfg, 'Ek basic.cfg satırları');
-  return serializeEntries(applyOverrides(e, extra)) + '\n';
+  return selfCheck(serializeEntries(applyOverrides(e, extra)) + '\n', 'basic.cfg');
 }
 
 /* ------------------------------------------------------------------ */
@@ -252,7 +275,7 @@ export function generateArma3Profile(p: ServerProfile, opts: GenerateOptions = {
       cls('CustomAILevel', [v('skillAI', d.skillAI), v('precisionAI', d.precisionAI)]),
     ]),
   ];
-  return serializeEntries(e) + '\n';
+  return selfCheck(serializeEntries(e) + '\n', 'Arma3Profile');
 }
 
 /* ------------------------------------------------------------------ */

@@ -1,4 +1,5 @@
 import { ConfigSyntaxError, parseExtraLines } from './config/generators.js';
+import { findDuplicateNames } from './config/armaConfig.js';
 import { type ServerProfile, effectiveRconPort, usedPorts } from './model/profile.js';
 import type { HostOs } from './launch/paths.js';
 import { splitArgs } from './launch/commandLine.js';
@@ -145,7 +146,10 @@ export function validateProfile(p: ServerProfile, os?: HostOs, others: ServerPro
     [p.basic.extraBasicCfg, 'basic.cfg', 'basic.extraBasicCfg'],
   ] as const) {
     try {
-      parseExtraLines(text, label);
+      const entries = parseExtraLines(text, label);
+      for (const d of findDuplicateNames(entries)) {
+        out.push(issue('extra.duplicate', 'warning', `Ek ${label} satırlarında "${d.path}" ${d.count} kez yazılmış; yalnızca sonuncusu kullanılır. Fazlalarını sil.`, `"${d.path}" appears ${d.count} times in the extra ${label} lines; only the last one is used. Remove the others.`, path));
+      }
     } catch (err) {
       if (err instanceof ConfigSyntaxError) {
         out.push(issue('extra.syntax', 'error', `Ek ${label} satırlarında hata: ${err.details.map((d) => `satır ${d.line}: ${d.message}`).join('; ')}`, `Error in extra ${label} lines: ${err.details.map((d) => `line ${d.line}: ${d.message}`).join('; ')}`, path));

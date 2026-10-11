@@ -6,6 +6,7 @@ import {
   asNumber,
   asString,
   asStringArray,
+  dedupeEntries,
   findClass,
   findValue,
   parseConfig,
@@ -191,8 +192,7 @@ export function importServerCfg(text: string, base?: ServerProfile): ImportResul
       !(en.kind === 'value' && en.name.toLowerCase() === 'allowedvotecmds' && Array.isArray(en.value) && en.value.length === 0),
   );
   if (unknown.length) {
-    const prev = String(advanced.extraServerCfg ?? '').trim();
-    advanced.extraServerCfg = (prev ? prev + '\n' : '') + serializeEntries(unknown);
+    advanced.extraServerCfg = mergeExtraLines(String(advanced.extraServerCfg ?? ''), dedupeEntries(unknown));
   }
 
   const merged = {
@@ -221,6 +221,30 @@ export function importServerCfg(text: string, base?: ServerProfile): ImportResul
     };
   }
   return { profile: res.data, issues, unknownKeys: unknown.map((u) => (u as { name: string }).name) };
+}
+
+/**
+ * İçe aktarılan tanınmayan satırları mevcut "ek satırlar"a ekler. Aynı adlı eski satırlar
+ * yenisiyle değiştirilir; aynı dosyayı iki kez içe aktarmak satırları çoğaltmaz.
+ */
+export function mergeExtraLines(prevText: string, incoming: CfgEntry[]): string {
+  const prev = prevText.trim();
+  const add = serializeEntries(incoming);
+  if (!prev) return add;
+  const parsed = parseConfig(prev);
+  if (parsed.issues.some((i) => i.severity === 'error')) {
+    // Eski metin bozuksa dokunma; kullanıcı doğrulama uyarısını görecek.
+    return prev + '\n' + add;
+  }
+  const names = new Set(
+    incoming.filter((e) => e.kind === 'value' || e.kind === 'class').map((e) => (e as { name: string }).name.toLowerCase()),
+  );
+  const collides = parsed.entries.some((e) => (e.kind === 'value' || e.kind === 'class') && names.has(e.name.toLowerCase()));
+  // Çakışma yoksa eski metni olduğu gibi bırak (yorumları korunur).
+  if (!collides) return prev + '\n' + add;
+  const kept = parsed.entries.filter((e) => !((e.kind === 'value' || e.kind === 'class') && names.has(e.name.toLowerCase())));
+  const keptText = serializeEntries(dedupeEntries(kept)).trim();
+  return keptText ? keptText + '\n' + add : add;
 }
 
 function deletePath(obj: Record<string, unknown>, path: (string | number)[]): void {

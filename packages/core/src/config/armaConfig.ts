@@ -487,6 +487,47 @@ export function findClass(entries: CfgEntry[], name: string): Extract<CfgEntry, 
   return undefined;
 }
 
+export interface DuplicateName {
+  /** Örn. "regularCheck" ya da "Missions.Mission_1.template" */
+  path: string;
+  count: number;
+}
+
+/**
+ * Aynı kapsamda birden fazla kez tanımlanan adlar (büyük/küçük harf duyarsız; değer ve
+ * class aynı ad alanını paylaşır). Arma bunlarda "Member already defined" diyip açılmaz.
+ */
+export function findDuplicateNames(entries: CfgEntry[], prefix = ''): DuplicateName[] {
+  const out: DuplicateName[] = [];
+  const seen = new Map<string, { name: string; count: number }>();
+  for (const e of entries) {
+    if (e.kind !== 'value' && e.kind !== 'class') continue;
+    const key = e.name.toLowerCase();
+    const prev = seen.get(key);
+    if (prev) prev.count++;
+    else seen.set(key, { name: e.name, count: 1 });
+    if (e.kind === 'class') out.push(...findDuplicateNames(e.entries, `${prefix}${e.name}.`));
+  }
+  for (const { name, count } of seen.values()) if (count > 1) out.unshift({ path: prefix + name, count });
+  return out;
+}
+
+/**
+ * Her kapsamda bir adın yalnızca son tanımını bırakır (Arma'nın "son yazılan geçerli"
+ * beklentisiyle aynı sonuç, ama hata vermeden). Sıra, kalan girdilerin sırasıdır.
+ */
+export function dedupeEntries(entries: CfgEntry[]): CfgEntry[] {
+  const lastIndex = new Map<string, number>();
+  entries.forEach((e, i) => {
+    if (e.kind === 'value' || e.kind === 'class') lastIndex.set(e.name.toLowerCase(), i);
+  });
+  return entries.flatMap((e, i): CfgEntry[] => {
+    if (e.kind !== 'value' && e.kind !== 'class') return [e];
+    if (lastIndex.get(e.name.toLowerCase()) !== i) return [];
+    return e.kind === 'class' ? [{ ...e, entries: dedupeEntries(e.entries) }] : [e];
+  });
+}
+
 export function asNumber(value: CfgValue | undefined): number | undefined {
   if (typeof value === 'number') return value;
   if (typeof value === 'boolean') return value ? 1 : 0;
