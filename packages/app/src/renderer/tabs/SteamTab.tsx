@@ -7,9 +7,11 @@ import { api, attempt, setState, toast, useStore } from '../state';
 
 const BRANCHES = ['public', 'creatordlc', 'profiling', 'contact'];
 
-export function SteamTab({ id, dirty, onSave }: { id: string; dirty: boolean; onSave: () => Promise<boolean> }) {
+const STEAMCLIENT_RESULTS = ['ok', 'copied', 'missing'];
+
+export function SteamTab({ id }: { id: string }) {
   const { t } = useI18n();
-  const { draft } = useDraft();
+  const { draft, ensureSaved, jobActive } = useDraft();
   const status = useStore((s) => s.statuses[id]?.status ?? 'stopped');
   const platform = useStore((s) => s.info?.platform);
   const allJobs = useStore((s) => s.jobs);
@@ -26,10 +28,10 @@ export function SteamTab({ id, dirty, onSave }: { id: string; dirty: boolean; on
         actions={
           <Button
             kind="primary"
-            disabled={!stopped || !draft.paths.serverDir}
-            title={!stopped ? t('st.stopFirst') : undefined}
+            disabled={!stopped || !draft.paths.serverDir || jobActive}
+            title={jobActive ? t('job.activeHint') : !stopped ? t('st.stopFirst') : undefined}
             onClick={async () => {
-              if (dirty && !(await onSave())) return;
+              if (!(await ensureSaved())) return;
               await attempt(() => api.steam.updateServer(id));
             }}
           >
@@ -40,6 +42,11 @@ export function SteamTab({ id, dirty, onSave }: { id: string; dirty: boolean; on
         {!stopped && (
           <div className="banner" data-level="info">
             {t('st.stopFirst')}
+          </div>
+        )}
+        {jobActive && (
+          <div className="banner" data-level="info">
+            {t('job.activeHint')}
           </div>
         )}
         <div className="fields">
@@ -57,7 +64,7 @@ export function SteamTab({ id, dirty, onSave }: { id: string; dirty: boolean; on
               size="sm"
               onClick={async () => {
                 const r = await attempt(() => api.steam.fixSteamClient(id));
-                if (r) toast(r === 'missing' ? 'warning' : 'success', `steamclient.so: ${r}`);
+                if (r) toast(r === 'missing' ? 'warning' : r === 'ok' || r === 'copied' ? 'success' : 'info', STEAMCLIENT_RESULTS.includes(r) ? t(`st.sc.${r}`) : `steamclient.so: ${r}`);
               }}
             >
               {t('st.steamclient')}

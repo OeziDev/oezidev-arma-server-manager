@@ -2,9 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Issue, ServerProfile } from '../../shared/api';
 import type { Route } from '../App';
 import { DraftContext, setPath } from '../components/draft';
-import { Button, StatusMark, useConfirm } from '../components/ui';
+import { Button, FormContext, StatusMark, useConfirm } from '../components/ui';
 import { useI18n } from '../i18n';
-import { api, attempt, errorText, formatDuration, hostLabel, toast, useStore } from '../state';
+import { api, attempt, draftGuard, errorText, formatDuration, hostLabel, toast, useStore } from '../state';
 import { OverviewTab } from '../tabs/OverviewTab';
 import { ConfigTab, type ConfigSection } from '../tabs/ConfigTab';
 import { MissionsTab } from '../tabs/MissionsTab';
@@ -35,44 +35,119 @@ export function locate(path: string): { tab: TabId; section?: ConfigSection } {
   return { tab: 'launch' };
 }
 
-export function ServerView({ id, tab, onTab, onNavigate }: { id: string; tab: TabId; onTab: (t: TabId) => void; onNavigate: (r: Route) => void }) {
+const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
+/** Derin eşitlik (anahtar sırasından bağımsız) */
+export function same(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (Array.isArray(a)) return Array.isArray(b) && a.length === b.length && a.every((x, i) => same(x, b[i]));
+  if (isObj(a) && isObj(b)) {
+    const ka = Object.keys(a).filter((k) => a[k] !== undefined);
+    const kb = Object.keys(b).filter((k) => b[k] !== undefined);
+    return ka.length === kb.length && ka.every((k) => same(a[k], b[k]));
+  }
+  return false;
+}
+const hasId = (v: unknown): v is { id: string } => isObj(v) && typeof v.id === 'string';
+
+/**
+ * Üç yönlü birleştirme: base = düzenlemeye başlanan kayıtlı sürüm, mine = taslak, theirs = arka planda
+ * değişmiş güncel kayıt (ör. Workshop senkronu mod yollarını yazdı). Kullanıcının değiştirmediği her şey
+ * güncel kayıttan, değiştirdiği her şey taslaktan alınır; id taşıyan dizi öğeleri (modlar, görevler) tek tek birleşir.
+ */
+export function merge3(base: unknown, mine: unknown, theirs: unknown): unknown {
+  if (same(mine, base)) return theirs;
+  if (same(theirs, base) || same(mine, theirs)) return mine;
+  if (isObj(base) && isObj(mine) && isObj(theirs)) {
+    const out: Record<string, unknown> = {};
+    for (const k of new Set([...Object.keys(theirs), ...Object.keys(mine)])) {
+      if (!(k in mine)) {
+        // Kullanıcı sildiyse silinmiş kalsın; güncel kayıtta yeni eklendiyse al
+        if (!(k in base)) out[k] = theirs[k];
+        continue;
+      }
+      out[k] = k in theirs ? merge3(base[k], mine[k], theirs[k]) : mine[k];
+    }
+    return out;
+  }
+  if (Array.isArray(base) && Array.isArray(mine) && Array.isArray(theirs) && [...base, ...mine, ...theirs].every(hasId)) {
+    const b = new Map(base.map((x) => [x.id, x]));
+    const th = new Map(theirs.map((x) => [x.id, x]));
+    return mine.map((x) => (b.has(x.id) && th.has(x.id) ? merge3(b.get(x.id), x, th.get(x.id)) : x));
+  }
+  return mine;
+}
+
+export function ServerView({ id, tab, onTab, onNavigate }: { id: string; tab: TabId; onTab: (t: TabId) => void; onNavigate: (r: Route, opts?: { force?: boolean }) => void }) {
   const { t, lang } = useI18n();
   const status = useStore((s) => s.statuses[id]);
   const hosts = useStore((s) => s.hosts);
   const summaries = useStore((s) => s.summaries);
+  const jobActive = useStore((s) => Object.values(s.jobs).some((j) => j.profileId === id && (j.status === 'running' || j.status === 'waiting-input')));
   const [saved, setSaved] = useState<ServerProfile | null>(null);
   const [draft, setDraft] = useState<ServerProfile | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [issues, setIssues] = useState<Issue[]>([]);
   const [section, setSection] = useState<ConfigSection>('server');
   const [now, setNow] = useState(Date.now());
+  const [epoch, setEpoch] = useState(0);
+  const [invalid, setInvalid] = useState<Record<string, true>>({});
+  const [hiddenError, setHiddenError] = useState<string | null>(null);
   const { confirm, node: confirmNode } = useConfirm();
-  const dirty = useMemo(() => !!draft && !!saved && JSON.stringify(draft) !== JSON.stringify(saved), [draft, saved]);
+  const invalidCount = Object.keys(invalid).length;
+  const draftDirty = useMemo(() => !!draft && !!saved && !same(draft, saved), [draft, saved]);
+  const dirty = draftDirty || invalidCount > 0;
   const dirtyRef = useRef(false);
   dirtyRef.current = dirty;
+
+  /** Taslağı dışarıdan değiştir: yerel metin alanları (sayı, liste) yeni değere döner */
+  const replaceDraft = useCallback((p: ServerProfile) => {
+    setDraft(p);
+    setEpoch((e) => e + 1);
+  }, []);
+
+  const report = useCallback((key: string, bad: boolean) => {
+    setInvalid((prev) => {
+      if (bad === !!prev[key]) return prev;
+      const next = { ...prev };
+      if (bad) next[key] = true;
+      else delete next[key];
+      return next;
+    });
+  }, []);
+  const form = useMemo(() => ({ report, epoch }), [report, epoch]);
 
   const load = useCallback(async () => {
     const p = await api.profiles.get(id);
     setSaved(p);
-    setDraft(p);
-  }, [id]);
+    replaceDraft(p);
+  }, [id, replaceDraft]);
 
   useEffect(() => {
     void load().catch((e) => toast('error', errorText(e)));
   }, [load]);
 
-  // Profil arka planda değiştiyse (ör. Workshop senkronu) ve düzenleme yoksa yeniden yükle
+  // Profil arka planda değiştiyse (ör. Workshop senkronu) ve düzenleme yoksa yeniden yükle.
+  // Düzenleme varsa atlanır; Kaydet sırasında güncel kayıtla birleştirilir (merge3).
   useEffect(() => {
     if (saved && !dirtyRef.current) {
-      void api.profiles.get(id).then((p) => {
-        if (!dirtyRef.current && JSON.stringify(p) !== JSON.stringify(saved)) {
-          setSaved(p);
-          setDraft(p);
-        }
-      });
+      void api.profiles
+        .get(id)
+        .then((p) => {
+          if (!dirtyRef.current && !same(p, saved)) {
+            setSaved(p);
+            replaceDraft(p);
+          }
+        })
+        .catch(() => undefined);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [summaries]);
+
+  // Ana süreç kaydedilmemiş değişiklikle çıkışta sorsun
+  useEffect(() => {
+    void api.app.setDirty(dirty).catch(() => undefined);
+  }, [dirty]);
+  useEffect(() => () => void api.app.setDirty(false).catch(() => undefined), []);
 
   // Canlı doğrulama
   useEffect(() => {
@@ -98,10 +173,28 @@ export function ServerView({ id, tab, onTab, onNavigate }: { id: string; tab: Ta
   const update = useCallback((fn: (p: ServerProfile) => ServerProfile) => setDraft((d) => (d ? fn(d) : d)), []);
 
   const save = async (): Promise<boolean> => {
-    if (!draft) return false;
+    if (!draft || !saved) return false;
+    if (invalidCount > 0) {
+      toast('error', t('common.localInvalid', { n: invalidCount }));
+      return false;
+    }
     try {
-      const r = await api.profiles.save(draft);
+      // Düzenleme sırasında profil arka planda değiştiyse (Workshop senkronu vb.) üzerine yazma: birleştir
+      let toSave: ServerProfile = draft;
+      let base: ServerProfile = saved;
+      const latest = await api.profiles.get(id).catch(() => null);
+      let mergedIn = false;
+      if (latest && !same(latest, saved)) {
+        toSave = merge3(saved, draft, latest) as ServerProfile;
+        base = latest;
+        mergedIn = !same(toSave, draft);
+      }
+      const r = await api.profiles.save(toSave);
       if (r.errors.length || !r.profile) {
+        if (base !== saved) {
+          setSaved(base);
+          replaceDraft(toSave);
+        }
         setErrors(Object.fromEntries(r.errors.map((e) => [e.path, e.message])));
         toast('error', t('common.unsavedErrors', { n: r.errors.length }));
         const first = r.errors[0];
@@ -109,15 +202,29 @@ export function ServerView({ id, tab, onTab, onNavigate }: { id: string; tab: Ta
         return false;
       }
       setSaved(r.profile);
-      setDraft(r.profile);
+      replaceDraft(r.profile);
       setIssues(r.issues);
       toast('success', t('common.saved'));
+      if (mergedIn) toast('info', t('common.mergedBackground'));
       return true;
     } catch (err) {
       toast('error', errorText(err));
       return false;
     }
   };
+
+  const discard = () => {
+    if (saved) replaceDraft(saved);
+  };
+
+  // App'teki gezinme koruması her zaman güncel kaydet/at işlevlerini görsün
+  useEffect(() => {
+    const g = { dirty, save, discard };
+    draftGuard.current = g;
+    return () => {
+      if (draftGuard.current === g) draftGuard.current = null;
+    };
+  });
 
   const goTo = (path: string) => {
     const loc = locate(path);
@@ -133,15 +240,28 @@ export function ServerView({ id, tab, onTab, onNavigate }: { id: string; tab: Ta
   const machine = hostLabel(saved.hostId, hosts, t('common.local'));
   const hostAddr = saved.hostId === 'local' ? '127.0.0.1' : hosts.find((h) => h.id === saved.hostId)?.host ?? '?';
   const errorCount = Object.keys(errors).length + issues.filter((i) => i.severity === 'error').length;
+  const jobHint = jobActive ? t('job.activeHint') : undefined;
+  const lastError = status?.lastError;
+
+  const ensureSaved = async () => !dirty || (await save());
 
   const start = async () => {
-    if (dirty && !(await save())) return;
+    if (jobActive) return;
+    if (!(await ensureSaved())) return;
     await attempt(() => api.server.start(id), t('action.started'));
   };
 
-  const ctx = { draft, set, update, errors, issues };
+  const restart = async () => {
+    if (jobActive) return;
+    if (!(await confirm(t('action.restartConfirm', { name: saved.name })))) return;
+    if (!(await ensureSaved())) return;
+    await attempt(() => api.server.restart(id, false));
+  };
+
+  const ctx = { draft, set, update, errors, issues, dirty, ensureSaved, jobActive };
 
   return (
+    <FormContext.Provider value={form}>
     <DraftContext.Provider value={ctx}>
       <header className="server-head">
         <div className="server-head-row">
@@ -150,18 +270,15 @@ export function ServerView({ id, tab, onTab, onNavigate }: { id: string; tab: Ta
             {saved.name}
           </h1>
           <div className="head-actions">
+            {jobActive && <span className="small warn head-hint">{t('job.activeShort')}</span>}
             {!running && !busy && (
-              <Button kind="primary" onClick={start}>
+              <Button kind="primary" onClick={start} disabled={jobActive} title={jobHint}>
                 {t('action.start')}
               </Button>
             )}
             {running && (
               <>
-                <Button
-                  onClick={async () => {
-                    if (await confirm(t('action.restartConfirm', { name: saved.name }))) await attempt(() => api.server.restart(id, false));
-                  }}
-                >
+                <Button onClick={restart} disabled={jobActive} title={jobHint}>
                   {t('action.restart')}
                 </Button>
                 <Button
@@ -234,6 +351,23 @@ export function ServerView({ id, tab, onTab, onNavigate }: { id: string; tab: Ta
           {t('head.unreachable')}
         </div>
       )}
+      {lastError && hiddenError !== lastError && (
+        <div className="error-box" role="alert">
+          <div className="error-box-head">
+            <strong>{t('head.lastError')}</strong>
+            <span className="spacer" />
+            {lastError === 'validation' && tab !== 'overview' && (
+              <Button size="sm" onClick={() => onTab('overview')}>
+                {t('head.showIssues')}
+              </Button>
+            )}
+            <Button size="sm" kind="ghost" onClick={() => setHiddenError(lastError)}>
+              {t('common.close')}
+            </Button>
+          </div>
+          {lastError === 'validation' ? <div>{t('head.lastErrorValidation')}</div> : <pre className="error-box-text">{lastError}</pre>}
+        </div>
+      )}
       <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
         {tab === 'console' ? (
           <div className="content flush">
@@ -244,15 +378,15 @@ export function ServerView({ id, tab, onTab, onNavigate }: { id: string; tab: Ta
             {tab === 'overview' && <OverviewTab id={id} profile={saved} issues={issues} errors={errors} onFix={goTo} />}
             {tab === 'config' && <ConfigTab section={section} onSection={setSection} />}
             {tab === 'missions' && <MissionsTab id={id} />}
-            {tab === 'mods' && <ModsTab id={id} dirty={dirty} onSave={save} />}
-            {tab === 'launch' && <LaunchTab id={id} dirty={dirty} />}
+            {tab === 'mods' && <ModsTab id={id} />}
+            {tab === 'launch' && <LaunchTab id={id} />}
             {tab === 'players' && <PlayersTab id={id} />}
-            {tab === 'steam' && <SteamTab id={id} dirty={dirty} onSave={save} />}
+            {tab === 'steam' && <SteamTab id={id} />}
             {tab === 'files' && (
               <FilesTab
                 id={id}
-                onImported={(p) => setDraft(p)}
-                onDeleted={() => onNavigate({ view: 'welcome' })}
+                onImported={replaceDraft}
+                onDeleted={() => onNavigate({ view: 'welcome' }, { force: true })}
                 onDuplicated={(newId) => onNavigate({ view: 'server', id: newId, tab: 'config' })}
               />
             )}
@@ -262,8 +396,9 @@ export function ServerView({ id, tab, onTab, onNavigate }: { id: string; tab: Ta
           <div className="dirty-bar" role="region" aria-label={t('common.unsaved')}>
             <span className="msg">
               <strong>{t('common.unsaved')}</strong> {Object.keys(errors).length > 0 && <span className="bad"> {t('common.unsavedErrors', { n: Object.keys(errors).length })}</span>}
+              {invalidCount > 0 && <span className="bad"> {t('common.localInvalid', { n: invalidCount })}</span>}
             </span>
-            <Button kind="ghost" onClick={() => setDraft(saved)}>
+            <Button kind="ghost" onClick={discard}>
               {t('common.discard')}
             </Button>
             <Button kind="primary" onClick={save}>
@@ -274,5 +409,6 @@ export function ServerView({ id, tab, onTab, onNavigate }: { id: string; tab: Ta
       </div>
       {confirmNode}
     </DraftContext.Provider>
+    </FormContext.Provider>
   );
 }

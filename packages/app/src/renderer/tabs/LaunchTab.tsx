@@ -1,13 +1,13 @@
 import { effectiveRconPort } from '@core-constants';
-import { useState } from 'react';
-import { LinesF, NumberF, PasswordF, TextF, ToggleF, useDraft } from '../components/draft';
-import { Button, Field, Section } from '../components/ui';
+import { useEffect, useState } from 'react';
+import { LinesF, NumberF, PasswordF, TextF, ToggleF, useDraft, useFieldMeta } from '../components/draft';
+import { Button, Field, Section, useFormReset, useLocalInvalid } from '../components/ui';
 import { useI18n } from '../i18n';
 import { api, attempt } from '../state';
 
-export function LaunchTab({ id, dirty }: { id: string; dirty: boolean }) {
+export function LaunchTab({ id }: { id: string }) {
   const { t } = useI18n();
-  const { draft, set } = useDraft();
+  const { draft, set, dirty } = useDraft();
   const [time, setTime] = useState('06:00');
   const times = draft.supervisor.scheduledRestarts;
 
@@ -54,6 +54,7 @@ export function LaunchTab({ id, dirty }: { id: string; dirty: boolean }) {
           <NumberF path="supervisor.restartDelaySec" unit={t('common.seconds')} />
           <NumberF path="supervisor.maxRestartsPerHour" />
           <NumberF path="supervisor.gracefulShutdownSec" unit={t('common.seconds')} />
+          <NumberF path="supervisor.startTimeoutSec" unit={t('common.seconds')} />
         </div>
       </Section>
 
@@ -78,19 +79,7 @@ export function LaunchTab({ id, dirty }: { id: string; dirty: boolean }) {
               </Button>
             </div>
           </Field>
-          <Field label={t('field.supervisor.warnMinutes')} help={t('help.supervisor.warnMinutes')}>
-            <input
-              className="input mid mono"
-              defaultValue={draft.supervisor.warnMinutes.join(', ')}
-              onChange={(e) => {
-                const nums = e.target.value
-                  .split(/[\s,;]+/)
-                  .map(Number)
-                  .filter((n) => Number.isInteger(n) && n > 0 && n <= 120);
-                set('supervisor.warnMinutes', [...new Set(nums)].sort((a, b) => b - a));
-              }}
-            />
-          </Field>
+          <WarnMinutesField />
           <TextF path="supervisor.warnMessage" />
           <ToggleF path="supervisor.updateOnScheduledRestart" />
         </div>
@@ -125,5 +114,53 @@ export function LaunchTab({ id, dirty }: { id: string; dirty: boolean }) {
         </div>
       </Section>
     </>
+  );
+}
+
+/** "15, 10, 5, 1" -> [15, 10, 5, 1]; geçersiz parça varsa onu döner */
+function parseWarnMinutes(text: string): { values: number[] } | { bad: string } {
+  const parts = text.split(/[\s,;]+/).filter(Boolean);
+  const out: number[] = [];
+  for (const p of parts) {
+    const n = /^\d+$/.test(p) ? Number(p) : NaN;
+    if (!Number.isInteger(n) || n < 1 || n > 120) return { bad: p };
+    out.push(n);
+  }
+  return { values: [...new Set(out)].sort((a, b) => b - a) };
+}
+
+function WarnMinutesField() {
+  const { t } = useI18n();
+  const { draft, set } = useDraft();
+  const m = useFieldMeta('supervisor.warnMinutes');
+  const value = draft.supervisor.warnMinutes;
+  const [text, setText] = useState(value.join(', '));
+  const parsed = parseWarnMinutes(text);
+  const bad = 'bad' in parsed ? parsed.bad : null;
+  useLocalInvalid(bad !== null);
+  // Taslak dışarıdan değiştiyse (at / içe aktar / yeniden yükle) metni eşitle
+  useEffect(() => {
+    const cur = parseWarnMinutes(text);
+    if (!('values' in cur) || JSON.stringify(cur.values) !== JSON.stringify(value)) setText(value.join(', '));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value]);
+  useFormReset(() => setText(value.join(', ')));
+  return (
+    <Field label={m.label} help={m.help} error={bad !== null ? t('ln.warnInvalid', { value: bad }) : m.error} issues={m.issues} htmlFor={m.id}>
+      <input
+        id={m.id}
+        className="input mid mono"
+        value={text}
+        aria-invalid={bad !== null || !!m.error || undefined}
+        onChange={(e) => {
+          setText(e.target.value);
+          const r = parseWarnMinutes(e.target.value);
+          if ('values' in r) set('supervisor.warnMinutes', r.values);
+        }}
+        onBlur={() => {
+          if (bad === null) setText(value.join(', '));
+        }}
+      />
+    </Field>
   );
 }

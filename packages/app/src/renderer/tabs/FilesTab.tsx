@@ -1,16 +1,18 @@
 import { useEffect, useState } from 'react';
 import type { PreviewFiles, ServerProfile } from '../../shared/api';
 import { useDraft } from '../components/draft';
+import { ImportSummary, hasImportDetails, type ImportSummaryData } from '../components/ImportSummary';
 import { Button, Section, copyText, useConfirm } from '../components/ui';
 import { useI18n } from '../i18n';
-import { api, attempt, errorText, toast } from '../state';
+import { api, attempt, errorText, refreshSummaries, toast } from '../state';
 
 type FileKey = 'serverCfg' | 'basicCfg' | 'arma3Profile' | 'beServerCfg' | 'commandLine' | 'headlessCommandLine' | 'systemdUnit' | 'paths';
 
 export function FilesTab({ id, onImported, onDeleted, onDuplicated }: { id: string; onImported: (p: ServerProfile) => void; onDeleted: () => void; onDuplicated: (id: string) => void }) {
   const { t } = useI18n();
-  const { draft } = useDraft();
+  const { draft, ensureSaved, jobActive } = useDraft();
   const [preview, setPreview] = useState<PreviewFiles | null>(null);
+  const [summary, setSummary] = useState<ImportSummaryData | null>(null);
   const [which, setWhich] = useState<FileKey>('serverCfg');
   const { confirm, node } = useConfirm();
 
@@ -47,14 +49,18 @@ export function FilesTab({ id, onImported, onDeleted, onDuplicated }: { id: stri
       filters: kind === 'cfg' ? [{ name: 'Arma config', extensions: ['cfg', 'txt'] }] : [{ name: 'Arma3Profile', extensions: ['Arma3Profile', 'ArmA3Profile', 'arma3profile'] }],
     });
     if (!file) return;
-    await attempt(async () => {
+    const what = kind === 'cfg' ? 'server.cfg' : 'Arma3Profile';
+    try {
       const text = await api.app.readPickedFile(file);
       const res = kind === 'cfg' ? await api.profiles.importServerCfg(draft, text) : await api.profiles.importArma3Profile(draft, text);
+      // Sadece taslak değişir; kalıcı olması için Kaydet gerekir
       onImported(res.profile);
-      toast('success', t('fl.imported'));
-      if (res.unknownKeys.length) toast('info', t('fl.unknownKeys', { keys: res.unknownKeys.join(', ') }));
-      for (const i of res.issues.filter((x) => x.severity === 'error').slice(0, 3)) toast('warning', `${i.line}: ${i.message}`);
-    });
+      const data: ImportSummaryData = { what, issues: res.issues, unknownKeys: res.unknownKeys, needsSave: true };
+      if (hasImportDetails(data)) setSummary(data);
+      else toast('success', t('fl.imported'));
+    } catch (err) {
+      setSummary({ what, issues: [], unknownKeys: [], error: errorText(err) });
+    }
   };
 
   return (
@@ -64,12 +70,15 @@ export function FilesTab({ id, onImported, onDeleted, onDuplicated }: { id: stri
         intro={t('fl.previewIntro')}
         actions={
           <div className="hstack">
-            <Button size="sm" onClick={() => copyText(content)}>
+            <Button size="sm" disabled={!content} onClick={() => copyText(content, t('common.copied'))}>
               {t('common.copy')}
             </Button>
             <Button
               size="sm"
+              disabled={jobActive}
+              title={jobActive ? t('job.activeHint') : t('fl.deployHelp')}
               onClick={async () => {
+                if (!(await ensureSaved())) return;
                 const files = await attempt(() => api.server.deploy(id));
                 if (files) toast('success', t('action.deployed', { n: files.length }));
               }}
@@ -130,6 +139,7 @@ export function FilesTab({ id, onImported, onDeleted, onDuplicated }: { id: stri
                 <Button
                   size="sm"
                   onClick={async () => {
+                    if (!(await ensureSaved())) return;
                     const json = await attempt(() => api.profiles.exportJson(id));
                     if (json) await api.app.saveFile({ defaultName: `${draft.name.replace(/[^\w.-]+/g, '_')}.oezi.json`, content: json });
                   }}
@@ -146,8 +156,12 @@ export function FilesTab({ id, onImported, onDeleted, onDuplicated }: { id: stri
         <div className="hstack">
           <Button
             onClick={async () => {
+              if (!(await ensureSaved())) return;
               const p = await attempt(() => api.profiles.duplicate(id));
-              if (p) onDuplicated(p.id);
+              if (!p) return;
+              // Kenar çubuğu listesi yeni profili içermeden gidersek App ilk sunucuya geri döner
+              await refreshSummaries().catch(() => undefined);
+              onDuplicated(p.id);
             }}
           >
             {t('fl.duplicate')}
@@ -163,6 +177,7 @@ export function FilesTab({ id, onImported, onDeleted, onDuplicated }: { id: stri
           </Button>
         </div>
       </Section>
+      {summary && <ImportSummary data={summary} onClose={() => setSummary(null)} />}
       {node}
     </>
   );

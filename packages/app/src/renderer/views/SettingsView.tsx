@@ -1,28 +1,39 @@
-import { useEffect, useState } from 'react';
-import type { AppSettings } from '../../shared/api';
+import { useState } from 'react';
+import type { AppSettings, UpdateState } from '../../shared/api';
 import { Button, Field, PasswordInput, Section, Seg, Toggle } from '../components/ui';
 import { useI18n } from '../i18n';
-import { api, setState, tryRun, useStore } from '../state';
+import { api, attempt, setState, tryRun, useStore } from '../state';
 import { InstallSteamCmdDialog } from './HostsView';
+
+type SteamEdits = Partial<Pick<AppSettings, 'steamUsername' | 'localSteamcmdPath'>>;
 
 export function SettingsView() {
   const { t } = useI18n();
   const settings = useStore((s) => s.settings);
   const info = useStore((s) => s.info);
-  const [s, setS] = useState<AppSettings | null>(settings);
+  // Sadece kullanıcının dokunduğu alanlar yerelde tutulur; gerisi her zaman güncel ayarlardan okunur
+  // (ör. "SteamCMD kur" bittiğinde ana süreç localSteamcmdPath'i yazar ve settings-changed gönderir).
+  const [edits, setEdits] = useState<SteamEdits>({});
+  const [password, setPassword] = useState('');
   const [install, setInstall] = useState(false);
-  useEffect(() => setS(settings), [settings]);
-  if (!s || !info) return null;
+  if (!settings || !info) return null;
 
-  const save = async (next: AppSettings) => {
-    setS(next);
+  /** Sadece değişen alanları gönder (ana süreç birleştirir). */
+  const save = async (patch: Partial<AppSettings>, okText?: string): Promise<boolean> => {
     let saved: AppSettings | undefined;
-    if (await tryRun(async () => (saved = await api.app.saveSettings(next)))) {
-      setState({ settings: saved! });
-    }
+    const ok = await tryRun(async () => (saved = await api.app.saveSettings(patch)), okText);
+    if (ok && saved) setState({ settings: saved });
+    return ok;
   };
-  const field = <K extends keyof AppSettings>(k: K, v: AppSettings[K]) => setS({ ...s, [k]: v });
-  const steamDirty = s.steamUsername !== settings?.steamUsername || s.localSteamcmdPath !== settings?.localSteamcmdPath || !!s.steamPassword;
+
+  const steamUsername = edits.steamUsername ?? settings.steamUsername;
+  const localSteamcmdPath = edits.localSteamcmdPath ?? settings.localSteamcmdPath;
+  const steamPatch: Partial<AppSettings> = {
+    ...(steamUsername !== settings.steamUsername ? { steamUsername } : {}),
+    ...(localSteamcmdPath !== settings.localSteamcmdPath ? { localSteamcmdPath } : {}),
+    ...(password ? { steamPassword: password } : {}),
+  };
+  const steamDirty = Object.keys(steamPatch).length > 0;
 
   return (
     <div className="content">
@@ -30,16 +41,16 @@ export function SettingsView() {
         <div className="fields">
           <Field label={t('set.language')}>
             <Seg
-              value={s.language}
+              value={settings.language}
               options={[
                 { value: 'tr', label: 'Türkçe' },
                 { value: 'en', label: 'English' },
               ]}
-              onChange={(v) => save({ ...s, language: v, steamPassword: '' })}
+              onChange={(v) => void save({ language: v })}
             />
           </Field>
           <Field label={t('set.tray')} help={t('help.set.tray')}>
-            <Toggle checked={s.minimizeToTray} onChange={(v) => save({ ...s, minimizeToTray: v, steamPassword: '' })} />
+            <Toggle checked={settings.minimizeToTray} onChange={(v) => void save({ minimizeToTray: v })} />
           </Field>
         </div>
       </Section>
@@ -47,13 +58,19 @@ export function SettingsView() {
       <Section title={t('set.steam')} intro={t('set.steamIntro')}>
         <div className="fields">
           <Field label={t('set.steamUser')}>
-            <input className="input mid mono" value={s.steamUsername} autoComplete="off" onChange={(e) => field('steamUsername', e.target.value.trim())} />
+            <input className="input mid mono" value={steamUsername} autoComplete="off" onChange={(e) => setEdits((x) => ({ ...x, steamUsername: e.target.value.trim() }))} />
           </Field>
-          <Field label={t('set.steamPassword')} help={s.hasSteamPassword ? t('set.steamPasswordSet') : undefined}>
+          <Field label={t('set.steamPassword')} help={settings.hasSteamPassword ? t('set.steamPasswordSet') : undefined}>
             <div className="input-row">
-              <PasswordInput value={s.steamPassword ?? ''} onChange={(v) => field('steamPassword', v)} />
-              {s.hasSteamPassword && (
-                <Button size="sm" kind="danger" onClick={() => save({ ...s, steamPassword: '', clearSteamPassword: true })}>
+              <PasswordInput value={password} onChange={setPassword} />
+              {settings.hasSteamPassword && (
+                <Button
+                  size="sm"
+                  kind="danger"
+                  onClick={async () => {
+                    if (await save({ clearSteamPassword: true })) setPassword('');
+                  }}
+                >
                   {t('set.clearPassword')}
                 </Button>
               )}
@@ -61,12 +78,17 @@ export function SettingsView() {
           </Field>
           <Field label={t('set.steamcmd')}>
             <div className="input-row">
-              <input className="input mono" value={s.localSteamcmdPath} onChange={(e) => field('localSteamcmdPath', e.target.value)} placeholder={info.platform === 'windows' ? 'C:\\steamcmd\\steamcmd.exe' : '/home/steam/steamcmd/steamcmd.sh'} />
+              <input
+                className="input mono"
+                value={localSteamcmdPath}
+                onChange={(e) => setEdits((x) => ({ ...x, localSteamcmdPath: e.target.value }))}
+                placeholder={info.platform === 'windows' ? 'C:\\steamcmd\\steamcmd.exe' : '/home/steam/steamcmd/steamcmd.sh'}
+              />
               <Button
                 size="sm"
                 onClick={async () => {
                   const f = await api.app.pickFile({ title: t('set.steamcmd') });
-                  if (f) field('localSteamcmdPath', f);
+                  if (f) setEdits((x) => ({ ...x, localSteamcmdPath: f }));
                 }}
               >
                 {t('common.browse')}
@@ -79,14 +101,36 @@ export function SettingsView() {
             </div>
           </Field>
           <Field label="">
-            <div>
-              <Button kind="primary" disabled={!steamDirty} onClick={() => save(s)}>
+            <div className="hstack">
+              <Button
+                kind="primary"
+                disabled={!steamDirty}
+                onClick={async () => {
+                  if (await save(steamPatch, t('common.saved'))) {
+                    setEdits({});
+                    setPassword('');
+                  }
+                }}
+              >
                 {t('common.save')}
               </Button>
+              {steamDirty && (
+                <Button
+                  kind="ghost"
+                  onClick={() => {
+                    setEdits({});
+                    setPassword('');
+                  }}
+                >
+                  {t('common.discard')}
+                </Button>
+              )}
             </div>
           </Field>
         </div>
       </Section>
+
+      <UpdatesSection version={info.version} />
 
       <Section title={t('set.about')}>
         {info.insecureSecrets ? (
@@ -112,5 +156,76 @@ export function SettingsView() {
       </Section>
       {install && <InstallSteamCmdDialog hostId="local" defaultDir={info.platform === 'windows' ? 'C:\\steamcmd' : '/opt/steamcmd'} onClose={() => setInstall(false)} />}
     </div>
+  );
+}
+
+function updateText(u: UpdateState | null, t: (k: string, v?: Record<string, string | number>) => string): string {
+  if (!u) return t('upd.idle');
+  const version = u.version ?? '';
+  switch (u.status) {
+    case 'disabled':
+      return u.disabledReason === 'portable' ? t('upd.disabledPortable') : u.disabledReason === 'dev' ? t('upd.disabledDev') : t('upd.disabled');
+    case 'checking':
+      return t('upd.checking');
+    case 'available':
+      return t('upd.available', { version });
+    case 'downloading':
+      return t('upd.downloading', { version, percent: Math.round(u.percent ?? 0) });
+    case 'ready':
+      return t('upd.ready', { version });
+    case 'none':
+      return t('upd.none');
+    case 'error':
+      return t('upd.error', { error: u.error ?? '' });
+    default:
+      return t('upd.idle');
+  }
+}
+
+function UpdatesSection({ version }: { version: string }) {
+  const { t } = useI18n();
+  const update = useStore((s) => s.update);
+  const status = update?.status ?? 'idle';
+  const disabled = status === 'disabled';
+  const busy = status === 'checking' || status === 'downloading' || status === 'available';
+  return (
+    <Section title={t('upd.title')} intro={t('upd.intro')}>
+      <div className="fields">
+        <Field label={t('upd.current')}>
+          <span>v{version}</span>
+        </Field>
+        <Field label={t('upd.status')}>
+          <div className="vstack" style={{ gap: 8 }}>
+            <span className={status === 'error' ? 'bad' : status === 'ready' ? 'ok' : undefined}>{updateText(update, t)}</span>
+            {status === 'downloading' && (
+              <div className="bar" style={{ maxWidth: 360 }} role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(update?.percent ?? 0)}>
+                <span style={{ width: `${update?.percent ?? 0}%` }} />
+              </div>
+            )}
+          </div>
+        </Field>
+        <Field label="">
+          <div className="vstack" style={{ gap: 10 }}>
+            <div className="hstack">
+              <Button
+                disabled={disabled || busy}
+                onClick={async () => {
+                  const s = await attempt(() => api.app.checkForUpdates());
+                  if (s) setState({ update: s });
+                }}
+              >
+                {t('upd.check')}
+              </Button>
+              {status === 'ready' && (
+                <Button kind="primary" onClick={() => attempt(() => api.app.installUpdate())}>
+                  {t('upd.install')}
+                </Button>
+              )}
+            </div>
+            {status === 'ready' && <span className="small muted">{t('upd.installNote')}</span>}
+          </div>
+        </Field>
+      </div>
+    </Section>
   );
 }

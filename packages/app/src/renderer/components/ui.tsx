@@ -1,5 +1,43 @@
-import { type ReactNode, useEffect, useId, useRef, useState } from 'react';
+import { createContext, type ReactNode, useContext, useEffect, useId, useRef, useState } from 'react';
 import { useI18n } from '../i18n';
+import { api, errorText, toast } from '../state';
+
+/**
+ * Açık sunucu formunun yerel geçerlilik kaydı: metin alanları taslağa yazılamayan (geçersiz) bir değer
+ * tutarken Kaydet engellenir. epoch, taslak dışarıdan değiştirildiğinde (yükle / at / içe aktar) artar;
+ * yerel metinler o anda taslaktaki değere döner.
+ */
+export interface FormCtx {
+  report: (key: string, invalid: boolean) => void;
+  epoch: number;
+}
+export const FormContext = createContext<FormCtx | null>(null);
+
+/** Bileşen geçersiz bir yerel metin tutuyorsa formu bilgilendirir (Kaydet engellenir). */
+export function useLocalInvalid(invalid: boolean, enabled = true) {
+  const form = useContext(FormContext);
+  const key = useId();
+  const report = enabled ? form?.report : undefined;
+  useEffect(() => {
+    report?.(key, invalid);
+  }, [report, key, invalid]);
+  useEffect(() => () => report?.(key, false), [report, key]);
+}
+
+/** Taslak dışarıdan değiştiğinde (ilk render hariç) çağrılır. */
+export function useFormReset(fn: () => void) {
+  const epoch = useContext(FormContext)?.epoch ?? 0;
+  const first = useRef(true);
+  const cb = useRef(fn);
+  cb.current = fn;
+  useEffect(() => {
+    if (first.current) {
+      first.current = false;
+      return;
+    }
+    cb.current();
+  }, [epoch]);
+}
 
 export function Button(props: {
   children: ReactNode;
@@ -97,6 +135,15 @@ export function Section(props: { title: ReactNode; intro?: ReactNode; children: 
   );
 }
 
+const NUM_RE = /^-?\d+([.,]\d+)?$/;
+/** Metni sayıya çevir; tam olarak bir sayı değilse (ör. "1.000.000", "12abc", boş) undefined. */
+export function parseNumber(text: string): number | undefined {
+  const s = text.trim();
+  if (!NUM_RE.test(s)) return undefined;
+  const n = Number(s.replace(',', '.'));
+  return Number.isFinite(n) ? n : undefined;
+}
+
 export function NumberInput(props: {
   value: number;
   onChange: (v: number) => void;
@@ -106,29 +153,45 @@ export function NumberInput(props: {
   id?: string;
   className?: string;
   invalid?: boolean;
+  /** Sunucu formuna bağlı değil (ör. iletişim penceresi): geçersizken Kaydet'i engellemez */
+  standalone?: boolean;
+  'aria-label'?: string;
 }) {
-  // Kullanıcı yazarken ara durumları (boş, "0.") koru; sayıya çevrilebildiğinde bildir.
+  const { t } = useI18n();
+  // Kullanıcı yazarken ara durumları koru; sadece tam bir sayı olduğunda bildir.
+  // Türkçe/Almanca klavyede virgül de ondalık ayırıcı kabul edilir.
   const [text, setText] = useState(String(props.value));
+  const parsed = parseNumber(text);
+  const localInvalid = parsed === undefined;
   useEffect(() => {
-    if (Number(text.replace(',', '.')) !== props.value) setText(String(props.value));
+    if (parseNumber(text) !== props.value) setText(String(props.value));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.value]);
+  useFormReset(() => setText(String(props.value)));
+  useLocalInvalid(localInvalid, !props.standalone);
   return (
-    <input
-      id={props.id}
-      className={`input ${props.className ?? 'short'}`}
-      inputMode="decimal"
-      value={text}
-      aria-invalid={props.invalid || undefined}
-      onChange={(e) => {
-        // Türkçe/Almanca klavyede virgül de ondalık ayırıcı kabul edilir (TADST'deki hata burada yok)
-        const raw = e.target.value;
-        setText(raw);
-        const n = Number(raw.replace(',', '.'));
-        if (raw.trim() !== '' && Number.isFinite(n)) props.onChange(n);
-      }}
-      onBlur={() => setText(String(props.value))}
-    />
+    <span className="num-wrap">
+      <input
+        id={props.id}
+        className={`input ${props.className ?? 'short'}`}
+        inputMode="decimal"
+        value={text}
+        aria-label={props['aria-label']}
+        aria-invalid={props.invalid || localInvalid || undefined}
+        title={localInvalid ? t('common.notANumber') : undefined}
+        onChange={(e) => {
+          const raw = e.target.value;
+          setText(raw);
+          const n = parseNumber(raw);
+          if (n !== undefined) props.onChange(n);
+        }}
+        onBlur={() => {
+          // Geçersiz metni silme: kullanıcı neyin yanlış olduğunu görsün
+          if (!localInvalid) setText(String(props.value));
+        }}
+      />
+      {localInvalid && <span className="num-err">{t('common.notANumber')}</span>}
+    </span>
   );
 }
 
@@ -207,25 +270,47 @@ export function ListInput(props: { value: string[]; onChange: (v: string[]) => v
   );
 }
 
-export function Modal(props: { title: ReactNode; intro?: ReactNode; children: ReactNode; footer?: ReactNode; onClose: () => void; wide?: boolean }) {
+/** Açık pencereler yığını: Escape sadece en üstteki pencereyi kapatır. */
+const modalStack: symbol[] = [];
+
+export function Modal(props: {
+  title: ReactNode;
+  intro?: ReactNode;
+  children: ReactNode;
+  footer?: ReactNode;
+  onClose: () => void;
+  wide?: boolean;
+  /** false: Escape ve dışarı tıklama kapatmaz (sadece düğmeler) */
+  dismissible?: boolean;
+}) {
   const id = useId();
   const ref = useRef<HTMLDivElement>(null);
+  const onClose = useRef(props.onClose);
+  onClose.current = props.onClose;
+  const dismissible = props.dismissible !== false;
+  const canDismiss = useRef(dismissible);
+  canDismiss.current = dismissible;
   useEffect(() => {
+    const me = Symbol('modal');
+    modalStack.push(me);
     const prev = document.activeElement as HTMLElement | null;
     const first = ref.current?.querySelector<HTMLElement>('input, select, textarea, button');
     first?.focus();
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') props.onClose();
+      if (e.key !== 'Escape' || modalStack[modalStack.length - 1] !== me) return;
+      e.stopPropagation();
+      if (canDismiss.current) onClose.current();
     };
     window.addEventListener('keydown', onKey);
     return () => {
       window.removeEventListener('keydown', onKey);
+      const i = modalStack.indexOf(me);
+      if (i >= 0) modalStack.splice(i, 1);
       prev?.focus();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   return (
-    <div className="backdrop" onMouseDown={(e) => e.target === e.currentTarget && props.onClose()}>
+    <div className="backdrop" onMouseDown={(e) => e.target === e.currentTarget && canDismiss.current && props.onClose()}>
       <div className={`modal ${props.wide ? 'wide' : ''}`} role="dialog" aria-modal="true" aria-labelledby={id} ref={ref}>
         <div className="modal-head">
           <h2 id={id}>{props.title}</h2>
@@ -273,7 +358,7 @@ export function useConfirm() {
         </>
       }
     >
-      <p style={{ margin: '4px 0 8px' }}>{req.text}</p>
+      <p style={{ margin: '4px 0 8px', whiteSpace: 'pre-line', overflowWrap: 'anywhere' }}>{req.text}</p>
     </Modal>
   ) : null;
   return { confirm, node };
@@ -292,8 +377,16 @@ export function Empty({ title, children }: { title: string; children?: ReactNode
   );
 }
 
-export function copyText(text: string) {
-  void navigator.clipboard.writeText(text);
+/** Ana süreç üzerinden panoya kopyala (tarayıcı pano izni bu uygulamada kapalı). */
+export async function copyText(text: string, okText: string): Promise<boolean> {
+  try {
+    await api.app.copyText(text);
+    toast('success', okText);
+    return true;
+  } catch (err) {
+    toast('error', errorText(err));
+    return false;
+  }
 }
 
 export function randomPassword(len = 20): string {

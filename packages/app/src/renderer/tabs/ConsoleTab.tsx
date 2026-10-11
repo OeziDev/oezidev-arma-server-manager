@@ -1,7 +1,29 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { Button, Toggle } from '../components/ui';
+import type { LogLine } from '../../shared/api';
+import { Button, Toggle, copyText } from '../components/ui';
 import { useI18n } from '../i18n';
-import { api, errorText, formatTime, loadLogs, setState, useStore } from '../state';
+import { api, errorText, formatTime, loadLogs, pushLocalLog, type LocalLogLine, useStore } from '../state';
+
+type ViewLine = (LogLine | LocalLogLine) & { key: string };
+
+/** Sunucu satırları ve arayüzün kendi satırları (her ikisi de zamana göre sıralı) zamana göre birleşir. */
+function mergeByTime(server: LogLine[], local: LocalLogLine[]): ViewLine[] {
+  const out: ViewLine[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < server.length || j < local.length) {
+    const a = server[i];
+    const b = local[j];
+    if (a && (!b || a.t <= b.t)) {
+      out.push({ ...a, key: `s${a.seq}` });
+      i++;
+    } else if (b) {
+      out.push({ ...b, key: `l${j}` });
+      j++;
+    }
+  }
+  return out;
+}
 
 const MAX_RENDER = 1500;
 
@@ -15,6 +37,7 @@ function kindOf(source: string, line: string): string {
 export function ConsoleTab({ id }: { id: string }) {
   const { t } = useI18n();
   const logs = useStore((s) => s.logs[id]);
+  const localLogs = useStore((s) => s.localLogs[id]);
   const rcon = useStore((s) => s.statuses[id]?.rcon);
   const [filter, setFilter] = useState('');
   const [source, setSource] = useState('');
@@ -29,12 +52,13 @@ export function ConsoleTab({ id }: { id: string }) {
     void loadLogs(id);
   }, [id]);
 
-  const sources = useMemo(() => [...new Set((logs ?? []).map((l) => l.source))].sort(), [logs]);
+  const all = useMemo(() => mergeByTime(logs ?? [], localLogs ?? []), [logs, localLogs]);
+  const sources = useMemo(() => [...new Set(all.map((l) => l.source))].sort(), [all]);
   const lines = useMemo(() => {
     const f = filter.toLowerCase();
-    const out = (logs ?? []).filter((l) => l.t >= since && (!source || l.source === source) && (!f || l.line.toLowerCase().includes(f)));
+    const out = all.filter((l) => l.t >= since && (!source || l.source === source) && (!f || l.line.toLowerCase().includes(f)));
     return out.slice(-MAX_RENDER);
-  }, [logs, filter, source, since]);
+  }, [all, filter, source, since]);
 
   useLayoutEffect(() => {
     if (follow && ref.current) ref.current.scrollTop = ref.current.scrollHeight;
@@ -46,8 +70,8 @@ export function ConsoleTab({ id }: { id: string }) {
     setHistory((h) => [c, ...h.filter((x) => x !== c)].slice(0, 50));
     setHIndex(-1);
     setCmd('');
-    const push = (text: string) =>
-      setState((s) => ({ logs: { ...s.logs, [id]: [...(s.logs[id] ?? []), ...text.split('\n').map((line) => ({ t: Date.now(), source: 'app', line }))] } }));
+    // Sunucu tamponunda olmayan satırlar: ayrı tutulur, sekme değişince ya da log yenilenince kaybolmaz
+    const push = (text: string) => pushLocalLog(id, text);
     push(`> ${c}`);
     try {
       const res = await api.rcon.command(id, c);
@@ -75,7 +99,7 @@ export function ConsoleTab({ id }: { id: string }) {
         <Button size="sm" kind="ghost" onClick={() => setSince(Date.now())}>
           {t('con.clear')}
         </Button>
-        <Button size="sm" kind="ghost" onClick={() => void navigator.clipboard.writeText(lines.map((l) => `${formatTime(l.t)} [${l.source}] ${l.line}`).join('\n'))}>
+        <Button size="sm" kind="ghost" disabled={lines.length === 0} onClick={() => copyText(lines.map((l) => `${formatTime(l.t)} [${l.source}] ${l.line}`).join('\n'), t('common.copied'))}>
           {t('common.copy')}
         </Button>
       </div>
@@ -93,8 +117,8 @@ export function ConsoleTab({ id }: { id: string }) {
         {lines.length === 0 ? (
           <div className="empty">{t('con.empty')}</div>
         ) : (
-          lines.map((l, i) => (
-            <div key={i} className="log-line" data-k={kindOf(l.source, l.line)}>
+          lines.map((l) => (
+            <div key={l.key} className="log-line" data-k={kindOf(l.source, l.line)}>
               <span className="log-time">{formatTime(l.t)}</span>
               <span className="log-src">{l.source === 'app' ? t('con.app') : l.source}</span>
               <span className="log-text">{l.line}</span>

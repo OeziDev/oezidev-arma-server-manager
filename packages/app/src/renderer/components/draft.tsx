@@ -1,6 +1,6 @@
 import { createContext, type ReactNode, useContext, useId } from 'react';
 import type { Issue, ServerProfile } from '../../shared/api';
-import { hasKey, useI18n } from '../i18n';
+import { hasKey, localizeError, useI18n } from '../i18n';
 import { Field, LinesInput, ListInput, NumberInput, PasswordInput, randomPassword, Toggle } from './ui';
 
 export function getPath(obj: unknown, path: string): unknown {
@@ -27,6 +27,12 @@ export interface DraftCtx {
   update: (fn: (p: ServerProfile) => ServerProfile) => void;
   errors: Record<string, string>;
   issues: Issue[];
+  /** Kaydedilmemiş değişiklik (ya da geçersiz yerel metin) var */
+  dirty: boolean;
+  /** Kaydedilmiş profili kullanan işlemlerden önce: değişiklik varsa kaydet; başarısızsa false */
+  ensureSaved: () => Promise<boolean>;
+  /** Bu profil için bir SteamCMD işi sürüyor */
+  jobActive: boolean;
 }
 
 export const DraftContext = createContext<DraftCtx | null>(null);
@@ -37,15 +43,18 @@ export function useDraft(): DraftCtx {
 }
 
 /** Alan etiketi, yardım, hata ve sorun bilgisini yola göre toplar. */
-function useFieldMeta(path: string, labelKey?: string) {
+export function useFieldMeta(path: string, labelKey?: string) {
   const { t, lang } = useI18n();
   const { errors, issues } = useDraft();
   const id = useId();
   const lk = labelKey ?? `field.${path}`;
   const hk = labelKey ? labelKey.replace(/^field\./, 'help.') : `help.${path}`;
-  const error = Object.entries(errors).find(([p]) => p === path || p.startsWith(path + '.'))?.[1];
+  const raw = Object.entries(errors).find(([p]) => p === path || p.startsWith(path + '.'))?.[1];
+  const error = raw === undefined ? undefined : localizeError(raw, t);
   const fieldIssues = issues.filter((i) => i.path === path).map((i) => ({ sev: i.severity, text: i.message[lang] }));
-  return { id, label: t(lk), help: hasKey(lang, hk) ? t(hk) : undefined, error, issues: fieldIssues };
+  /** Alt yol için (ör. "security.kickTimeout.manual") hata var mı */
+  const errorAt = (sub: string) => Object.keys(errors).some((p) => p === sub || p.startsWith(sub + '.'));
+  return { id, label: t(lk), help: hasKey(lang, hk) ? t(hk) : undefined, error, issues: fieldIssues, errorAt };
 }
 
 interface BaseProps {

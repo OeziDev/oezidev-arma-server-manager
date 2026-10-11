@@ -11,6 +11,7 @@ import {
   ToggleF,
   getPath,
   useDraft,
+  useFieldMeta,
 } from '../components/draft';
 import { Button, Field, NumberInput, Section, Seg, Toggle } from '../components/ui';
 import { useI18n } from '../i18n';
@@ -129,7 +130,7 @@ function GeneralSection() {
         <LinesF path="general.motd" rows={4} />
         <NumberF path="general.motdInterval" unit={t('common.seconds')} />
         <TextF path="general.logFile" mono width="mid" />
-        <SelectF path="general.timeStampFormat" options={['none', 'short', 'full'].map((v) => ({ value: v, label: v }))} />
+        <SelectF path="general.timeStampFormat" options={['none', 'short', 'full'].map((v) => ({ value: v, label: t(`opt.ts.${v}`) }))} />
         <ToggleF path="general.persistent" />
         <ToggleF path="general.statisticsEnabled" />
         <ToggleF path="general.drawingInMap" />
@@ -143,6 +144,7 @@ function SecuritySection() {
   const { t } = useI18n();
   const { draft, set } = useDraft();
   const kt = draft.security.kickTimeout;
+  const ktMeta = useFieldMeta('security.kickTimeout');
   return (
     <Section title={t('cfg.security')} intro={t('cfg.securityIntro')}>
       <div className="fields">
@@ -152,11 +154,16 @@ function SecuritySection() {
         <SelectF path="security.allowedFilePatching" options={[0, 1, 2].map((v) => ({ value: v, label: t(`opt.fp.${v}`) }))} />
         <LinesF path="security.filePatchingExceptions" mono rows={2} />
         <NumberF path="security.requiredBuild" className="mid" />
-        <Field label={t('field.security.kickTimeout')} help={t('help.security.kickTimeout')}>
+        <Field label={ktMeta.label} help={ktMeta.help} error={ktMeta.error} issues={ktMeta.issues}>
           <div className="vstack">
             {(['manual', 'connectivity', 'battlEye', 'harmless'] as const).map((k) => (
               <div key={k} className="input-row">
-                <NumberInput value={kt[k]} onChange={(v) => set(`security.kickTimeout.${k}`, Math.round(v))} />
+                <NumberInput
+                  value={kt[k]}
+                  aria-label={`${ktMeta.label}: ${t(`kick.${k}`)}`}
+                  invalid={ktMeta.errorAt(`security.kickTimeout.${k}`)}
+                  onChange={(v) => set(`security.kickTimeout.${k}`, Math.round(v))}
+                />
                 <span className="unit">{t(`kick.${k}`)}</span>
               </div>
             ))}
@@ -178,6 +185,7 @@ function VotingSection() {
     <Section title={t('cfg.voting')}>
       <div className="fields">
         <ToggleF path="voting.enabled" />
+        {draft.voting.enabled && <ToggleF path="voting.allowAdminVote" />}
         <NumberF path="voting.voteMissionPlayers" />
         <Field label={t('field.voting.voteThreshold')} help={t('help.voting.voteThreshold')}>
           <div className="input-row">
@@ -211,13 +219,14 @@ function VotingSection() {
 function LimitField({ path, unit }: { path: string; unit: string }) {
   const { t } = useI18n();
   const { draft, set } = useDraft();
+  const m = useFieldMeta(path);
   const v = getPath(draft, path) as { enabled: boolean; value: number; kick: boolean };
   return (
-    <Field label={t(`field.${path}`)}>
+    <Field label={m.label} help={m.help} error={m.error} issues={m.issues} htmlFor={m.id}>
       <div className="hstack" style={{ gap: 18 }}>
         <Toggle checked={v.enabled} onChange={(x) => set(`${path}.enabled`, x)} label={t('limit.enabled')} />
         <span className="input-row" style={{ width: 'auto' }}>
-          <NumberInput value={v.value} onChange={(x) => set(`${path}.value`, Math.round(x))} />
+          <NumberInput id={m.id} value={v.value} invalid={m.errorAt(`${path}.value`)} onChange={(x) => set(`${path}.value`, Math.round(x))} />
           <span className="unit">{unit}</span>
         </span>
         <Toggle checked={v.kick} disabled={!v.enabled} onChange={(x) => set(`${path}.kick`, x)} label={t('limit.kick')} />
@@ -253,6 +262,7 @@ const LEVELS: Record<string, string[]> = {
   weaponInfo: ['lvl.off', 'lvl.fade', 'lvl.always'],
   stanceIndicator: ['lvl.off', 'lvl.fade', 'lvl.always'],
   thirdPersonView: ['lvl.off', 'lvl.on', 'lvl.vehicles'],
+  tacticalPing: ['lvl.off', 'lvl.ping.scene', 'lvl.ping.map', 'lvl.ping.both'],
 };
 
 function DifficultySection() {

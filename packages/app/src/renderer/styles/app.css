@@ -146,7 +146,7 @@ a { color: var(--info); }
 .tab[aria-selected='true'] { color: var(--text); border-bottom-color: var(--signal); }
 .tab .dot { position: absolute; top: 8px; right: 4px; width: 6px; height: 6px; border-radius: 50%; background: var(--bad); }
 
-.content { flex: 1; overflow-y: auto; padding: 24px 28px 96px; min-height: 0; }
+.content { flex: 1; overflow-y: auto; padding: 24px 28px 56px; min-height: 0; }
 .content.flush { padding: 0; display: flex; flex-direction: column; overflow: hidden; }
 
 /* ---------------- Düğmeler ---------------- */
@@ -308,7 +308,8 @@ a { color: var(--info); }
 .toast .who { font: 500 12px var(--font-cond); color: var(--text-3); }
 .toast button { background: none; border: 0; color: var(--text-3); cursor: pointer; padding: 0 2px; }
 
-.dirty-bar { position: absolute; left: 0; right: 0; bottom: 0; display: flex; align-items: center; gap: 12px; padding: 12px 28px; background: var(--raised); border-top: 1px solid var(--line-strong); z-index: 5; }
+/* Normal akışta (içeriğin altında): konsoldaki RCON girişini ya da sayfanın son alanlarını örtmez */
+.dirty-bar { flex: none; display: flex; align-items: center; gap: 12px; padding: 12px 28px; background: var(--raised); border-top: 1px solid var(--line-strong); z-index: 5; }
 .dirty-bar .msg { flex: 1; color: var(--text-2); }
 .dirty-bar .msg strong { color: var(--text); font-weight: 600; }
 
@@ -348,3 +349,21 @@ a { color: var(--info); }
 .diff-grid > .diff-ctrl { justify-content: flex-end; }
 .diff-group { grid-column: 1 / -1; font: 600 15px var(--font-cond); color: var(--text-2); padding-top: 18px !important; }
 .range { width: 100%; max-width: 320px; accent-color: var(--signal); }
+
+/* ---------------- Sayı girişi ---------------- */
+.num-wrap { display: inline-flex; flex-direction: column; gap: 3px; min-width: 0; }
+.num-wrap > .input.short { width: 140px; }
+.num-wrap > .input.mid { width: 280px; max-width: 100%; }
+.num-err { color: var(--bad); font-size: 12px; max-width: 280px; }
+
+/* ---------------- Başlatma hatası ---------------- */
+.error-box { margin: 12px 28px 0; padding: 12px 16px; border: 1px solid color-mix(in srgb, var(--bad) 55%, var(--line-strong)); border-left: 3px solid var(--bad); border-radius: var(--r-control); background: color-mix(in srgb, var(--bad) 8%, var(--panel)); flex: none; }
+.error-box-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.error-box-head strong { color: var(--bad); font: 600 16px var(--font-cond); }
+.error-box-text { margin: 0; font: 400 12.5px/1.55 var(--font-mono); color: var(--text); white-space: pre-wrap; word-break: break-word; max-height: 180px; overflow-y: auto; }
+.head-hint { align-self: center; }
+
+/* ---------------- Güncelleme rozeti ---------------- */
+.update-pill { margin: 0 10px 8px; padding: 7px 10px; border: 1px solid var(--line-strong); border-radius: var(--r-control); background: var(--panel); color: var(--text-2); font: 500 13px var(--font-cond); text-align: left; cursor: pointer; }
+.update-pill:hover { color: var(--text); border-color: var(--text-3); }
+.update-pill[data-ready] { border-color: color-mix(in srgb, var(--signal) 60%, transparent); color: var(--signal); background: color-mix(in srgb, var(--signal) 10%, var(--panel)); }

@@ -10,6 +10,7 @@ import type {
   RconPlayer,
   ServerSummary,
   StatusInfo,
+  UpdateState,
 } from '../shared/api';
 
 declare global {
@@ -32,13 +33,24 @@ export interface ChatItem {
   message: string;
 }
 
+/** Arayüzde üretilen (RCON komutu / yanıtı) konsol satırı; sunucu tamponunda yoktur, seq taşımaz. */
+export interface LocalLogLine {
+  t: number;
+  source: 'app';
+  line: string;
+}
+
 export interface State {
   ready: boolean;
   info: AppInfo | null;
   settings: AppSettings | null;
+  update: UpdateState | null;
   summaries: ServerSummary[];
   statuses: Record<string, StatusInfo>;
+  /** Sunucudan gelen satırlar (seq'e göre sıralı, tekrarsız) */
   logs: Record<string, LogLine[]>;
+  /** Arayüzün kendi eklediği satırlar (RCON komutları ve yanıtları) */
+  localLogs: Record<string, LocalLogLine[]>;
   players: Record<string, RconPlayer[]>;
   chat: Record<string, ChatItem[]>;
   jobs: Record<string, JobInfo>;
@@ -50,9 +62,11 @@ let state: State = {
   ready: false,
   info: null,
   settings: null,
+  update: null,
   summaries: [],
   statuses: {},
   logs: {},
+  localLogs: {},
   players: {},
   chat: {},
   jobs: {},
@@ -129,7 +143,33 @@ export async function refreshHosts() {
   setState({ hosts: await api.hosts.list() });
 }
 
-const MAX_LOG = 3000;
+const MAX_LOG = 5000;
+const MAX_LOCAL_LOG = 500;
+
+/** Yeni satırları seq'e göre ekle; zaten olanları atla. */
+function appendLogs(prev: LogLine[], lines: LogLine[]): LogLine[] {
+  if (!lines.length) return prev;
+  const last = prev[prev.length - 1];
+  let fresh = lines;
+  if (last) {
+    // seq geriye gittiyse sunucu yöneticisi yeniden oluşturulmuş demektir (sayaç sıfırlandı): olduğu gibi ekle
+    const reset = lines[0]!.seq < last.seq && lines.every((l) => l.seq <= last.seq) && lines[0]!.seq <= 1;
+    if (!reset) fresh = lines.filter((l) => l.seq > last.seq);
+  }
+  if (!fresh.length) return prev;
+  const next = prev.concat(fresh);
+  return next.length > MAX_LOG ? next.slice(-MAX_LOG) : next;
+}
+
+/** Arayüzün kendi ürettiği satırları ekle (RCON komutu ve yanıtı). */
+export function pushLocalLog(profileId: string, text: string) {
+  const t = Date.now();
+  const items: LocalLogLine[] = text.split('\n').map((line) => ({ t, source: 'app', line }));
+  setState((s) => {
+    const next = [...(s.localLogs[profileId] ?? []), ...items];
+    return { localLogs: { ...s.localLogs, [profileId]: next.length > MAX_LOCAL_LOG ? next.slice(-MAX_LOCAL_LOG) : next } };
+  });
+}
 
 export function startEventLoop(lang: () => 'tr' | 'en') {
   return api.onEvent((e: AppEvent) => {
@@ -140,8 +180,8 @@ export function startEventLoop(lang: () => 'tr' | 'en') {
       case 'log':
         setState((s) => {
           const prev = s.logs[e.profileId] ?? [];
-          const next = prev.concat(e.lines);
-          return { logs: { ...s.logs, [e.profileId]: next.length > MAX_LOG ? next.slice(-MAX_LOG) : next } };
+          const next = appendLogs(prev, e.lines);
+          return next === prev ? {} : { logs: { ...s.logs, [e.profileId]: next } };
         });
         break;
       case 'players':
@@ -167,20 +207,46 @@ export function startEventLoop(lang: () => 'tr' | 'en') {
       case 'hosts-changed':
         void refreshHosts();
         break;
+      case 'settings-changed':
+        setState({ settings: e.settings });
+        break;
+      case 'update':
+        setState({ update: e.update });
+        break;
     }
   });
 }
 
+const logsLoaded = new Set<string>();
+
+/** Sunucunun log tamponunu profil başına bir kez yükle; sonrası olaylarla gelir. */
 export async function loadLogs(profileId: string) {
-  const lines = await api.server.logs(profileId);
+  if (logsLoaded.has(profileId)) return;
+  logsLoaded.add(profileId);
+  let lines: LogLine[];
+  try {
+    lines = await api.server.logs(profileId);
+  } catch {
+    logsLoaded.delete(profileId);
+    return;
+  }
   setState((s) => {
     const existing = s.logs[profileId] ?? [];
-    // Olaylarla gelenleri kaybetmeden birleştir
-    const last = lines[lines.length - 1];
-    const tail = last ? existing.filter((l) => l.t > last.t) : existing;
-    return { logs: { ...s.logs, [profileId]: lines.concat(tail).slice(-MAX_LOG) } };
+    // Tampon, istek sırasında olaylarla gelenleri de içerebilir: seq'e göre birleştir
+    const sorted = [...lines].sort((a, b) => a.seq - b.seq);
+    const last = sorted[sorted.length - 1];
+    const tail = last ? existing.filter((l) => l.seq > last.seq) : existing;
+    return { logs: { ...s.logs, [profileId]: sorted.concat(tail).slice(-MAX_LOG) } };
   });
 }
+
+/** Arayüzde açık sunucunun kaydedilmemiş taslağı (App'teki gezinme koruması için). */
+export interface DraftGuard {
+  dirty: boolean;
+  save: () => Promise<boolean>;
+  discard: () => void;
+}
+export const draftGuard: { current: DraftGuard | null } = { current: null };
 
 export function hostLabel(hostId: string, hosts: HostConfig[], localLabel: string): string {
   if (hostId === 'local') return localLabel;

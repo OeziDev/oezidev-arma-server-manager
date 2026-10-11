@@ -2,7 +2,7 @@ import { usedPorts } from '@core-constants';
 import { useEffect } from 'react';
 import type { Issue, ServerProfile } from '../../shared/api';
 import { Button } from '../components/ui';
-import { useI18n } from '../i18n';
+import { fieldLabel, localizeError, useI18n } from '../i18n';
 import { formatTime, loadLogs, useStore } from '../state';
 
 export function OverviewTab({ id, profile, issues, errors, onFix }: { id: string; profile: ServerProfile; issues: Issue[]; errors: Record<string, string>; onFix: (path: string) => void }) {
@@ -10,12 +10,12 @@ export function OverviewTab({ id, profile, issues, errors, onFix }: { id: string
   const status = useStore((s) => s.statuses[id]);
   const logs = useStore((s) => s.logs[id]);
   useEffect(() => {
-    if (!logs) void loadLogs(id);
-  }, [id, logs]);
+    void loadLogs(id);
+  }, [id]);
 
   const order = { error: 0, warning: 1, info: 2 } as const;
   const all: { sev: 'error' | 'warning' | 'info'; text: string; path?: string }[] = [
-    ...Object.entries(errors).map(([path, msg]) => ({ sev: 'error' as const, text: `${path}: ${msg}`, path })),
+    ...Object.entries(errors).map(([path, msg]) => ({ sev: 'error' as const, text: `${fieldLabel(path, lang, t)}: ${localizeError(msg, t)}`, path })),
     ...issues.map((i) => ({ sev: i.severity, text: i.message[lang], ...(i.path ? { path: i.path } : {}) })),
   ].sort((a, b) => order[a.sev] - order[b.sev]);
 
@@ -72,12 +72,6 @@ export function OverviewTab({ id, profile, issues, errors, onFix }: { id: string
                 ? t('common.none')
                 : `${status?.headless.filter((h) => h.alive).length ?? 0} / ${profile.headless.count}`}
             </div>
-            {status?.lastError && status.lastError !== 'validation' && (
-              <>
-                <div className="muted">!</div>
-                <div className="bad small diff-ctrl">{status.lastError}</div>
-              </>
-            )}
           </div>
         </section>
 

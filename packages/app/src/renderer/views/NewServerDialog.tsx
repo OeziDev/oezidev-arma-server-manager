@@ -1,10 +1,20 @@
 import { useState } from 'react';
+import { hasImportDetails, type ImportSummaryData } from '../components/ImportSummary';
 import { Button, Field, Modal } from '../components/ui';
-import { useI18n } from '../i18n';
-import { api, attempt, refreshSummaries, toast, useStore } from '../state';
+import { localizeError, useI18n } from '../i18n';
+import { api, attempt, errorText, refreshSummaries, useStore } from '../state';
 import { RemoteBrowser } from './RemoteBrowser';
 
-export function NewServerDialog({ onClose, onCreated, onAddHost }: { onClose: () => void; onCreated: (id: string) => void; onAddHost: () => void }) {
+export function NewServerDialog({
+  onClose,
+  onCreated,
+  onAddHost,
+}: {
+  onClose: () => void;
+  /** summary: server.cfg içe aktarıldıysa sonucu (uyarılar, ek satırlara taşınanlar ya da hata) */
+  onCreated: (id: string, summary?: ImportSummaryData) => void;
+  onAddHost: () => void;
+}) {
   const { t } = useI18n();
   const hosts = useStore((s) => s.hosts);
   const [name, setName] = useState('');
@@ -22,21 +32,27 @@ export function NewServerDialog({ onClose, onCreated, onAddHost }: { onClose: ()
   };
 
   const create = async () => {
-    const p = await attempt(async () => {
-      const created = await api.profiles.create({ name: name.trim() || 'Arma 3', hostId, paths: { serverDir: dir.trim() }, network: { port } });
-      if (cfgFile) {
+    // 1) Profili oluştur. Başarısızsa pencere açık kalır, tekrar denenebilir.
+    const created = await attempt(() => api.profiles.create({ name: name.trim() || 'Arma 3', hostId, paths: { serverDir: dir.trim() }, network: { port } }));
+    if (!created) return;
+    // 2) İsteğe bağlı server.cfg içe aktarma. Profil artık var: hata olsa bile yeni profile git
+    //    (tekrar "Oluştur" ikinci bir profil yaratmasın), sonucu ayrıca göster.
+    let summary: ImportSummaryData | undefined;
+    if (cfgFile) {
+      try {
         const text = await api.app.readPickedFile(cfgFile);
         const imported = await api.profiles.importServerCfg(created, text);
         const r = await api.profiles.save({ ...imported.profile, name: created.name, hostId: created.hostId, paths: created.paths, network: created.network, rcon: created.rcon });
-        if (imported.unknownKeys.length) toast('info', t('fl.unknownKeys', { keys: imported.unknownKeys.join(', ') }));
-        return r.profile ?? created;
+        summary = { what: 'server.cfg', issues: imported.issues, unknownKeys: imported.unknownKeys };
+        if (r.errors.length || !r.profile) {
+          summary.error = t('new.importNotSaved') + '\n' + r.errors.map((e) => `${e.path}: ${localizeError(e.message, t)}`).join('\n');
+        }
+      } catch (err) {
+        summary = { what: 'server.cfg', issues: [], unknownKeys: [], error: errorText(err) };
       }
-      return created;
-    });
-    if (p) {
-      await refreshSummaries();
-      onCreated(p.id);
     }
+    await refreshSummaries().catch(() => undefined);
+    onCreated(created.id, summary && hasImportDetails(summary) ? summary : undefined);
   };
 
   const importJson = async () => {

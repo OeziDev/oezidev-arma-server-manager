@@ -89,7 +89,9 @@ function GuardDialog({ job }: { job: JobInfo }) {
     <Modal
       title={t('guard.title')}
       intro={t('guard.text')}
-      onClose={() => void answer(null)}
+      // SteamCMD kodu bekliyor: yanlışlıkla Escape / dışarı tıklama işi iptal etmesin, sadece düğmeler
+      dismissible={false}
+      onClose={() => undefined}
       footer={
         <>
           <Button kind="ghost" onClick={() => answer(null)}>

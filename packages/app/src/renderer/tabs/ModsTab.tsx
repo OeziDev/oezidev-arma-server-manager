@@ -9,9 +9,9 @@ import { api, attempt, errorText, toast } from '../state';
 type ModRef = ServerProfile['launch']['mods'][number];
 type ListKey = 'mods' | 'serverMods';
 
-export function ModsTab({ id, dirty, onSave }: { id: string; dirty: boolean; onSave: () => Promise<boolean> }) {
+export function ModsTab({ id }: { id: string }) {
   const { t } = useI18n();
-  const { draft, update } = useDraft();
+  const { draft, update, ensureSaved, jobActive } = useDraft();
   const [found, setFound] = useState<FoundMod[] | null>(null);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
@@ -94,13 +94,14 @@ export function ModsTab({ id, dirty, onSave }: { id: string; dirty: boolean; onS
   };
 
   const sync = async () => {
-    if (dirty && !(await onSave())) return;
+    if (jobActive) return;
+    if (!(await ensureSaved())) return;
     await attempt(() => api.steam.syncWorkshop(id));
   };
 
+  // Sadece taslaktan çıkar: sunucudaki bağlantı ve anahtarları ana süreç başarılı Kaydet'ten sonra temizler
   const remove = async (key: ListKey, mod: ModRef) => {
     if (!(await confirm(t('mods.removeConfirm', { name: mod.displayName || mod.path }), true))) return;
-    if (mod.source === 'workshop') await api.steam.removeWorkshopMod(id, mod.path).catch(() => undefined);
     setList(key, (l) => l.filter((m) => m.id !== mod.id));
   };
 
@@ -110,6 +111,7 @@ export function ModsTab({ id, dirty, onSave }: { id: string; dirty: boolean; onS
   };
 
   const scan = async () => {
+    if (!(await ensureSaved())) return;
     const r = await attempt(() => api.mods.scan(id));
     if (r) setFound(r);
   };
@@ -125,7 +127,7 @@ export function ModsTab({ id, dirty, onSave }: { id: string; dirty: boolean; onS
           <Button size="sm" onClick={importPreset}>
             {t('mods.importPreset')}
           </Button>
-          <Button size="sm" kind="primary" disabled={workshopCount === 0} onClick={sync}>
+          <Button size="sm" kind="primary" disabled={workshopCount === 0 || jobActive} title={jobActive ? t('job.activeHint') : undefined} onClick={sync}>
             {t('mods.sync')}
           </Button>
         </div>

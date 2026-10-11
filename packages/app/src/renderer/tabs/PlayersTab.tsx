@@ -18,7 +18,23 @@ export function PlayersTab({ id }: { id: string }) {
   const [action, setAction] = useState<Action>(null);
   const [addBan, setAddBan] = useState(false);
   const [locked, setLocked] = useState(false);
+  const [sending, setSending] = useState(false);
+  const sendingRef = useRef(false);
   const chatRef = useRef<HTMLDivElement>(null);
+
+  // Enter + düğme ya da hızlı iki Enter aynı mesajı iki kez göndermesin; hata olursa metin kalsın
+  const sendBroadcast = async () => {
+    const text = broadcast.trim();
+    if (!text || sendingRef.current) return;
+    sendingRef.current = true;
+    setSending(true);
+    try {
+      if (await tryRun(() => api.rcon.say(id, text))) setBroadcast((cur) => (cur.trim() === text ? '' : cur));
+    } finally {
+      sendingRef.current = false;
+      setSending(false);
+    }
+  };
 
   const refresh = async () => {
     const p = await attempt(() => api.rcon.players(id));
@@ -62,8 +78,8 @@ export function PlayersTab({ id }: { id: string }) {
             <Button
               size="sm"
               onClick={async () => {
-                await attempt(() => api.rcon.setLock(id, !locked));
-                setLocked(!locked);
+                const next = !locked;
+                if (await tryRun(() => api.rcon.setLock(id, next))) setLocked(next);
               }}
             >
               {locked ? t('pl.unlock') : t('pl.lock')}
@@ -153,21 +169,12 @@ export function PlayersTab({ id }: { id: string }) {
               value={broadcast}
               maxLength={400}
               onChange={(e) => setBroadcast(e.target.value)}
-              onKeyDown={async (e) => {
-                if (e.key === 'Enter' && broadcast.trim()) {
-                  await attempt(() => api.rcon.say(id, broadcast.trim()));
-                  setBroadcast('');
-                }
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.repeat) void sendBroadcast();
               }}
               aria-label={t('pl.broadcast')}
             />
-            <Button
-              disabled={!broadcast.trim()}
-              onClick={async () => {
-                await attempt(() => api.rcon.say(id, broadcast.trim()));
-                setBroadcast('');
-              }}
-            >
+            <Button disabled={!broadcast.trim() || sending} onClick={sendBroadcast}>
               {t('pl.send')}
             </Button>
           </div>
@@ -262,7 +269,7 @@ function ActionDialog({ id, action, onClose, onDone }: { id: string; action: Non
         {action.kind === 'ban' && (
           <Field label={t('pl.minutes')}>
             <div className="hstack">
-              <NumberInput value={minutes} onChange={(v) => setMinutes(Math.max(1, Math.round(v)))} />
+              <NumberInput standalone value={minutes} onChange={(v) => setMinutes(Math.max(1, Math.round(v)))} />
               <span className="unit">{t('common.minutes')}</span>
               <Toggle checked={perm} onChange={setPerm} label={t('pl.permanent')} />
             </div>
@@ -308,7 +315,7 @@ function AddBanDialog({ id, onClose }: { id: string; onClose: () => void }) {
           <input className="input" value={reason} onChange={(e) => setReason(e.target.value)} />
         </Field>
         <Field label={t('pl.minutes')} help={`0 = ${t('pl.permanent')}`}>
-          <NumberInput value={minutes} onChange={(v) => setMinutes(Math.max(0, Math.round(v)))} />
+          <NumberInput standalone value={minutes} onChange={(v) => setMinutes(Math.max(0, Math.round(v)))} />
         </Field>
       </div>
     </Modal>

@@ -1,8 +1,8 @@
 import { DIFFICULTY_PRESETS } from '@core-constants';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { FoundMission, ServerProfile } from '../../shared/api';
 import { LinesF, SelectF, ToggleF, useDraft } from '../components/draft';
-import { Button, Empty, Section, Toggle } from '../components/ui';
+import { Button, Empty, Section, Toggle, useFormReset, useLocalInvalid } from '../components/ui';
 import { useI18n } from '../i18n';
 import { api, attempt, formatBytes, toast } from '../state';
 
@@ -14,7 +14,7 @@ function newId() {
 
 export function MissionsTab({ id }: { id: string }) {
   const { t } = useI18n();
-  const { draft, update } = useDraft();
+  const { draft, update, ensureSaved } = useDraft();
   const [found, setFound] = useState<FoundMission[] | null>(null);
   const [dir, setDir] = useState<string | null>(null);
   const [filter, setFilter] = useState('');
@@ -24,7 +24,9 @@ export function MissionsTab({ id }: { id: string }) {
   const rotation = draft.missions.rotation;
   const inRotation = useMemo(() => new Set(rotation.map((m) => m.template.toLowerCase())), [rotation]);
 
+  // Tarama / yükleme kayıtlı profildeki klasörü kullanır: önce taslağı kaydet
   const scan = async () => {
+    if (!(await ensureSaved())) return;
     const r = await attempt(() => api.missions.scan(id));
     if (r) {
       setFound(r.missions);
@@ -64,6 +66,7 @@ export function MissionsTab({ id }: { id: string }) {
             <Button
               size="sm"
               onClick={async () => {
+                if (!(await ensureSaved())) return;
                 const name = await attempt(() => api.missions.upload(id));
                 if (name) {
                   toast('success', t('ms.uploaded', { name }));
@@ -142,10 +145,10 @@ export function MissionsTab({ id }: { id: string }) {
                     </div>
                     {m.params.length > 0 && <div className="rot-sub">{m.params.map((p) => `${p.name}=${p.value}`).join(', ')}</div>}
                   </div>
-                  <select className="select" style={{ width: 120 }} value={m.difficulty} onChange={(e) => patch(i, { difficulty: e.target.value as Mission['difficulty'] })} aria-label="difficulty">
+                  <select className="select" style={{ width: 120 }} value={m.difficulty} onChange={(e) => patch(i, { difficulty: e.target.value as Mission['difficulty'] })} aria-label={t('ms.difficulty')}>
                     {DIFFICULTY_PRESETS.map((d) => (
                       <option key={d} value={d}>
-                        {d}
+                        {t(`opt.preset.${d}`)}
                       </option>
                     ))}
                   </select>
@@ -195,7 +198,7 @@ export function MissionsTab({ id }: { id: string }) {
           <div className="fields">
             <ToggleF path="missions.autoSelectMission" />
             <ToggleF path="missions.randomMissionOrder" />
-            <SelectF path="missions.forcedDifficulty" options={[{ value: '', label: t('common.none') }, ...DIFFICULTY_PRESETS.map((d) => ({ value: d, label: d }))]} />
+            <SelectF path="missions.forcedDifficulty" options={[{ value: '', label: t('common.none') }, ...DIFFICULTY_PRESETS.map((d) => ({ value: d, label: t(`opt.preset.${d}`) }))]} />
             <LinesF path="missions.missionWhitelist" mono rows={3} />
           </div>
         </Section>
@@ -204,32 +207,52 @@ export function MissionsTab({ id }: { id: string }) {
   );
 }
 
+const PARAM_RE = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(-?\d+(?:[.,]\d+)?)\s*;?\s*$/;
+const paramsText = (params: Mission['params']) => params.map((p) => `${p.name} = ${p.value}`).join('\n');
+
+/** Metni çöz: geçersiz satır varsa { bad } döner (taslak değişmez, Kaydet engellenir). */
+function parseParams(v: string): { params: Mission['params'] } | { bad: { line: number; text: string } } {
+  const out: Mission['params'] = [];
+  for (const [n, line] of v.split('\n').entries()) {
+    if (!line.trim()) continue;
+    const m = PARAM_RE.exec(line);
+    if (!m) return { bad: { line: n + 1, text: line.trim() } };
+    out.push({ name: m[1]!, value: Number(m[2]!.replace(',', '.')) });
+  }
+  return { params: out };
+}
+
 function ParamsEditor({ mission, onChange }: { mission: Mission; onChange: (p: Mission['params']) => void }) {
   const { t } = useI18n();
-  const [text, setText] = useState(mission.params.map((p) => `${p.name} = ${p.value}`).join('\n'));
-  const [err, setErr] = useState('');
-  const parse = (v: string) => {
-    setText(v);
-    const out: Mission['params'] = [];
-    for (const [n, line] of v.split('\n').entries()) {
-      if (!line.trim()) continue;
-      const m = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(-?\d+(?:[.,]\d+)?)\s*;?\s*$/.exec(line);
-      if (!m) {
-        setErr(`${n + 1}: ${line}`);
-        return;
-      }
-      out.push({ name: m[1]!, value: Number(m[2]!.replace(',', '.')) });
-    }
-    setErr('');
-    onChange(out);
-  };
+  const [text, setText] = useState(paramsText(mission.params));
+  const parsed = parseParams(text);
+  const bad = 'bad' in parsed ? parsed.bad : null;
+  useLocalInvalid(!!bad);
+  // Taslak dışarıdan değiştiyse (Değişiklikleri at, içe aktarma) metni yeniden eşitle
+  useEffect(() => {
+    const cur = parseParams(text);
+    if (!('params' in cur) || JSON.stringify(cur.params) !== JSON.stringify(mission.params)) setText(paramsText(mission.params));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mission.params]);
+  useFormReset(() => setText(paramsText(mission.params)));
   return (
     <div style={{ padding: '6px 12px 12px 58px', borderBottom: '1px solid var(--line)' }}>
       <div className="small muted" style={{ marginBottom: 6 }}>
         {t('ms.paramsHelp')}
       </div>
-      <textarea className="textarea mono" rows={4} value={text} onChange={(e) => parse(e.target.value)} placeholder={'Daytime = 12\nWeather = 0'} aria-invalid={!!err || undefined} />
-      {err && <div className="field-error">{err}</div>}
+      <textarea
+        className="textarea mono"
+        rows={4}
+        value={text}
+        onChange={(e) => {
+          setText(e.target.value);
+          const r = parseParams(e.target.value);
+          if ('params' in r) onChange(r.params);
+        }}
+        placeholder={'Daytime = 12\nWeather = 0'}
+        aria-invalid={!!bad || undefined}
+      />
+      {bad && <div className="field-error">{t('ms.paramsInvalid', { line: bad.line, text: bad.text })}</div>}
     </div>
   );
 }

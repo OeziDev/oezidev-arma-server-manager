@@ -9,8 +9,36 @@ export function parseWorkshopId(input: string): string | null {
 }
 
 export interface PresetMod {
+  /** Workshop modunda görünen ad; yerel modda klasör adı (Link yolundaki son klasör, güvenli hale getirilmiş) */
   name: string;
   workshopId?: string;
+  /** Launcher'daki görünen ad (DisplayName) */
+  displayName?: string;
+  /** Yerel modun klasör adı (ör. "@benim_modum") */
+  folder?: string;
+}
+
+/** "local:C:\\Arma\\@mod\\" ya da "C:\\Arma\\@mod" -> "@mod" */
+function lastFolderName(p: string): string | undefined {
+  const clean = p.replace(/^local:/i, '').split('|')[0]!.trim();
+  const parts = clean.split(/[\\/]+/).filter((x) => x && x !== '.' && x !== '..');
+  const last = parts[parts.length - 1];
+  return last && !/^[a-z]:$/i.test(last) ? last : undefined;
+}
+
+/**
+ * Klasör adı olarak kullanılacak metni güvenli yapar: ";" (mod listesi ayırıcı), Windows'ta yasak
+ * karakterler (<>:"/\\|?*) ve kontrol karakterleri "_" olur; sondaki nokta/boşluklar atılır,
+ * Windows'un ayrılmış adları (CON, NUL, COM1...) değiştirilir.
+ */
+export function sanitizeFolderName(name: string): string {
+  let s = name
+    .replace(/[\u0000-\u001f\u007f;<>:"/\\|?*]/g, '_')
+    .trim()
+    .replace(/[. ]+$/, '');
+  if (/^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$/i.test(s)) s = `_${s}`;
+  if (s === '' || s === '.' || s === '..') return '';
+  return s;
 }
 
 /** Arma 3 Launcher'dan dışa aktarılan mod listesi (.html) */
@@ -19,10 +47,23 @@ export function parseLauncherPreset(html: string): PresetMod[] {
   const rows = html.split(/<tr\b/i).slice(1);
   for (const row of rows) {
     if (!/data-type="(Local)?ModContainer"/i.test(row)) continue;
-    const name = /data-type="DisplayName"[^>]*>([^<]*)</i.exec(row)?.[1]?.trim();
+    const rawName = /data-type="DisplayName"[^>]*>([^<]*)</i.exec(row)?.[1]?.trim();
     const id = /filedetails\/\?id=(\d+)/i.exec(row)?.[1];
-    if (!name) continue;
-    out.push({ name: decodeEntities(name), ...(id ? { workshopId: id } : {}) });
+    const displayName = rawName ? decodeEntities(rawName) : undefined;
+    if (id) {
+      if (!displayName) continue;
+      out.push({ name: displayName, workshopId: id });
+      continue;
+    }
+    // Yerel mod: klasör adı Link'teki "local:C:\\...\\@klasor\\" yolundan, yoksa görünen addan
+    const link = /<[^>]*data-type="Link"[^>]*>([^<]*)</i.exec(row);
+    const linkTag = link?.[0] ?? '';
+    const meta = /data-meta="([^"]*)"/i.exec(linkTag)?.[1] ?? /href="([^"]*)"/i.exec(linkTag)?.[1];
+    const candidates = [meta, link?.[1]].filter((x): x is string => !!x).map((x) => decodeEntities(x).trim());
+    const fromPath = candidates.map((c) => (/^local:/i.test(c) || /[\\/]/.test(c) ? lastFolderName(c) : undefined)).find(Boolean);
+    const folder = sanitizeFolderName(fromPath ?? displayName ?? '');
+    if (!folder) continue;
+    out.push({ name: folder, folder, ...(displayName ? { displayName } : {}) });
   }
   return out;
 }

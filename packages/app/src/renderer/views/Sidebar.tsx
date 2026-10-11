@@ -1,14 +1,16 @@
-import type { Route } from '../App';
+import type { Navigate, Route } from '../App';
 import { StatusMark } from '../components/ui';
 import { useI18n } from '../i18n';
 import { api, hostLabel, useStore } from '../state';
 
-export function Sidebar({ route, onNavigate, onNew }: { route: Route; onNavigate: (r: Route) => void; onNew: () => void }) {
+export function Sidebar({ route, onNavigate, onNew }: { route: Route; onNavigate: Navigate; onNew: () => void }) {
   const { t } = useI18n();
   const summaries = useStore((s) => s.summaries);
   const statuses = useStore((s) => s.statuses);
   const hosts = useStore((s) => s.hosts);
   const version = useStore((s) => s.info?.version);
+  const update = useStore((s) => s.update);
+  const showUpdate = update && (update.status === 'downloading' || update.status === 'ready');
 
   return (
     <aside className="sidebar">
@@ -55,6 +57,18 @@ export function Sidebar({ route, onNavigate, onNew }: { route: Route; onNavigate
           {t('app.settings')}
         </button>
       </nav>
+      {showUpdate && (
+        <button
+          className="update-pill"
+          data-ready={update.status === 'ready' || undefined}
+          onClick={() => onNavigate({ view: 'settings' })}
+          title={update.status === 'ready' ? t('upd.pillReadyTitle') : undefined}
+        >
+          {update.status === 'ready'
+            ? t('upd.pillReady', { version: update.version ?? '' })
+            : t('upd.pillDownloading', { percent: Math.round(update.percent ?? 0) })}
+        </button>
+      )}
       <div className="side-foot">
         <div>{t('app.developedBy')}{version ? ` v${version}` : ''}</div>
         <button onClick={() => void api.app.openExternal('https://discord.gg/JNnkdBN5GP')}>{t('app.discord')}</button>

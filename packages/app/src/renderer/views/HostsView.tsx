@@ -75,7 +75,7 @@ export function HostsView() {
                         kind="danger"
                         disabled={used.length > 0}
                         onClick={async () => {
-                          if (await confirm(`${h.name}?`, true)) await tryRun(() => api.hosts.remove(h.id));
+                          if (await confirm(t('hosts.deleteConfirm', { name: h.name || `${h.username}@${h.host}` }), true)) await tryRun(() => api.hosts.remove(h.id));
                         }}
                       >
                         {t('common.delete')}
@@ -99,8 +99,21 @@ function HostDialog({ initial, onClose }: { initial: HostConfig; onClose: () => 
   const { t } = useI18n();
   const [h, setH] = useState<HostConfig>({ ...initial, password: '', passphrase: '' });
   const [test, setTest] = useState<HostTestResult | null>(null);
-  const set = <K extends keyof HostConfig>(k: K, v: HostConfig[K]) => setH((x) => ({ ...x, [k]: v }));
+  const { confirm, node: confirmNode } = useConfirm();
+  const set = <K extends keyof HostConfig>(k: K, v: HostConfig[K]) => {
+    setH((x) => ({ ...x, [k]: v }));
+    // Bağlantı hedefi değişti: eski test sonucu (ve parmak izi) artık geçerli değil
+    if (k === 'host' || k === 'port' || k === 'username') setTest(null);
+  };
   const isNew = !initial.id;
+  const fpChanged = !!test?.fingerprintChanged && !!test.fingerprint;
+  const trustedNew = fpChanged && h.fingerprint === test?.fingerprint;
+
+  const trustNew = async () => {
+    if (!test?.fingerprint) return;
+    if (!(await confirm(t('hosts.trustConfirm', { old: initial.fingerprint || '-', new: test.fingerprint }), true))) return;
+    setH((x) => ({ ...x, fingerprint: test.fingerprint! }));
+  };
 
   const runTest = async () => {
     setTest(null);
@@ -194,6 +207,29 @@ function HostDialog({ initial, onClose }: { initial: HostConfig; onClose: () => 
           <input className="input mono" value={h.steamcmdPath} onChange={(e) => set('steamcmdPath', e.target.value)} />
         </Field>
       </div>
+      {fpChanged && (
+        <div className="banner mt" data-level="error">
+          <div className="vstack" style={{ gap: 6 }}>
+            <strong className="bad">{t('hosts.fpChangedTitle')}</strong>
+            <span className="small">{t('hosts.fpChangedText')}</span>
+            <span className="small">
+              {t('hosts.fpOld')}: <span className="mono">{initial.fingerprint || '-'}</span>
+            </span>
+            <span className="small">
+              {t('hosts.fpNew')}: <span className="mono">{test!.fingerprint}</span>
+            </span>
+            <div>
+              {trustedNew ? (
+                <span className="small warn">{t('hosts.fpTrusted')}</span>
+              ) : (
+                <Button size="sm" kind="danger" onClick={trustNew}>
+                  {t('hosts.trustNew')}
+                </Button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
       {test && (
         <div className="banner mt" data-level={test.ok ? 'info' : 'error'}>
           <div className="vstack" style={{ gap: 4 }}>
@@ -205,12 +241,13 @@ function HostDialog({ initial, onClose }: { initial: HostConfig; onClose: () => 
             )}
             {test.ok && (
               <span className="small muted">
-                Linux, {test.isRoot ? t('hosts.root') : 'user'}, {test.hasSystemd ? t('hosts.systemdYes') : t('hosts.systemdNo')}. {t('hosts.fingerprintNote')}
+                Linux, {test.isRoot ? t('hosts.root') : t('hosts.user')}, {test.hasSystemd ? t('hosts.systemdYes') : t('hosts.systemdNo')}. {t('hosts.fingerprintNote')}
               </span>
             )}
           </div>
         </div>
       )}
+      {confirmNode}
     </Modal>
   );
 }
