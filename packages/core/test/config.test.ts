@@ -265,6 +265,15 @@ class Missions
     expect(profile.advanced.extraServerCfg).toContain('battleyeLicense = 1;');
   });
 
+  it('dolu allowedVoteCmds listesi kaybolmaz (ek satırlara taşınır), boş liste oylamayı kapatır', () => {
+    const r1 = importServerCfg('allowedVoteCmds[] = {{"missions", true, true}};');
+    expect(r1.profile.advanced.extraServerCfg).toContain('allowedVoteCmds[]');
+    expect(r1.profile.voting.enabled).toBe(true);
+    const r2 = importServerCfg('allowedVoteCmds[] = {};');
+    expect(r2.profile.voting.enabled).toBe(false);
+    expect(r2.profile.advanced.extraServerCfg).not.toContain('allowedVoteCmds');
+  });
+
   it('aralık dışı değerleri uyarıyla varsayılana çeker', () => {
     const { profile, issues } = importServerCfg('maxPlayers = 99999;\nhostname = "x";');
     expect(profile.general.maxPlayers).toBe(64);

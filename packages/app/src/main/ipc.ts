@@ -1,5 +1,7 @@
 import { BrowserWindow, dialog, ipcMain, shell, type IpcMainInvokeEvent } from 'electron';
 import fs from 'node:fs';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { z } from 'zod';
 import { fetchCollectionItems, fetchWorkshopDetails, parseLauncherPreset } from '@oezi/arma-core';
 import type { AppSettings, HostConfig } from '../shared/api.js';
@@ -36,18 +38,23 @@ const SettingsSchema = z.object({
   clearSteamPassword: z.boolean().optional(),
 });
 
-const EXTERNAL_ALLOW = [/^https:\/\/discord\.gg\//, /^https:\/\/(www\.)?discord\.com\//, /^https:\/\/steamcommunity\.com\//, /^https:\/\/community\.bistudio\.com\//, /^https:\/\/github\.com\//];
+export const EXTERNAL_ALLOW = [/^https:\/\/discord\.gg\//, /^https:\/\/(www\.)?discord\.com\//, /^https:\/\/steamcommunity\.com\//, /^https:\/\/community\.bistudio\.com\//, /^https:\/\/github\.com\//];
 
 type Handler = (...args: unknown[]) => unknown;
 
 export function registerIpc(opts: { services: AppServices; store: Store; getWindow: () => BrowserWindow | null; version: string; onSettingsChanged: (s: AppSettings) => void }) {
   const { services: s, store } = opts;
   const picked = new Set<string>();
+  const appPageUrl = pathToFileURL(path.join(__dirname, '..', 'renderer', 'index.html')).href;
 
   const handle = (area: string, method: string, fn: Handler) => {
     ipcMain.handle(channel(area, method), async (event: IpcMainInvokeEvent, ...args: unknown[]) => {
       const win = opts.getWindow();
-      if (!win || event.sender !== win.webContents) return { ok: false, error: 'Yetkisiz istek' };
+      // Sadece uygulamanın kendi sayfası çağırabilir (sürüklenen bir html dosyası değil)
+      const frameUrl = event.senderFrame?.url ?? '';
+      const dev = process.env.VITE_DEV_SERVER_URL;
+      const own = frameUrl.startsWith(appPageUrl) || (!!dev && frameUrl.startsWith(dev));
+      if (!win || event.sender !== win.webContents || !own) return { ok: false, error: 'Yetkisiz istek' };
       try {
         return { ok: true, value: await fn(...args) };
       } catch (err) {

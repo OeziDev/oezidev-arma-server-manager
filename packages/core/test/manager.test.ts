@@ -190,6 +190,22 @@ describe('ServerManager (doğrudan mod, yerel)', () => {
     expect(mgr2.getStatus().status).toBe('stopped');
   });
 
+  it('süreç sorgusu geçici olarak başarısız olursa çöktü sanmaz', async () => {
+    const { mgr } = await setup({ rcon: { enabled: false } });
+    await mgr.start();
+    await waitFor(() => mgr.getStatus().status === 'running');
+    const host = mgr.host as LocalHost & { processInfo: LocalHost['processInfo'] };
+    const original = host.processInfo.bind(host);
+    host.processInfo = async () => {
+      throw new Error('tasklist başarısız');
+    };
+    await sleep(1200);
+    expect(mgr.getStatus().status).toBe('running');
+    expect(mgr.getStatus().autoRestarts).toBe(0);
+    host.processInfo = original;
+    await mgr.stop();
+  });
+
   it('engelleyici doğrulama hatasında başlatmaz', async () => {
     const { mgr } = await setup({ rcon: { password: '', enabled: true } });
     await expect(mgr.start()).rejects.toBeInstanceOf(ValidationFailedError);

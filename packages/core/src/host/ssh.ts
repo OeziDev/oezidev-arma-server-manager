@@ -19,6 +19,7 @@ import {
   type TailOptions,
 } from './types.js';
 import { createSystemdApi } from './systemd.js';
+import { followWithRestart } from './follow.js';
 
 const { Client } = ssh2;
 const posix = path.posix;
@@ -61,6 +62,15 @@ export class SshHost implements Host {
   /** Bağlantıda görülen parmak izi (kaydedilmesi için) */
   fingerprint = '';
   readonly systemd?: SystemdApi;
+  private _generation = 0;
+  /** Uzun süreli akışlar (log takibi) için ayrı bağlantı: OpenSSH oturum sınırına (MaxSessions=10) takılmasın */
+  private streamConn: SshHost | null = null;
+  /** İlk bağlantıda öğrenilen parmak izi için geri çağrı (kaydetmek üzere) */
+  onFingerprintLearned?: (fp: string) => void;
+
+  get generation(): number {
+    return this._generation;
+  }
 
   constructor(private readonly cfg: SshHostConfig) {
     this.id = cfg.id;
@@ -144,6 +154,12 @@ export class SshHost implements Host {
     });
     this.client = client;
     this.connected = true;
+    this._generation++;
+    if (!this.cfg.expectedFingerprint && this.fingerprint) {
+      // İlk bağlantı: parmak izini sabitle (TOFU); sonraki bağlantılarda değişirse reddedilir
+      this.cfg.expectedFingerprint = this.fingerprint;
+      this.onFingerprintLearned?.(this.fingerprint);
+    }
 
     const uname = await this.exec('uname', ['-s']);
     if (uname.code !== 0 || !/linux/i.test(uname.stdout)) {
@@ -156,6 +172,10 @@ export class SshHost implements Host {
   }
 
   async close(): Promise<void> {
+    if (this.streamConn) {
+      await this.streamConn.close();
+      this.streamConn = null;
+    }
     const c = this.client;
     this.connected = false;
     this.sftpConn = null;
@@ -296,7 +316,7 @@ export class SshHost implements Host {
 
   async list(p: string): Promise<DirEntry[]> {
     // GNU find: %y kendi türü, %Y bağlantı hedefinin türü
-    const res = await this.exec('find', [p, '-mindepth', '1', '-maxdepth', '1', '-printf', '%f\\t%y\\t%Y\\t%s\\t%T@\\n']);
+    const res = await this.exec('find', ['-H', p, '-mindepth', '1', '-maxdepth', '1', '-printf', '%f\\t%y\\t%Y\\t%s\\t%T@\\n']);
     if (res.code !== 0) throw new HostError(`${p} listelenemedi: ${res.stderr.trim()}`, 'list_failed');
     return res.stdout
       .split('\n')
@@ -372,11 +392,11 @@ export class SshHost implements Host {
 
   /* ---------------- süreçler ---------------- */
 
-  spawn(file: string, args: string[], opts: ExecOptions = {}): StreamingProcess {
+  spawn(file: string, args: string[], opts: ExecOptions & { privileged?: boolean } = {}): StreamingProcess {
     // Uzak PID'i öğrenmek için önce $$ yazdırılır, sonra komut exec ile aynı süreçte çalışır.
-    const inner = this.buildCommand(file, args, { ...opts, cwd: undefined });
+    const inner = this.buildCommand(file, args, { ...opts, cwd: undefined, privileged: false });
     const cdPart = opts.cwd ? `cd ${quotePosixArg(opts.cwd)} && ` : '';
-    const command = `sh -c ${quotePosixArg(`echo __OEZI_PID__$$; ${cdPart}exec ${inner}`)}`;
+    const command = this.withPrivilege(`sh -c ${quotePosixArg(`echo __OEZI_PID__$$; ${cdPart}exec ${inner}`)}`, !!opts.privileged);
     const listeners: ((chunk: string, stream: 'stdout' | 'stderr') => void)[] = [];
     let resolvePid!: (pid: number | undefined) => void;
     const pid = new Promise<number | undefined>((r) => (resolvePid = r));
@@ -409,7 +429,8 @@ export class SshHost implements Host {
             if (!pidSeen) resolvePid(undefined);
             resolve(code ?? null);
           });
-          if (opts.input !== undefined) stream.write(opts.input);
+          if (opts.closeStdin) stream.end(opts.input ?? '');
+          else if (opts.input !== undefined) stream.write(opts.input);
         }),
       (err: Error) => {
         resolvePid(undefined);
@@ -452,15 +473,26 @@ export class SshHost implements Host {
     return pid;
   }
 
-  async processInfo(pid: number): Promise<ProcessInfo> {
+  async processInfo(pid: number, opts: { commandLine?: boolean } = {}): Promise<ProcessInfo> {
     if (!pid || pid <= 0) return { pid, alive: false };
+    const n = Math.trunc(pid);
+    const cmd = opts.commandLine ? `; tr '\\0' ' ' < /proc/${n}/cmdline; echo` : '';
     const res = await this.runShell(
-      `s=$(cat /proc/${pid}/stat 2>/dev/null) || exit 1; echo "$s" | sed 's/.*) //' | cut -d' ' -f1; basename "$(readlink /proc/${pid}/exe 2>/dev/null)"; cat /proc/${pid}/comm`,
+      `s=$(cat /proc/${n}/stat 2>/dev/null) || exit 7; echo "$s" | sed 's/.*) //' | cut -d' ' -f1; basename "$(readlink /proc/${n}/exe 2>/dev/null)"; cat /proc/${n}/comm${cmd}`,
+      { timeoutMs: 20000 },
     );
-    if (res.code !== 0) return { pid, alive: false };
-    const [state, image, comm] = res.stdout.split('\n').map((x) => x.trim());
+    if (res.code === 7) return { pid, alive: false };
+    // Bağlantı koptuysa (kod null) ya da başka bir hata: "öldü" sanma
+    if (res.code !== 0) throw new HostError(`Süreç sorgulanamadı: ${res.stderr.trim() || 'bağlantı yok'}`, 'query_failed');
+    const [state, image, comm, commandLine] = res.stdout.split('\n').map((x) => x.trim());
     if (state === 'Z' || state === 'X') return { pid, alive: false };
-    return { pid, alive: true, ...(image ? { image: image.toLowerCase() } : {}), ...(comm ? { comm: comm.toLowerCase() } : {}) };
+    return {
+      pid,
+      alive: true,
+      ...(image ? { image: image.toLowerCase() } : {}),
+      ...(comm ? { comm: comm.toLowerCase() } : {}),
+      ...(opts.commandLine ? { commandLine: commandLine ?? '' } : {}),
+    };
   }
 
   async killProcess(pid: number, opts: { force?: boolean } = {}): Promise<void> {
@@ -470,28 +502,50 @@ export class SshHost implements Host {
     if (res.code !== 0) await this.exec('kill', [sig, String(pid)]);
   }
 
-  tail(p: string, onLines: (lines: string[]) => void, opts: TailOptions = {}): TailHandle {
-    const proc = this.spawn('tail', ['-n', opts.fromStart ? '+1' : String(opts.initialLines ?? 200), '-F', p]);
-    const splitter = new LineSplitter();
-    let buffered: string[] = [];
-    let timer: NodeJS.Timeout | null = null;
-    proc.onData((chunk, stream) => {
-      if (stream === 'stderr') return; // "tail: file truncated" vb.
-      buffered.push(...splitter.push(chunk));
-      if (!timer) {
-        timer = setTimeout(() => {
-          timer = null;
-          const lines = buffered;
-          buffered = [];
-          if (lines.length) onLines(lines);
-        }, 200);
-      }
-    });
-    return {
-      stop: () => {
-        if (timer) clearTimeout(timer);
-        void proc.kill();
-      },
+  private streamHost(): SshHost {
+    if (!this.streamConn) {
+      this.streamConn = new SshHost({ ...this.cfg, id: `${this.id}:stream`, ...(this.cfg.expectedFingerprint ? {} : {}) });
+    }
+    return this.streamConn;
+  }
+
+  followCommand(file: string, args: string[], onLines: (lines: string[]) => void, opts: { resumeArgs?: string[]; privileged?: boolean } = {}): TailHandle {
+    const sh = this.streamHost();
+    // Ana bağlantıda öğrenilen parmak izi akış bağlantısında da zorunlu olsun
+    if (this.cfg.expectedFingerprint) sh.cfg.expectedFingerprint = this.cfg.expectedFingerprint;
+    const lazySpawn = (a: string[]): StreamingProcess => {
+      let inner: StreamingProcess | null = null;
+      const listeners: ((chunk: string, stream: 'stdout' | 'stderr') => void)[] = [];
+      const ready = sh
+        .connect()
+        .then(() => {
+          inner = sh.spawn(file, a, { privileged: !!opts.privileged });
+          listeners.forEach((l) => inner!.onData(l));
+          return inner;
+        })
+        .catch(() => null);
+      return {
+        pid: ready.then((p) => (p ? p.pid : undefined)),
+        onData: (cb) => {
+          listeners.push(cb);
+          if (inner) inner.onData(cb);
+        },
+        write: (d) => inner?.write(d),
+        kill: async () => {
+          const p = await ready;
+          await p?.kill();
+        },
+        wait: async () => {
+          const p = await ready;
+          return p ? p.wait() : -1;
+        },
+      };
     };
+    return followWithRestart(lazySpawn, args, opts.resumeArgs ?? args, onLines);
+  }
+
+  tail(p: string, onLines: (lines: string[]) => void, opts: TailOptions = {}): TailHandle {
+    const first = ['-n', opts.fromStart ? '+1' : String(opts.initialLines ?? 200), '-F', p];
+    return this.followCommand('tail', first, onLines, { resumeArgs: ['-n', '0', '-F', p] });
   }
 }

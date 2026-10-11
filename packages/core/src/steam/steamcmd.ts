@@ -28,16 +28,21 @@ export interface SteamCmdContext {
   /** Steam Guard / 2FA kodu iste (iptal için null) */
   askGuardCode?: () => Promise<string | null>;
   signal?: AbortSignal;
+  /** Tek bir SteamCMD çağrısı için üst süre (ms). Takılan indirme sunucuyu kapalı tutmasın. */
+  timeoutMs?: number;
 }
 
 export type SteamCmdFailure =
   | 'guard_required'
+  | 'mobile_confirm'
   | 'bad_password'
   | 'password_required'
   | 'rate_limited'
   | 'no_subscription'
   | 'disk_space'
+  | 'disk_write'
   | 'timeout'
+  | 'stalled'
   | 'aborted'
   | 'not_found'
   | 'missing_libs'
@@ -62,12 +67,15 @@ export class SteamCmdError extends Error {
 
 const FAILURE_MESSAGES: Record<SteamCmdFailure, string> = {
   guard_required: 'Steam Guard kodu gerekli',
+  mobile_confirm: 'Steam, girişi telefondaki Steam uygulamasından onaylamanı bekliyor; onaylayıp tekrar dene',
   bad_password: 'Steam şifresi yanlış',
   password_required: 'Steam şifresi gerekli (önbellekte giriş yok)',
   rate_limited: 'Steam çok fazla deneme yapıldığı için geçici olarak engelledi; biraz bekle',
   no_subscription: 'Bu Steam hesabı gerekli içeriğe sahip değil (Arma 3 sahibi bir hesap gerekir)',
   disk_space: 'Diskte yeterli yer yok',
+  disk_write: 'Dosyalar yazılamadı: sunucu çalışırken dosyalar kilitli olabilir ya da izin yok',
   timeout: 'İndirme zaman aşımına uğradı',
+  stalled: 'SteamCMD belirlenen sürede bitmedi ve durduruldu',
   aborted: 'İptal edildi',
   not_found: 'SteamCMD bulunamadı',
   missing_libs: 'SteamCMD çalışmadı: 32-bit kütüphaneler eksik olabilir (Debian/Ubuntu: apt install lib32gcc-s1)',
@@ -82,11 +90,13 @@ export function failureMessage(f: SteamCmdFailure): string {
 export function detectFailure(lines: string[]): SteamCmdFailure | undefined {
   const text = lines.join('\n');
   if (/Two-factor code|Steam Guard code|Account Logon Denied|Invalid Login Auth Code|Two Factor Code Mismatch|AccountLoginDeniedNeedTwoFactor|Account Login Denied/i.test(text)) return 'guard_required';
+  if (/confirm the login in the Steam Mobile app|Please confirm the login/i.test(text)) return 'mobile_confirm';
   if (/Invalid Password|InvalidPassword/i.test(text)) return 'bad_password';
   if (/Cached credentials not found|No cached credentials|@NoPromptForPassword|password:\s*$/im.test(text)) return 'password_required';
   if (/Rate Limit Exceeded|RateLimitExceeded/i.test(text)) return 'rate_limited';
   if (/No subscription|\(No subscription\)/i.test(text)) return 'no_subscription';
-  if (/Not enough disk space|disk write failure/i.test(text)) return 'disk_space';
+  if (/Not enough disk space|insufficient disk space/i.test(text)) return 'disk_space';
+  if (/disk write failure|Disk write failure|Failed to write file|Access is denied/i.test(text)) return 'disk_write';
   if (/\(Timeout\)|Timeout downloading item/i.test(text)) return 'timeout';
   if (/linux32\/steamcmd: No such file or directory|error while loading shared libraries/i.test(text)) return 'missing_libs';
   if (/^ERROR!|FAILED/m.test(text)) return 'unknown';
@@ -96,14 +106,23 @@ export function detectFailure(lines: string[]): SteamCmdFailure | undefined {
 const PROGRESS_RE = /Update state \(0x[0-9a-f]+\) ([\w ]+), progress: ([\d.]+)/i;
 
 /** Tek bir steamcmd çağrısı. */
-export async function runSteamCmd(ctx: SteamCmdContext, args: string[]): Promise<SteamCmdRun> {
+export async function runSteamCmd(ctx: SteamCmdContext, args: string[], opts: { continueOnFailure?: boolean } = {}): Promise<SteamCmdRun> {
   const { host } = ctx;
   if (!(await host.exists(ctx.steamcmdPath))) {
     throw new SteamCmdError(`${failureMessage('not_found')}: ${ctx.steamcmdPath}`, 'not_found');
   }
   const L = pathLib(host.os);
-  const fullArgs = ['+@ShutdownOnFailedCommand', '1', '+@NoPromptForPassword', '1', ...args, '+quit'];
-  const proc = host.spawn(ctx.steamcmdPath, fullArgs, { cwd: L.dirname(ctx.steamcmdPath) });
+  // Workshop'ta bir mod başarısız olunca kalanlar da denensin (continueOnFailure)
+  const fullArgs = ['+@ShutdownOnFailedCommand', opts.continueOnFailure ? '0' : '1', '+@NoPromptForPassword', '1', ...args, '+quit'];
+  // stdin kapatılır: istem bekleyen SteamCMD EOF alıp çıkar, sonsuza kadar asılı kalmaz
+  const proc = host.spawn(ctx.steamcmdPath, fullArgs, { cwd: L.dirname(ctx.steamcmdPath), closeStdin: true });
+  let timedOut = false;
+  const timer = ctx.timeoutMs
+    ? setTimeout(() => {
+        timedOut = true;
+        void proc.kill();
+      }, ctx.timeoutMs)
+    : null;
   const output: string[] = [];
   let partial = '';
   const onAbort = () => void proc.kill();
@@ -129,9 +148,14 @@ export async function runSteamCmd(ctx: SteamCmdContext, args: string[]): Promise
     }
   });
   const code = await proc.wait();
+  if (timer) clearTimeout(timer);
   ctx.signal?.removeEventListener('abort', onAbort);
   if (partial.trim()) output.push(partial.trim());
   if (ctx.signal?.aborted) return { code, output, failure: 'aborted' };
+  if (timedOut) {
+    output.push(`[SteamCMD ${Math.round((ctx.timeoutMs ?? 0) / 60000)} dk içinde bitmedi, durduruldu]`);
+    return { code, output, failure: detectFailure(output) === 'mobile_confirm' ? 'mobile_confirm' : 'stalled' };
+  }
   const failure = detectFailure(output) ?? (code !== 0 ? 'unknown' : undefined);
   return failure ? { code, output, failure } : { code, output };
 }
@@ -144,19 +168,22 @@ function maskPassword(line: string, password?: string): string {
  * Giriş gerektiren bir SteamCMD işlemi: önbellek -> şifre -> Steam Guard sırasıyla dener.
  * `before` login'den önce gelecek komutlar (force_install_dir), `after` login sonrası komutlar.
  */
-export async function runWithLogin(ctx: SteamCmdContext, before: string[], after: string[]): Promise<SteamCmdRun> {
+export async function runWithLogin(ctx: SteamCmdContext, before: string[], after: string[], opts: { continueOnFailure?: boolean } = {}): Promise<SteamCmdRun> {
   const user = ctx.credentials.username.trim();
   if (!user) throw new SteamCmdError('Steam kullanıcı adı ayarlanmamış', 'password_required');
-  if (user === 'anonymous') return runSteamCmd(ctx, [...before, '+login', 'anonymous', ...after]);
+  if (user === 'anonymous') return runSteamCmd(ctx, [...before, '+login', 'anonymous', ...after], opts);
 
-  let run = await runSteamCmd(ctx, [...before, '+login', user, ...after]);
+  let run = await runSteamCmd(ctx, [...before, '+login', user, ...after], opts);
   if (run.failure === 'password_required' && ctx.credentials.password) {
-    run = await runSteamCmd(ctx, [...before, '+login', user, ctx.credentials.password, ...after]);
+    run = await runSteamCmd(ctx, [...before, '+login', user, ctx.credentials.password, ...after], opts);
   }
   for (let attempt = 0; attempt < 3 && run.failure === 'guard_required'; attempt++) {
     const code = await ctx.askGuardCode?.();
     if (!code) throw new SteamCmdError(failureMessage('guard_required'), 'guard_required', run.output);
-    run = await runSteamCmd(ctx, [...before, '+login', user, ctx.credentials.password ?? '', code.trim(), ...after]);
+    run = await runSteamCmd(ctx, [...before, '+login', user, ctx.credentials.password ?? '', code.trim(), ...after], opts);
+  }
+  if (run.failure === 'mobile_confirm' || run.failure === 'stalled') {
+    throw new SteamCmdError(failureMessage(run.failure), run.failure, run.output);
   }
   if (run.failure === 'password_required') {
     throw new SteamCmdError(failureMessage('password_required'), 'password_required', run.output);
@@ -212,8 +239,8 @@ export async function downloadWorkshopItems(
   const retries = o.retries ?? 3;
   for (let attempt = 0; attempt <= retries && pending.length; attempt++) {
     const cmds = pending.flatMap((id) => ['+workshop_download_item', appId, id, ...(o.validate ? ['validate'] : [])]);
-    const run = await runWithLogin(ctx, ['+force_install_dir', o.workshopDir], cmds);
-    if (run.failure && ['bad_password', 'rate_limited', 'no_subscription', 'disk_space', 'aborted', 'missing_libs'].includes(run.failure)) {
+    const run = await runWithLogin(ctx, ['+force_install_dir', o.workshopDir], cmds, { continueOnFailure: true });
+    if (run.failure && ['bad_password', 'rate_limited', 'no_subscription', 'disk_space', 'disk_write', 'aborted', 'missing_libs', 'stalled', 'mobile_confirm'].includes(run.failure)) {
       throw new SteamCmdError(failureMessage(run.failure), run.failure, run.output);
     }
     const next: string[] = [];
@@ -226,7 +253,8 @@ export async function downloadWorkshopItems(
         next.push(id);
       }
     }
-    pending = next;
+    // Bir sonraki denemede aynı mod yine ilk sırada zaman aşımına uğramasın
+    pending = next.length > 1 ? [...next.slice(1), next[0]!] : next;
   }
   return {
     ok,

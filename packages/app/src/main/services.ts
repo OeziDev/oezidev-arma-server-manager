@@ -140,13 +140,22 @@ export class AppServices {
 
   async init() {
     for (const p of this.store.listProfiles()) this.createManager(p);
-    await Promise.all(
-      [...this.managers.values()].map((m) =>
-        m.attach().catch((err: Error) => {
-          this.emit({ type: 'notice', profileId: m.getProfile().id, notice: { level: 'warning', message: { tr: `Sunucu durumu alınamadı: ${err.message}`, en: `Could not read server state: ${err.message}` } } });
-        }),
-      ),
-    );
+    await Promise.all([...this.managers.values()].map((m) => this.attachWithRetry(m)));
+  }
+
+  /** Makineye ulaşılamıyorsa (VPS kapalı, ağ yok) 30 sn'de bir yeniden dene; bulunca takibe başla. */
+  private async attachWithRetry(m: ServerManager, notify = true): Promise<void> {
+    try {
+      await m.attach();
+    } catch (err) {
+      if (notify) {
+        const msg = (err as Error).message;
+        this.emit({ type: 'notice', profileId: m.getProfile().id, notice: { level: 'warning', message: { tr: `Sunucu durumu alınamadı, tekrar denenecek: ${msg}`, en: `Could not read server state, will retry: ${msg}` } } });
+      }
+      setTimeout(() => {
+        if (this.managers.get(m.getProfile().id) === m) void this.attachWithRetry(m, false);
+      }, 30_000);
+    }
   }
 
   async shutdown() {
@@ -183,7 +192,7 @@ export class AppServices {
         throw new UserError(`SSH anahtar dosyası okunamadı: ${cfg.privateKeyPath}`);
       }
     }
-    return new SshHost({
+    const host = new SshHost({
       id: cfg.id,
       label: cfg.name || `${cfg.username}@${cfg.host}`,
       host: cfg.host,
@@ -195,6 +204,17 @@ export class AppServices {
       ...(expected ? { expectedFingerprint: expected } : {}),
       useSudo: cfg.useSudo,
     });
+    if (!expected && cfg.id && cfg.id !== 'test') {
+      // Test edilmeden kaydedilmiş makine: ilk bağlantıda parmak izini kaydet (sonra değişirse reddedilir)
+      host.onFingerprintLearned = (fp) => {
+        const current = this.store.getHost(cfg.id);
+        if (current && !current.fingerprint) {
+          this.store.saveHost({ ...current, fingerprint: fp });
+          this.emit({ type: 'hosts-changed' });
+        }
+      };
+    }
+    return host;
   }
 
   private hostOs(hostId: string): HostOs {
@@ -222,7 +242,7 @@ export class AppServices {
     for (const p of this.store.listProfiles().filter((x) => x.hostId === saved.id)) {
       this.managers.get(p.id)?.dispose();
       const m = this.createManager(p);
-      void m.attach().catch(() => undefined);
+      void this.attachWithRetry(m, false);
     }
     this.emit({ type: 'hosts-changed' });
     return saved;
@@ -240,7 +260,8 @@ export class AppServices {
   async testHost(h: HostConfig): Promise<HostTestResult> {
     let host: SshHost;
     try {
-      host = this.makeSsh({ ...h, id: h.id || 'test' }, { ...(h.password ? { password: h.password } : {}), ...(h.passphrase ? { passphrase: h.passphrase } : {}) }, '');
+      // Kayıtlı parmak izi varsa el sıkışmada doğrulanır: değişmişse şifre gönderilmeden bağlantı kesilir
+      host = this.makeSsh({ ...h, id: h.id || 'test' }, { ...(h.password ? { password: h.password } : {}), ...(h.passphrase ? { passphrase: h.passphrase } : {}) }, h.fingerprint || '');
     } catch (err) {
       return { ok: false, error: (err as Error).message };
     }
@@ -259,7 +280,8 @@ export class AppServices {
         ...(changed ? { error: `Sunucu parmak izi değişmiş! Kayıtlı: ${h.fingerprint}, şimdi: ${host.fingerprint}` } : {}),
       };
     } catch (err) {
-      return { ok: false, error: (err as Error).message, ...(host.fingerprint ? { fingerprint: host.fingerprint } : {}) };
+      const e = err as Error & { code?: string };
+      return { ok: false, error: e.message, ...(host.fingerprint ? { fingerprint: host.fingerprint } : {}), ...(e.code === 'host_key_mismatch' ? { fingerprintChanged: true } : {}) };
     } finally {
       await host.close();
     }
@@ -297,7 +319,8 @@ export class AppServices {
       host,
       otherProfiles: () => this.store.listProfiles(),
       useSystemd: cfg ? cfg.useSystemd : false,
-      ...(cfg?.serviceUser ? { serviceUser: cfg.serviceUser } : {}),
+      // Servis kullanıcısı boşsa ve SSH kullanıcısı root değilse, sunucu o kullanıcıyla çalışsın (root değil)
+      ...(cfg?.serviceUser ? { serviceUser: cfg.serviceUser } : cfg && cfg.username !== 'root' ? { serviceUser: cfg.username } : {}),
       defaultRconHost: cfg ? cfg.host : '127.0.0.1',
       notifier: this.notifierFor(p.id),
       updater: (profile, log) => this.runScheduledUpdate(profile, log),
@@ -403,7 +426,7 @@ export class AppServices {
     if (!m || existing?.hostId !== p.hostId) {
       m?.dispose();
       const nm = this.createManager(saved);
-      void nm.attach().catch(() => undefined);
+      void this.attachWithRetry(nm, false);
     } else {
       m.updateProfile(saved);
     }
@@ -467,8 +490,7 @@ export class AppServices {
           executable: spec.executable,
           args: spec.args,
           workingDirectory: rp.serverDir,
-          logFile: rp.stdoutLog,
-          ...(cfg.serviceUser ? { user: cfg.serviceUser } : {}),
+          ...(cfg.serviceUser ? { user: cfg.serviceUser } : cfg.username !== 'root' ? { user: cfg.username } : {}),
           restart: p.supervisor.autoRestart ? 'on-failure' : 'no',
           restartSec: p.supervisor.restartDelaySec,
           startLimitBurst: p.supervisor.maxRestartsPerHour,
@@ -519,7 +541,15 @@ export class AppServices {
     const res = ServerProfileSchema.safeParse(obj.profile);
     if (!res.success) throw new UserError('Profil dosyası bozuk: ' + res.error.issues[0]?.message);
     const hostOk = res.data.hostId === 'local' || !!this.store.getHost(res.data.hostId);
-    return this.createProfile({ ...res.data, id: randomUUID(), hostId: hostOk ? res.data.hostId : 'local', paths: { ...res.data.paths, profilesDir: '' } });
+    // Paylaşılan bir profil başka bir programı çalıştıramasın: çalıştırılabilir dosya ve ek parametreler sıfırlanır
+    return this.createProfile({
+      ...res.data,
+      id: randomUUID(),
+      hostId: hostOk ? res.data.hostId : 'local',
+      paths: { ...res.data.paths, profilesDir: '', executable: '' },
+      launch: { ...res.data.launch, extraArgs: '', malloc: '' },
+      headless: { ...res.data.headless, extraArgs: '' },
+    });
   }
 
   /* ---------------- görev / mod ---------------- */
@@ -581,6 +611,8 @@ export class AppServices {
       host,
       steamcmdPath,
       credentials: { username: settings.steamUsername, password: this.store.steamPassword() },
+      // Etkileşimli işler 3 saat, zamanlı (gözetimsiz) güncellemeler 45 dk ile sınırlı
+      timeoutMs: job ? 3 * 3600_000 : 45 * 60_000,
       ...(job
         ? {
             onLine: (l: string) => job.line(l),
@@ -628,6 +660,9 @@ export class AppServices {
   syncWorkshopJob(profileId: string, onlyIds?: string[]): string {
     const p = this.getProfile(profileId);
     if (!p.paths.serverDir) throw new UserError('Önce sunucu klasörünü seç');
+    if (!['stopped', 'crashed'].includes(this.manager(profileId).getStatus().status)) {
+      throw new UserError('Modları güncellemeden önce sunucuyu durdur (çalışırken dosyalar kilitli olur, oyuncular imza hatası alır).');
+    }
     return this.startJob(`Workshop modları: ${p.name}`, profileId, async (job) => {
       await this.syncWorkshop(p, this.steamCtx(p.hostId, job), (l) => job.line(l), onlyIds);
     });

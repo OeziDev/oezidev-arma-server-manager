@@ -25,6 +25,8 @@ export interface StatusInfo {
   rcon: RconState;
   players: number;
   lastError?: string;
+  /** Makineye ulaşılamıyor (SSH koptu vb.) */
+  unreachable?: boolean;
 }
 
 export interface LogLine {
@@ -53,7 +55,7 @@ export interface ManagerOptions {
   otherProfiles?: () => ServerProfile[];
   /** SSH ile bağlanılan Linux'ta systemd kullan (varsayılan: true) */
   useSystemd?: boolean;
-  /** systemd servisinin çalışacağı kullanıcı (boşsa SSH kullanıcısı / root) */
+  /** systemd servisinin çalışacağı kullanıcı (boşsa root) */
   serviceUser?: string;
   /** RCON'a bağlanılacak adres (profilde yoksa). SSH host'larında sunucu adresi. */
   defaultRconHost?: string;
@@ -68,6 +70,8 @@ export interface ManagerOptions {
     playersMs: number;
     stopTimeoutMs: number;
     rptWaitMs: number;
+    /** Ölü sayılmadan önce art arda kaç "yok" okuması gerekir */
+    deadConfirmations: number;
   }>;
 }
 
@@ -75,6 +79,8 @@ interface DirectState {
   pid: number;
   startedAt: number;
   executable: string;
+  /** Komut satırında aranacak işaret (aynı exe ile çalışan diğer sunuculardan ayırmak için) */
+  marker?: string;
   headless: { index: number; pid: number }[];
 }
 
@@ -87,6 +93,7 @@ export class ValidationFailedError extends Error {
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const MAX_LOG = 3000;
+const HC_MAX_RESTARTS_PER_HOUR = 6;
 
 export class ServerManager extends EventEmitter<ManagerEvents> {
   private profile: ServerProfile;
@@ -100,6 +107,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
   private autoRestarts = 0;
   private restartHistory: number[] = [];
   private hcAlive = new Map<number, boolean>();
+  private hcRestarts = new Map<number, number[]>();
   private hcTimers: NodeJS.Timeout[] = [];
   private monitorTimer: NodeJS.Timeout | null = null;
   private schedulerTimer: NodeJS.Timeout | null = null;
@@ -107,13 +115,18 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
   private rconTimer: NodeJS.Timeout | null = null;
   private playersTimer: NodeJS.Timeout | null = null;
   private tails: TailHandle[] = [];
+  private tailsGeneration = -1;
   private logBuffer: LogLine[] = [];
   private busy: Promise<void> | null = null;
   private monitoring = false;
+  private deadStreak = 0;
   private lastError: string | undefined;
+  private unreachable = false;
+  private lastLoggedError = { text: '', at: 0 };
   private scheduledFor: number | null = null;
   private warningsSent = new Set<number>();
   private playerCount = 0;
+  private attached = false;
   rcon: BattlEyeRcon | null = null;
   private disposed = false;
 
@@ -130,6 +143,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       playersMs: 15000,
       stopTimeoutMs: 15000,
       rptWaitMs: 120000,
+      deadConfirmations: 2,
       ...opts.timers,
     };
     this.schedulerTimer = setInterval(() => void this.schedulerTick(), this.t.schedulerMs);
@@ -147,6 +161,16 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
 
   hcUnitName(i: number): string {
     return this.unitName.replace(/\.service$/, `-hc${i}.service`);
+  }
+
+  private get hcUnits(): string[] {
+    return Array.from({ length: this.profile.headless.count }, (_, i) => this.hcUnitName(i + 1));
+  }
+
+  /** Bu profilin süreçlerini aynı makinedeki diğer Arma süreçlerinden ayıran işaret */
+  private markerFor(hcIndex?: number): string {
+    const rp = this.paths;
+    return `-profiles=${hcIndex ? rp.headlessProfilesDir(hcIndex) : rp.profilesDir}`;
   }
 
   getProfile(): ServerProfile {
@@ -180,6 +204,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       rcon: this.rcon?.state ?? 'disconnected',
       players: this.playerCount,
       ...(this.lastError ? { lastError: this.lastError } : {}),
+      ...(this.unreachable ? { unreachable: true } : {}),
     };
   }
 
@@ -199,6 +224,14 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
 
   private appLog(line: string) {
     this.pushLog('app', [line]);
+  }
+
+  /** Aynı hata satırını dakikada en fazla bir kez logla (bağlantı koptuğunda log taşmasın) */
+  private appLogThrottled(line: string) {
+    const now = Date.now();
+    if (this.lastLoggedError.text === line && now - this.lastLoggedError.at < 60_000) return;
+    this.lastLoggedError = { text: line, at: now };
+    this.appLog(line);
   }
 
   private pushLog(source: string, lines: string[]) {
@@ -289,7 +322,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
           description: `Arma 3 - ${p.name} (OeziDev)`,
           executable: server.executable,
           args: server.args,
-          logFile: rp.stdoutLog,
+          identifier: this.unitName.replace(/\.service$/, ''),
           restart: p.supervisor.autoRestart ? 'on-failure' : 'no',
         }),
       );
@@ -302,10 +335,12 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
             name,
             generateSystemdUnit({
               ...common,
+              // HC'ler kendi başına sık sık yeniden bağlanabilir; sınırı daha geniş tut
+              startLimitBurst: Math.max(10, p.supervisor.maxRestartsPerHour * 2),
               description: `Arma 3 - ${p.name} headless ${i} (OeziDev)`,
               executable: hc.executable,
               args: hc.args,
-              logFile: rp.headlessStdoutLog(i),
+              identifier: name.replace(/\.service$/, ''),
               restart: 'always',
               partOf: this.unitName,
               startDelaySec: p.headless.startDelaySec,
@@ -314,6 +349,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
           written.push(sd.unitPath(name));
         } else if (await this.host.exists(sd.unitPath(name))) {
           await sd.action('stop', name).catch(() => undefined);
+          await sd.action('disable', name).catch(() => undefined);
           await sd.removeUnit(name);
         }
       }
@@ -326,11 +362,21 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
   /* ---------------- başlat / durdur ---------------- */
 
   start(): Promise<void> {
-    return this.exclusive(() => this.doStart());
+    return this.exclusive(async () => {
+      // Uygulama açılışında makineye ulaşılamadıysa, önce çalışan bir sunucu var mı bak (çift başlatma olmasın)
+      if (!this.attached) {
+        await this.attachInner();
+        if (this.status === 'running' || this.status === 'starting') return;
+      }
+      await this.doStart();
+    });
   }
 
   stop(): Promise<void> {
-    return this.exclusive(() => this.doStop('manual'));
+    return this.exclusive(async () => {
+      if (!this.attached) await this.attachInner().catch(() => undefined);
+      await this.doStop('manual');
+    });
   }
 
   restart(opts: { update?: boolean; reason?: string } = {}): Promise<void> {
@@ -343,7 +389,8 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
           await this.opts.updater(this.profile, (l) => this.appLog(l));
           await this.notify('update', 'Güncellendi', 'Sunucu ve modlar güncellendi.');
         } catch (err) {
-          this.notice('error', `Güncelleme başarısız: ${(err as Error).message}`, `Update failed: ${(err as Error).message}`);
+          // Güncelleme başarısız olsa bile sunucu kapalı kalmasın
+          this.notice('error', `Güncelleme başarısız, sunucu güncellenmeden başlatılıyor: ${(err as Error).message}`, `Update failed, starting without update: ${(err as Error).message}`);
         }
       }
       await this.doStart(true);
@@ -361,20 +408,27 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       throw new ValidationFailedError(issues);
     }
     this.setStatus('starting');
+    this.deadStreak = 0;
     try {
-      await this.rotateLogs();
       await this.deploy();
       const rp = this.paths;
       if (this.mode === 'systemd') {
         const sd = this.host.systemd!;
-        await sd.action('reset-failed', this.unitName).catch(() => undefined);
-        const hcUnits = Array.from({ length: this.profile.headless.count }, (_, i) => this.hcUnitName(i + 1));
+        await sd.action('reset-failed', this.unitName, ...this.hcUnits).catch(() => undefined);
         await sd.action('start', this.unitName);
-        if (hcUnits.length) await sd.action('start', ...hcUnits);
+        // Sunucu VPS yeniden başlarsa da açılsın
+        await sd.action('enable', this.unitName).catch((err) => this.appLog(`systemctl enable: ${(err as Error).message}`));
+        if (this.hcUnits.length) {
+          // HC'ler ExecStartPre ile bekler: kuyruğa al, bekleme
+          await sd.startNoBlock(...this.hcUnits).catch((err) =>
+            this.notice('warning', `Headless client'lar başlatılamadı: ${(err as Error).message}`, `Headless clients failed to start: ${(err as Error).message}`),
+          );
+        }
         const st = await sd.status(this.unitName);
         this.systemdRestarts = st.restarts;
         this.startedAt = st.startedAt || Date.now();
       } else {
+        await this.rotateLogs();
         const spec = buildServerLaunch(this.profile, this.host.os, rp);
         spec.warnings.forEach((w) => this.appLog(w));
         this.appLog(`Başlatılıyor: ${spec.executable} ${spec.args.map((a) => (/^-password=/i.test(a) ? '-password=***' : a)).join(' ')}`);
@@ -384,10 +438,11 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
           showWindow: this.profile.launch.showConsoleWindow,
         });
         this.startedAt = Date.now();
-        this.direct = { pid, startedAt: this.startedAt, executable: spec.executable, headless: [] };
+        this.direct = { pid, startedAt: this.startedAt, executable: spec.executable, marker: this.markerFor(), headless: [] };
         await this.saveState();
         this.scheduleHeadless();
       }
+      this.attached = true;
       this.startTails(false);
       this.startMonitor();
       this.runningTimer = setTimeout(() => {
@@ -442,34 +497,35 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
   }
 
   private async doStop(reason: string, partOfRestart = false): Promise<void> {
-    if (this.status === 'stopped' && !this.direct) return;
+    if (this.status === 'stopped' && !this.direct && this.mode === 'direct') return;
     this.setStatus(partOfRestart ? 'restarting' : 'stopping');
     this.stopMonitor();
     this.hcTimers.forEach(clearTimeout);
     this.hcTimers = [];
     if (this.runningTimer) clearTimeout(this.runningTimer);
 
-    // 1) Nazik kapatma: RCON #shutdown
+    // 1) Nazik kapatma: RCON #shutdown (Altis Life gibi görevler veriyi kaydedebilsin)
     const graceMs = this.profile.supervisor.gracefulShutdownSec * 1000;
     if (graceMs > 0 && this.rcon?.state === 'connected') {
       try {
         await this.rcon.shutdown();
         this.appLog('RCON ile #shutdown gönderildi');
-        await this.waitUntilStopped(graceMs);
       } catch {
-        /* RCON cevap vermedi: zorla kapatmaya geç */
+        this.appLog('#shutdown onayı gelmedi; yine de kapanması bekleniyor');
       }
+      // Onay gelmese bile komut sunucuya ulaşmış olabilir: süreyi bekle
+      await this.waitUntilStopped(graceMs).catch(() => undefined);
     }
     this.stopRcon();
 
     // 2) Süreci durdur
     if (this.mode === 'systemd') {
       const sd = this.host.systemd!;
-      const units = [this.unitName, ...Array.from({ length: this.profile.headless.count }, (_, i) => this.hcUnitName(i + 1))];
-      await sd.action('stop', ...units).catch((err) => this.appLog(`systemctl stop: ${(err as Error).message}`));
+      await sd.action('stop', this.unitName, ...this.hcUnits).catch((err) => this.appLog(`systemctl stop: ${(err as Error).message}`));
+      if (!partOfRestart) await sd.action('disable', this.unitName).catch(() => undefined);
     } else if (this.direct) {
-      for (const hc of this.direct.headless) await this.killAndWait(hc.pid);
-      await this.killAndWait(this.direct.pid);
+      for (const hc of this.direct.headless) await this.killAndWait(hc.pid, this.markerFor(hc.index));
+      await this.killAndWait(this.direct.pid, this.direct.marker);
       this.direct = null;
       await this.host.remove(this.paths.stateFile).catch(() => undefined);
     }
@@ -483,14 +539,19 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     }
   }
 
-  private async killAndWait(pid: number) {
+  /** PID gerçekten bu profilin süreci mi (komut satırı işaretiyle)? Sonra kapat. */
+  private async killAndWait(pid: number, marker?: string) {
     const exe = this.direct?.executable ?? this.paths.executable;
-    const alive = async () => processMatches(await this.host.processInfo(pid), exe);
-    if (!(await alive())) return;
+    const alive = async () => processMatches(await this.host.processInfo(pid, { commandLine: !!marker }), exe, marker);
+    try {
+      if (!(await alive())) return;
+    } catch {
+      return; // sorgulanamıyorsa yanlış süreci öldürme riskine girme
+    }
     await this.host.killProcess(pid).catch(() => undefined);
     const until = Date.now() + this.t.stopTimeoutMs;
     while (Date.now() < until) {
-      if (!(await alive())) return;
+      if (!(await alive().catch(() => true))) return;
       await sleep(300);
     }
     this.appLog(`PID ${pid} kapanmadı, zorla sonlandırılıyor`);
@@ -516,10 +577,22 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
   }
 
   /** Uygulama açıldığında zaten çalışan sunucuyu bul ve takip etmeye başla. */
-  async attach(): Promise<void> {
-    await this.host.connect();
+  attach(): Promise<void> {
+    return this.attachInner();
+  }
+
+  private async attachInner(): Promise<void> {
+    try {
+      await this.host.connect();
+    } catch (err) {
+      this.unreachable = true;
+      this.emitStatus();
+      throw err;
+    }
+    this.unreachable = false;
     if (this.mode === 'systemd') {
       const st = await this.host.systemd!.status(this.unitName);
+      this.attached = true;
       if (!st.exists || (st.activeState !== 'active' && st.activeState !== 'activating')) {
         this.setStatus('stopped');
         return;
@@ -529,15 +602,23 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       this.setStatus(st.activeState === 'active' ? 'running' : 'starting');
     } else {
       const state = await this.loadState();
-      if (!state || !processMatches(await this.host.processInfo(state.pid), state.executable)) {
-        if (state) await this.host.remove(this.paths.stateFile).catch(() => undefined);
+      if (!state) {
+        this.attached = true;
+        this.setStatus('stopped');
+        return;
+      }
+      const info = await this.host.processInfo(state.pid, { commandLine: !!state.marker });
+      this.attached = true;
+      if (!processMatches(info, state.executable, state.marker)) {
+        await this.host.remove(this.paths.stateFile).catch(() => undefined);
         this.setStatus('stopped');
         return;
       }
       this.direct = state;
       this.startedAt = state.startedAt;
       for (const hc of state.headless) {
-        this.hcAlive.set(hc.index, processMatches(await this.host.processInfo(hc.pid), state.executable));
+        const hi = await this.host.processInfo(hc.pid, { commandLine: true }).catch(() => ({ pid: hc.pid, alive: false }));
+        this.hcAlive.set(hc.index, processMatches(hi, state.executable, this.markerFor(hc.index)));
       }
       this.setStatus('running');
     }
@@ -553,8 +634,15 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
   }
 
   private async loadState(): Promise<DirectState | null> {
+    let text: string;
     try {
-      const raw = JSON.parse(await this.host.readText(this.paths.stateFile)) as DirectState;
+      text = await this.host.readText(this.paths.stateFile);
+    } catch (err) {
+      if (await this.host.exists(this.paths.stateFile)) throw err; // okuma hatası: "durdu" sanma
+      return null;
+    }
+    try {
+      const raw = JSON.parse(text) as DirectState;
       if (typeof raw.pid !== 'number' || typeof raw.executable !== 'string') return null;
       return { ...raw, headless: Array.isArray(raw.headless) ? raw.headless : [] };
     } catch {
@@ -578,10 +666,28 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     if (this.monitoring || this.disposed) return;
     this.monitoring = true;
     try {
+      // SSH koptuysa yeniden bağlan (SshHost.connect bağlıysa hiçbir şey yapmaz)
+      try {
+        await this.host.connect();
+        if (this.unreachable) {
+          this.unreachable = false;
+          this.appLog('Makineye yeniden bağlanıldı');
+          this.emitStatus();
+        }
+      } catch (err) {
+        if (!this.unreachable) {
+          this.unreachable = true;
+          this.emitStatus();
+        }
+        this.appLogThrottled(`Makineye ulaşılamıyor: ${(err as Error).message}`);
+        return;
+      }
+      // Bağlantı yenilendiyse log takibini de yenile
+      if (this.tails.length && this.host.generation !== this.tailsGeneration) this.startTails(false, true);
       if (this.mode === 'systemd') await this.monitorSystemd();
       else await this.monitorDirect();
     } catch (err) {
-      this.appLog(`İzleme hatası: ${(err as Error).message}`);
+      this.appLogThrottled(`İzleme hatası: ${(err as Error).message}`);
     } finally {
       this.monitoring = false;
     }
@@ -589,21 +695,43 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
 
   private async monitorDirect() {
     if (!this.direct || this.busy) return;
+    // processInfo hata fırlatırsa (sorgu başarısız) ölü sayılmaz; üst katman loglar.
     const alive = processMatches(await this.host.processInfo(this.direct.pid), this.direct.executable);
-    if (!alive && (this.status === 'running' || this.status === 'starting')) {
-      await this.handleCrash();
+    if (alive) {
+      this.deadStreak = 0;
+    } else if (this.status === 'running' || this.status === 'starting') {
+      // Tek bir okuma yetmez: art arda N kez yoksa çöktü say
+      this.deadStreak++;
+      if (this.deadStreak >= this.t.deadConfirmations) {
+        this.deadStreak = 0;
+        await this.handleCrash();
+      }
       return;
     }
     let changed = false;
     for (const hc of this.direct.headless) {
-      const hcAlive = processMatches(await this.host.processInfo(hc.pid), this.direct.executable);
+      let hcAlive: boolean;
+      try {
+        hcAlive = processMatches(await this.host.processInfo(hc.pid), this.direct.executable);
+      } catch {
+        continue;
+      }
       if (this.hcAlive.get(hc.index) !== hcAlive) {
         this.hcAlive.set(hc.index, hcAlive);
         changed = true;
       }
       if (!hcAlive && this.status === 'running' && this.profile.supervisor.autoRestart) {
-        this.appLog(`Headless client ${hc.index} kapanmış, yeniden başlatılıyor`);
-        await this.startHeadless(hc.index);
+        const now = Date.now();
+        const hist = (this.hcRestarts.get(hc.index) ?? []).filter((x) => now - x < 3600_000);
+        const last = hist[hist.length - 1] ?? 0;
+        if (hist.length < HC_MAX_RESTARTS_PER_HOUR && now - last > 15_000) {
+          hist.push(now);
+          this.hcRestarts.set(hc.index, hist);
+          this.appLog(`Headless client ${hc.index} kapanmış, yeniden başlatılıyor`);
+          await this.startHeadless(hc.index);
+        } else if (hist.length >= HC_MAX_RESTARTS_PER_HOUR) {
+          this.appLogThrottled(`Headless client ${hc.index} çok sık kapanıyor; otomatik yeniden başlatma durduruldu`);
+        }
       }
     }
     if (changed) this.emitStatus();
@@ -617,12 +745,12 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       this.autoRestarts += st.restarts - this.systemdRestarts;
       this.notice('warning', 'Sunucu çöktü, systemd yeniden başlattı', 'Server crashed and was restarted by systemd');
       void this.notify('crash', 'Sunucu çöktü', 'systemd otomatik olarak yeniden başlattı.');
-      this.startTails(false);
     }
     this.systemdRestarts = st.restarts;
     let changed = false;
     for (let i = 1; i <= this.profile.headless.count; i++) {
-      const hs = await sd.status(this.hcUnitName(i));
+      const hs = await sd.status(this.hcUnitName(i)).catch(() => null);
+      if (!hs) continue;
       const alive = hs.activeState === 'active';
       if (this.hcAlive.get(i) !== alive) {
         this.hcAlive.set(i, alive);
@@ -632,7 +760,10 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     const prev = this.status;
     if (st.activeState === 'active') {
       if (st.startedAt) this.startedAt = st.startedAt;
-      if (prev !== 'running' && prev !== 'starting') this.setStatus('running');
+      if (prev !== 'running' && prev !== 'starting') {
+        this.setStatus('running');
+        if (!this.rcon) this.startRcon(this.t.rconDelayMs);
+      }
     } else if (st.activeState === 'activating' && st.subState === 'auto-restart') {
       this.setStatus('restarting');
     } else if (st.activeState === 'failed') {
@@ -656,8 +787,8 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     this.restartHistory = this.restartHistory.filter((t) => now - t < 3600_000);
     const sup = this.profile.supervisor;
     this.notice('error', 'Sunucu beklenmedik şekilde kapandı (çöktü)', 'Server stopped unexpectedly (crashed)');
-    // headless client'ları da kapat
-    if (this.direct) for (const hc of this.direct.headless) await this.host.killProcess(hc.pid).catch(() => undefined);
+    // Headless client'ları da kapat (önce gerçekten bizim süreçlerimiz mi kontrol et)
+    if (this.direct) for (const hc of this.direct.headless) await this.killAndWait(hc.pid, this.markerFor(hc.index));
     this.hcAlive.clear();
     if (sup.autoRestart && this.restartHistory.length < sup.maxRestartsPerHour) {
       this.restartHistory.push(now);
@@ -691,17 +822,31 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     this.tails = [];
   }
 
-  private startTails(attaching: boolean) {
+  private startTails(attaching: boolean, resume = false) {
     this.stopTails();
+    this.tailsGeneration = this.host.generation;
     const rp = this.paths;
-    const initial = attaching ? 300 : 0;
+    const count = this.profile.headless.count;
+    if (this.mode === 'systemd') {
+      // journald: dosya yolu/dönüşüm sorunları yok
+      const since = Math.floor((this.startedAt || Date.now()) / 1000) - 2;
+      const follow = (unit: string, source: string, initial: number) => {
+        const base = ['-u', unit, '-f', '-o', 'cat', '--no-pager'];
+        const first = resume ? [...base, '-n', '0'] : attaching ? [...base, '-n', String(initial)] : [...base, '--since', `@${since}`];
+        this.tails.push(this.host.followCommand('journalctl', first, (lines) => this.pushLog(source, lines), { resumeArgs: [...base, '-n', '0'], privileged: true }));
+      };
+      follow(this.unitName, 'server', 300);
+      for (let i = 1; i <= count; i++) follow(this.hcUnitName(i), `hc${i}`, 50);
+      return;
+    }
     if (this.host.os === 'windows') {
-      void this.tailNewestRpt(rp.rptDir, 'server', attaching);
-      for (let i = 1; i <= this.profile.headless.count; i++) void this.tailNewestRpt(rp.headlessProfilesDir(i), `hc${i}`, attaching);
+      void this.tailNewestRpt(rp.rptDir, 'server', attaching || resume);
+      for (let i = 1; i <= count; i++) void this.tailNewestRpt(rp.headlessProfilesDir(i), `hc${i}`, attaching || resume);
     } else {
-      this.tails.push(this.host.tail(rp.stdoutLog, (lines) => this.pushLog('server', lines), { initialLines: initial, fromStart: !attaching }));
-      for (let i = 1; i <= this.profile.headless.count; i++) {
-        this.tails.push(this.host.tail(rp.headlessStdoutLog(i), (lines) => this.pushLog(`hc${i}`, lines), { initialLines: initial, fromStart: !attaching }));
+      const opts = resume ? { initialLines: 0 } : attaching ? { initialLines: 300 } : { fromStart: true };
+      this.tails.push(this.host.tail(rp.stdoutLog, (lines) => this.pushLog('server', lines), opts));
+      for (let i = 1; i <= count; i++) {
+        this.tails.push(this.host.tail(rp.headlessStdoutLog(i), (lines) => this.pushLog(`hc${i}`, lines), resume ? { initialLines: 0 } : attaching ? { initialLines: 50 } : { fromStart: true }));
       }
     }
   }
@@ -733,6 +878,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     this.rconTimer = setTimeout(() => {
       this.rconTimer = null;
       if (this.status !== 'running' && this.status !== 'starting') return;
+      if (this.rcon) return;
       const host = p.rcon.connectHost || this.opts.defaultRconHost || '127.0.0.1';
       const rcon = new BattlEyeRcon({ host, port: effectiveRconPort(p), password: p.rcon.password, reconnect: true, reconnectDelayMs: 10_000 });
       this.rcon = rcon;
@@ -741,7 +887,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
           this.appLog(`RCON bağlandı (${host}:${effectiveRconPort(p)})`);
           void this.refreshPlayers();
         }
-        if (s === 'disconnected' && reason && reason !== 'Kapatıldı') this.appLog(`RCON bağlantısı yok: ${reason}`);
+        if (s === 'disconnected' && reason && reason !== 'Kapatıldı') this.appLogThrottled(`RCON bağlantısı yok: ${reason}`);
         this.emitStatus();
       });
       rcon.on('message', (m) => this.emit('rconMessage', m));

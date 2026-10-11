@@ -229,6 +229,11 @@ export function ServerView({ id, tab, onTab, onNavigate }: { id: string; tab: Ta
         </div>
       </header>
 
+      {status?.unreachable && (
+        <div className="banner" data-level="error" style={{ margin: '12px 28px 0', maxWidth: 'none' }}>
+          {t('head.unreachable')}
+        </div>
+      )}
       <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
         {tab === 'console' ? (
           <div className="content flush">

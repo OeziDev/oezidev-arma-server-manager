@@ -57,6 +57,7 @@ export const tr = {
   'head.machine': 'Makine',
   'head.rcon': 'RCON',
   'head.nextRestart': 'Sonraki restart',
+  'head.unreachable': 'Makineye ulaşılamıyor. Bağlantı geri gelince takip otomatik devam eder; bu sırada başlat/durdur işlemleri yapılamaz.',
   'action.start': 'Başlat',
   'action.stop': 'Durdur',
   'action.restart': 'Yeniden başlat',

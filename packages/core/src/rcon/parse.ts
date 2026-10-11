@@ -13,7 +13,7 @@ export interface RconPlayer {
   inLobby: boolean;
 }
 
-const PLAYER_RE = /^(\d+)\s+(\S+):(\d+)\s+(-?\d+)\s+([0-9a-fA-F]{32}|-)(?:\((\w+)\))?\s+(.*?)\s*$/;
+const PLAYER_RE = /^(\d+)\s+(\S+):(\d+)\s+(-?\d+)\s+([0-9a-fA-F]{32}|-)(?:\(([^)]*)\))?\s+(.*?)\s*$/;
 
 export function parsePlayers(text: string): RconPlayer[] {
   const out: RconPlayer[] = [];

@@ -11,7 +11,8 @@ import {
   splitArgs,
   validateProfile,
 } from '../src/index.js';
-import { generateSystemdUnit } from '../src/host/systemd.js';
+import { generateSystemdUnit, parseSystemdShow } from '../src/host/systemd.js';
+import { processMatches } from '../src/host/types.js';
 
 describe('yollar', () => {
   it('Windows ve Linux için doğru dosya yolları', () => {
@@ -53,6 +54,7 @@ describe('komut satırı', () => {
       '-cfg=/srv/arma3/p/basic.cfg',
       '-profiles=/srv/arma3/p',
       '-name=server',
+      '-bepath=/srv/arma3/p/BattlEye',
       '-mod=@cba_a3;@acre2',
       '-serverMod=@extdb3;@life_server',
       '-loadMissionToMemory',
@@ -115,18 +117,39 @@ describe('systemd unit', () => {
   it('ExecStart argümanlarını güvenli tırnaklar, restart sınırlarını yazar', () => {
     const unit = generateSystemdUnit({
       description: 'Arma 3 - Altis',
-      executable: '/srv/arma3/arma3server_x64',
-      args: ['-port=2302', '-mod=@cba_a3;@ace', '-config=/srv/arma3/p/server.cfg'],
-      workingDirectory: '/srv/arma3',
-      logFile: '/srv/arma3/p/server-stdout.log',
+      executable: '/srv/Arma 3 Server/arma3server_x64',
+      args: ['-port=2302', '-mod=@cba_a3;@ace', '-config=/srv/Arma 3 Server/p/server.cfg'],
+      workingDirectory: '/srv/Arma 3 Server/100%',
       restart: 'on-failure',
       restartSec: 10,
       startLimitBurst: 5,
     });
-    expect(unit).toContain('ExecStart=/srv/arma3/arma3server_x64 -port=2302 "-mod=@cba_a3;@ace" -config=/srv/arma3/p/server.cfg');
+    expect(unit).toContain('ExecStart="/srv/Arma 3 Server/arma3server_x64" -port=2302 "-mod=@cba_a3;@ace" "-config=/srv/Arma 3 Server/p/server.cfg"');
+    // WorkingDirectory tırnaklanmaz (systemd tırnağı kaldırmaz), sadece % kaçırılır
+    expect(unit).toContain('WorkingDirectory=/srv/Arma 3 Server/100%%');
     expect(unit).toContain('Restart=on-failure');
     expect(unit).toContain('StartLimitBurst=5');
-    expect(unit).toContain('StandardOutput=append:/srv/arma3/p/server-stdout.log');
+    expect(unit).toContain('StandardOutput=journal');
+    expect(unit).not.toContain('TimeoutStartSec');
+  });
+
+  it('headless gecikmesi başlangıç zaman aşımını uzatır', () => {
+    const unit = generateSystemdUnit({ description: 'hc', executable: '/a/b', args: [], workingDirectory: '/a', restart: 'always', restartSec: 5, startLimitBurst: 10, startDelaySec: 300 });
+    expect(unit).toContain('ExecStartPre=/bin/sleep 300');
+    expect(unit).toContain('TimeoutStartSec=420');
+  });
+
+  it('systemctl show çıktısı (systemd 249 uyumlu, --timestamp yok)', () => {
+    const st = parseSystemdShow('LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nNRestarts=2\nActiveEnterTimestampMonotonic=1000000000\n__UPTIME=1600.00\n', 2_000_000);
+    expect(st).toEqual({ exists: true, activeState: 'active', subState: 'running', mainPid: 4242, restarts: 2, startedAt: 2_000_000 - 600_000 });
+    expect(parseSystemdShow('LoadState=not-found\nActiveState=inactive\n').exists).toBe(false);
+  });
+
+  it('süreç eşleşmesi: aynı exe ile çalışan başka profilin süreci eşleşmez', () => {
+    const info = { pid: 1, alive: true, image: 'arma3server_x64', commandLine: '/srv/a/arma3server_x64 -port=2312 -profiles=/srv/a/oezi-profiles/b' };
+    expect(processMatches(info, '/srv/a/arma3server_x64', '-profiles=/srv/a/oezi-profiles/a')).toBe(false);
+    expect(processMatches(info, '/srv/a/arma3server_x64', '-profiles=/srv/a/oezi-profiles/b')).toBe(true);
+    expect(processMatches({ ...info, image: 'bash' }, '/srv/a/arma3server_x64')).toBe(false);
   });
 });
 

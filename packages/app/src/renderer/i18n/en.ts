@@ -55,6 +55,7 @@ export const en: Dict = {
   'head.machine': 'Machine',
   'head.rcon': 'RCON',
   'head.nextRestart': 'Next restart',
+  'head.unreachable': 'The machine is unreachable. Monitoring resumes automatically when the connection returns; start/stop is unavailable until then.',
   'action.start': 'Start',
   'action.stop': 'Stop',
   'action.restart': 'Restart',

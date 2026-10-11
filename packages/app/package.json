@@ -28,5 +28,88 @@
     "react-dom": "^19.3.0",
     "vite": "^8.3.4",
     "@oezi/arma-core": "^1.0.0"
+  },
+  "build": {
+    "appId": "dev.oezi.armamanager",
+    "productName": "OeziDev Arma Server Manager",
+    "copyright": "Copyright © 2026 OeziDev",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "!dist/**/*.map",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/icon.ico",
+        "to": "icon.ico"
+      },
+      {
+        "from": "build/icon.png",
+        "to": "icon.png"
+      },
+      {
+        "from": "build/tray.png",
+        "to": "tray.png"
+      },
+      {
+        "from": "build/tray@2x.png",
+        "to": "tray@2x.png"
+      }
+    ],
+    "asar": true,
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "executableName": "OeziArmaManager"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Arma Server Manager",
+      "artifactName": "OeziDev-Arma-Server-Manager-Setup-${version}.${ext}",
+      "installerLanguages": [
+        "tr_TR",
+        "en_US"
+      ],
+      "multiLanguageInstaller": true,
+      "uninstallDisplayName": "OeziDev Arma Server Manager"
+    },
+    "portable": {
+      "artifactName": "OeziDev-Arma-Server-Manager-${version}-portable.${ext}"
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "category": "Utility",
+      "icon": "build/icon.png",
+      "executableName": "oezi-arma-manager",
+      "artifactName": "OeziDev-Arma-Server-Manager-${version}.${ext}"
+    }
   }
 }

@@ -130,6 +130,10 @@ describe('RCON çıktı ayrıştırıcıları', () => {
       { id: 2, kind: 'ip', value: '1.2.3.4', minutesLeft: -1, reason: 'Spam' },
     ]);
   });
+  it('GUID henüz doğrulanmamış (?) oyuncu da listelenir', () => {
+    const p = parsePlayers('5   1.1.1.1:2304   0   0123456789abcdef0123456789abcdef(?) Yeni Oyuncu (Lobby)');
+    expect(p[0]).toMatchObject({ id: 5, verified: false, name: 'Yeni Oyuncu', inLobby: true });
+  });
   it('oyuncu adı parantez içerse bile', () => {
     const p = parsePlayers('3   1.1.1.1:2304   50   0123456789abcdef0123456789abcdef(OK) [TR] Ali (Medic) (Lobby)');
     expect(p[0]).toMatchObject({ name: '[TR] Ali (Medic)', inLobby: true });

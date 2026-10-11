@@ -3,6 +3,7 @@ import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 import type { HostOs } from '../launch/paths.js';
 import {
   type DetachedOptions,
@@ -19,6 +20,7 @@ import {
   type TailOptions,
 } from './types.js';
 import { createSystemdApi } from './systemd.js';
+import { followWithRestart } from './follow.js';
 
 const isWin = process.platform === 'win32';
 
@@ -29,6 +31,7 @@ export class LocalHost implements Host {
   readonly label: string;
   readonly os: HostOs = isWin ? 'windows' : 'linux';
   readonly systemd?: SystemdApi;
+  readonly generation = 1;
 
   constructor(opts: { label?: string; enableSystemd?: boolean } = {}) {
     this.label = opts.label ?? 'Bu bilgisayar';
@@ -54,11 +57,20 @@ export class LocalHost implements Host {
     await fsp.mkdir(path.dirname(p), { recursive: true });
     const tmp = `${p}.${randomBytes(4).toString('hex')}.tmp`;
     await fsp.writeFile(tmp, data);
-    try {
-      await fsp.rename(tmp, p);
-    } catch (err) {
-      await fsp.rm(tmp, { force: true });
-      throw err;
+    // Windows'ta antivirüs geçici dosyayı tararken rename EPERM/EBUSY verebilir: birkaç kez dene
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await fsp.rename(tmp, p);
+        return;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (attempt < 8 && (code === 'EPERM' || code === 'EBUSY' || code === 'EACCES')) {
+          await new Promise((r) => setTimeout(r, 100 * (attempt + 1)));
+          continue;
+        }
+        await fsp.rm(tmp, { force: true });
+        throw err;
+      }
     }
   }
 
@@ -207,7 +219,8 @@ export class LocalHost implements Host {
       child.on('close', (code) => resolve(code));
     });
     child.stdin.on('error', () => undefined);
-    if (opts.input !== undefined) child.stdin.write(opts.input);
+    if (opts.closeStdin) child.stdin.end(opts.input ?? '');
+    else if (opts.input !== undefined) child.stdin.write(opts.input);
     return {
       pid: Promise.resolve(child.pid),
       onData: (cb) => listeners.push(cb),
@@ -244,27 +257,43 @@ export class LocalHost implements Host {
     }
   }
 
-  async processInfo(pid: number): Promise<ProcessInfo> {
+  async processInfo(pid: number, opts: { commandLine?: boolean } = {}): Promise<ProcessInfo> {
     if (!pid || pid <= 0) return { pid, alive: false };
     if (isWin) {
-      const res = await this.exec('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH']);
+      const res = await this.exec('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { timeoutMs: 15000 });
+      if (res.code !== 0) throw new HostError(`Süreç sorgulanamadı (tasklist): ${res.stderr.trim()}`, 'query_failed');
       const line = res.stdout.split(/\r?\n/).find((l) => l.startsWith('"'));
       if (!line) return { pid, alive: false };
       const image = line.split('","')[0]?.replace(/^"/, '').toLowerCase();
-      return { pid, alive: true, ...(image ? { image } : {}) };
+      let commandLine: string | undefined;
+      if (opts.commandLine) {
+        const ps = await this.exec(
+          'powershell',
+          ['-NoProfile', '-NonInteractive', '-Command', `(Get-CimInstance Win32_Process -Filter "ProcessId=${Math.trunc(pid)}").CommandLine`],
+          { timeoutMs: 20000 },
+        );
+        if (ps.code === 0) commandLine = ps.stdout.trim();
+      }
+      return { pid, alive: true, ...(image ? { image } : {}), ...(commandLine !== undefined ? { commandLine } : {}) };
     }
+    let stat: string;
     try {
-      const stat = await fsp.readFile(`/proc/${pid}/stat`, 'utf8');
-      // "pid (comm) S ..." - comm parantez içinde, boşluk içerebilir
-      const close = stat.lastIndexOf(')');
-      const state = stat.slice(close + 2, close + 3);
-      if (state === 'Z' || state === 'X') return { pid, alive: false };
-      const exe = await fsp.readlink(`/proc/${pid}/exe`).catch(() => '');
-      const comm = stat.slice(stat.indexOf('(') + 1, close);
-      return { pid, alive: true, image: (exe ? path.basename(exe) : comm).toLowerCase(), comm: comm.toLowerCase() };
-    } catch {
-      return { pid, alive: false };
+      stat = await fsp.readFile(`/proc/${pid}/stat`, 'utf8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT' || (err as NodeJS.ErrnoException).code === 'ESRCH') return { pid, alive: false };
+      throw new HostError(`Süreç sorgulanamadı: ${(err as Error).message}`, 'query_failed');
     }
+    // "pid (comm) S ..." - comm parantez içinde, boşluk içerebilir
+    const close = stat.lastIndexOf(')');
+    const state = stat.slice(close + 2, close + 3);
+    if (state === 'Z' || state === 'X') return { pid, alive: false };
+    const exe = await fsp.readlink(`/proc/${pid}/exe`).catch(() => '');
+    const comm = stat.slice(stat.indexOf('(') + 1, close);
+    let commandLine: string | undefined;
+    if (opts.commandLine) {
+      commandLine = (await fsp.readFile(`/proc/${pid}/cmdline`, 'utf8').catch(() => '')).split('\0').join(' ').trim();
+    }
+    return { pid, alive: true, image: (exe ? path.basename(exe) : comm).toLowerCase(), comm: comm.toLowerCase(), ...(commandLine !== undefined ? { commandLine } : {}) };
   }
 
   async killProcess(pid: number, opts: { force?: boolean } = {}): Promise<void> {
@@ -286,19 +315,25 @@ export class LocalHost implements Host {
     }
   }
 
+  followCommand(file: string, args: string[], onLines: (lines: string[]) => void, opts: { resumeArgs?: string[] } = {}): TailHandle {
+    return followWithRestart((a) => this.spawn(file, a), args, opts.resumeArgs ?? args, onLines);
+  }
+
   tail(p: string, onLines: (lines: string[]) => void, opts: TailOptions = {}): TailHandle {
     let stopped = false;
     let offset = -1;
     const splitter = new LineSplitter();
     let timer: NodeJS.Timeout | undefined;
 
+    // Çok baytlı UTF-8 karakterler (ğ, ş...) okuma sınırında bölünmesin
+    let decoder = new StringDecoder('utf8');
     const readRange = async (start: number, end: number): Promise<string> => {
       const fh = await fsp.open(p, 'r');
       try {
         const len = end - start;
         const buf = Buffer.alloc(len);
         await fh.read(buf, 0, len, start);
-        return buf.toString('utf8');
+        return decoder.write(buf);
       } finally {
         await fh.close();
       }
@@ -329,6 +364,7 @@ export class LocalHost implements Host {
             offset = st.size;
           } else if (st.size < offset) {
             offset = 0; // dosya kesildi/yeniden oluşturuldu
+            decoder = new StringDecoder('utf8');
           } else if (st.size > offset) {
             const end = Math.min(st.size, offset + 4 * 1024 * 1024);
             const text = await readRange(offset, end);

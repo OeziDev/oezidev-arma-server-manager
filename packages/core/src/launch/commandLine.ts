@@ -78,6 +78,8 @@ export function buildServerLaunch(profile: ServerProfile, os: HostOs, paths?: Re
     `-name=${profile.paths.profileName}`,
   ];
   if (profile.network.bindIp.trim()) args.push(`-ip=${profile.network.bindIp.trim()}`);
+  // BattlEye klasörünü açıkça ver: Linux'ta büyük/küçük harf belirsizliği kalmasın, cfg'yi yazdığımız yerden okusun
+  if (profile.security.battlEye) args.push(`-bepath=${rp.beDir}`);
   const mods = modListArg(l.mods);
   if (mods) args.push(`-mod=${mods}`);
   const serverMods = modListArg(l.serverMods);

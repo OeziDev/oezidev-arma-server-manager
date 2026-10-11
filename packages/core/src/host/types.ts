@@ -20,6 +20,8 @@ export interface ExecOptions {
   timeoutMs?: number;
   /** stdin'e yazılacak veri */
   input?: string;
+  /** Girdi yazıldıktan sonra stdin kapatılsın (istem bekleyen programlar EOF alıp çıksın) */
+  closeStdin?: boolean;
 }
 
 export interface StreamingProcess {
@@ -48,14 +50,19 @@ export interface ProcessInfo {
   image?: string;
   /** Linux süreç adı (en fazla 15 karakter; betiklerde betik adı) */
   comm?: string;
+  /** Tam komut satırı (istenirse) */
+  commandLine?: string;
 }
 
 /** PID'deki süreç bizim başlattığımız çalıştırılabilir dosya mı? (PID yeniden kullanımına karşı) */
-export function processMatches(info: ProcessInfo, executablePath: string): boolean {
+export function processMatches(info: ProcessInfo, executablePath: string, marker?: string): boolean {
   if (!info.alive) return false;
   const base = executablePath.split(/[\\/]/).pop()!.toLowerCase();
-  if (!info.image && !info.comm) return true;
-  return info.image === base || (info.comm !== undefined && info.comm === base.slice(0, 15));
+  const nameOk = (!info.image && !info.comm) || info.image === base || (info.comm !== undefined && info.comm === base.slice(0, 15));
+  if (!nameOk) return false;
+  // Aynı makinede birden fazla sunucu aynı exe ile çalışır: komut satırındaki işaret (ör. -profiles=...) ayırt eder
+  if (marker && info.commandLine !== undefined) return info.commandLine.includes(marker);
+  return true;
 }
 
 export interface TailHandle {
@@ -85,6 +92,8 @@ export interface SystemdApi {
   removeUnit(name: string): Promise<void>;
   daemonReload(): Promise<void>;
   action(action: 'start' | 'stop' | 'restart' | 'enable' | 'disable' | 'reset-failed', ...units: string[]): Promise<void>;
+  /** Başlatmayı beklemeden kuyruğa al (ExecStartPre gecikmesi olan servisler için) */
+  startNoBlock(...units: string[]): Promise<void>;
   status(name: string): Promise<SystemdStatus>;
 }
 
@@ -123,12 +132,20 @@ export interface Host {
   exec(file: string, args: string[], opts?: ExecOptions): Promise<ExecResult>;
   spawn(file: string, args: string[], opts?: ExecOptions): StreamingProcess;
   startDetached(file: string, args: string[], opts: DetachedOptions): Promise<number>;
-  processInfo(pid: number): Promise<ProcessInfo>;
+  /** Süreç yoksa alive:false döner; sorgunun kendisi başarısız olursa hata fırlatır. */
+  processInfo(pid: number, opts?: { commandLine?: boolean }): Promise<ProcessInfo>;
   killProcess(pid: number, opts?: { force?: boolean }): Promise<void>;
   tail(path: string, onLines: (lines: string[]) => void, opts?: TailOptions): TailHandle;
+  /**
+   * Uzun süren bir komutun (journalctl -f gibi) stdout satırlarını takip eder.
+   * Komut beklenmedik şekilde biterse (bağlantı koptu vb.) `resumeArgs` ile yeniden başlatılır.
+   */
+  followCommand(file: string, args: string[], onLines: (lines: string[]) => void, opts?: { resumeArgs?: string[]; privileged?: boolean }): TailHandle;
 
   /** Linux'ta systemd varsa (ve yetki yeterliyse) */
   readonly systemd?: SystemdApi;
+  /** Her başarılı (yeniden) bağlantıda artar; uzun süreli akışların yenilenmesi için */
+  readonly generation: number;
 }
 
 export class HostError extends Error {

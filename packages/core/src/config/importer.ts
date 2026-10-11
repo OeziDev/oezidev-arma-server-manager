@@ -28,7 +28,7 @@ const KNOWN_SERVER_KEYS = new Set(
     'filePatchingExceptions', 'requiredBuild', 'allowedLoadFileExtensions', 'allowedPreprocessFileExtensions',
     'allowedHTMLLoadExtensions', 'allowedHTMLLoadURIs', 'onUnsignedData', 'onHackedData', 'onDifferentData',
     'doubleIdDetected', 'onUserConnected', 'onUserDisconnected', 'onUserKicked', 'kickTimeout',
-    'voteMissionPlayers', 'voteThreshold', 'allowedVoteCmds', 'disableVoN', 'vonCodec', 'vonCodecQuality',
+    'voteMissionPlayers', 'voteThreshold', 'disableVoN', 'vonCodec', 'vonCodecQuality',
     'maxPing', 'maxPacketLoss', 'maxDesync', 'disconnectTimeout', 'kickClientsOnSlowNetwork', 'upnp',
     'loopback', 'steamProtocolMaxDataSize', 'headlessClients', 'localClient', 'autoSelectMission',
     'randomMissionOrder', 'forcedDifficulty', 'missionWhitelist', 'Missions', 'AdvancedOptions',
@@ -184,7 +184,11 @@ export function importServerCfg(text: string, base?: ServerProfile): ImportResul
     setIf(advanced, 'queueSizeLogG', asNumber(findValue(adv.entries, 'queueSizeLogG')));
   }
   const unknown: CfgEntry[] = entries.filter(
-    (en) => (en.kind === 'value' || en.kind === 'class') && !KNOWN_SERVER_KEYS.has(en.name.toLowerCase()),
+    (en) =>
+      (en.kind === 'value' || en.kind === 'class') &&
+      !KNOWN_SERVER_KEYS.has(en.name.toLowerCase()) &&
+      // Boş allowedVoteCmds "oylama kapalı" demek (modelde var); dolu liste ise ek satır olarak korunur
+      !(en.kind === 'value' && en.name.toLowerCase() === 'allowedvotecmds' && Array.isArray(en.value) && en.value.length === 0),
   );
   if (unknown.length) {
     const prev = String(advanced.extraServerCfg ?? '').trim();

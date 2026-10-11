@@ -2,7 +2,7 @@ import { app, BrowserWindow, Menu, nativeImage, session, shell, Tray } from 'ele
 import path from 'node:path';
 import type { AppEvent, AppSettings } from '../shared/api.js';
 import { EVENT_CHANNEL } from '../shared/api.js';
-import { registerIpc } from './ipc.js';
+import { EXTERNAL_ALLOW, registerIpc } from './ipc.js';
 import { AppServices } from './services.js';
 import { Store } from './store.js';
 
@@ -51,14 +51,17 @@ function createWindow() {
   });
   win.once('ready-to-show', () => win?.show());
 
-  // Harici bağlantılar uygulama içinde açılmaz
+  // Harici bağlantılar uygulama içinde açılmaz; sadece izinli adresler tarayıcıda açılır
   win.webContents.setWindowOpenHandler(({ url }) => {
-    if (/^https:\/\//.test(url)) void shell.openExternal(url);
+    if (EXTERNAL_ALLOW.some((re) => re.test(url))) void shell.openExternal(url);
     return { action: 'deny' };
   });
+  // Uygulama tek sayfa: hiçbir gezinmeye izin verme (pencereye sürüklenen dosyalar dahil)
   win.webContents.on('will-navigate', (e, url) => {
-    if (!url.startsWith('file://') && !url.startsWith(process.env.VITE_DEV_SERVER_URL ?? '\0')) e.preventDefault();
+    const dev = process.env.VITE_DEV_SERVER_URL;
+    if (!(dev && url.startsWith(dev))) e.preventDefault();
   });
+  win.webContents.on('will-redirect', (e) => e.preventDefault());
 
   win.on('close', (e) => {
     if (!quitting && settings?.minimizeToTray && tray) {
