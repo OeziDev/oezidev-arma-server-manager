@@ -148,7 +148,14 @@ export class LocalHost implements Host {
       if (current === null) throw new HostError(`${linkPath} zaten var ve bir bağlantı değil`, 'exists');
       await this.remove(linkPath);
     }
-    await fsp.symlink(target, linkPath, isWin ? 'junction' : 'dir');
+    try {
+      await fsp.symlink(target, linkPath, isWin ? 'junction' : 'dir');
+    } catch (err) {
+      throw new HostError(
+        `Klasör bağlantısı oluşturulamadı (${linkPath} -> ${target}): ${(err as Error).message}. Sunucu ve Workshop klasörü NTFS bir diskte olmalı.`,
+        'link_failed',
+      );
+    }
   }
 
   async readLink(p: string): Promise<string | null> {
@@ -262,7 +269,8 @@ export class LocalHost implements Host {
     if (isWin) {
       const res = await this.exec('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { timeoutMs: 15000 });
       if (res.code !== 0) throw new HostError(`Süreç sorgulanamadı (tasklist): ${res.stderr.trim()}`, 'query_failed');
-      const line = res.stdout.split(/\r?\n/).find((l) => l.startsWith('"'));
+      // Bazı ortamlarda tasklist UTF-16 yazar: NUL karakterlerini at
+      const line = res.stdout.replace(/\u0000/g, '').split(/\r?\n/).find((l) => l.startsWith('"'));
       if (!line) return { pid, alive: false };
       const image = line.split('","')[0]?.replace(/^"/, '').toLowerCase();
       let commandLine: string | undefined;
@@ -272,7 +280,9 @@ export class LocalHost implements Host {
           ['-NoProfile', '-NonInteractive', '-Command', `(Get-CimInstance Win32_Process -Filter "ProcessId=${Math.trunc(pid)}").CommandLine`],
           { timeoutMs: 20000 },
         );
-        if (ps.code === 0) commandLine = ps.stdout.trim();
+        // PowerShell yoksa/başarısızsa komut satırı bilinmiyor say (boş string "başka süreç" anlamına gelmesin)
+        const out = ps.stdout.replace(/\u0000/g, '').trim();
+        if (ps.code === 0 && out) commandLine = out;
       }
       return { pid, alive: true, ...(image ? { image } : {}), ...(commandLine !== undefined ? { commandLine } : {}) };
     }
