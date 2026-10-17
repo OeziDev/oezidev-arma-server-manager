@@ -1,6 +1,6 @@
 /**
  * Arayüz hareketleri: tercih (localStorage), <html> sınıfı ve küçük yardımcı bileşenler.
- * Tüm CSS hareketleri `prefers-reduced-motion: no-preference` ve `:root:not(.no-motion)` altında tanımlı;
+ * Tüm CSS hareketleri `:root:not(.no-motion)` altında tanımlı;
  * buradaki JS tarafı (yazı efekti, sayaç, açılış ekranı) aynı koşula `motionOn()` ile bakar.
  */
 import { useEffect, useRef, useState } from 'react';
@@ -28,17 +28,10 @@ export function applyMotionClass(on = getMotionPref()): void {
   document.documentElement.classList.toggle('no-motion', !on);
 }
 
-function osReducedMotion(): boolean {
-  try {
-    return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  } catch {
-    return false;
-  }
-}
-
 /** Hareket açık mı (kullanıcı ayarı + işletim sistemi "hareketi azalt") */
 export function motionOn(): boolean {
-  return !document.documentElement.classList.contains('no-motion') && !osReducedMotion();
+  // Windows Server / Uzak Masaüstü'nde işletim sistemi "animasyon kapalı" bildirir; karar Ayarlar'daki düğmenindir.
+  return !document.documentElement.classList.contains('no-motion');
 }
 
 /** Değer her değiştiğinde artan sayaç (ilk değerde 0). key={n} ile CSS animasyonunu yeniden başlatmak için. */

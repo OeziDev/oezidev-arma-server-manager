@@ -833,7 +833,7 @@ export const en: Dict = {
 
   // animations
   'set.motion': 'Animations',
-  'help.set.motion': 'Transitions, the start screen and highlight effects. Always off when "reduce motion" is enabled in your operating system.',
+  'help.set.motion': 'Transitions, the start screen and highlight effects.',
   'splash.boot': 'Starting systems…',
   'splash.scan': 'Scanning servers…',
   'splash.ready': 'Ready',

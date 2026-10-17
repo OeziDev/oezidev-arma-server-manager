@@ -58,9 +58,7 @@ a { color: var(--info); }
 ::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 5px; border: 2px solid var(--bg); }
 ::-webkit-scrollbar-track { background: transparent; }
 
-@media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { animation: none !important; transition: none !important; }
-}
+:root.no-motion *, :root.no-motion *::before, :root.no-motion *::after { animation: none !important; transition: none !important; }
 
 /* ---------------- Yerleşim ---------------- */
 .shell { display: grid; grid-template-columns: var(--sidebar-w) 1fr; height: 100%; }
@@ -449,7 +447,7 @@ a { color: var(--info); }
 /* =====================================================================
  * Hareket ve HUD efektleri
  * Durağan görünüm (parıltı, nişangâh köşeleri, gösterge) her zaman; hareketin kendisi sadece
- * `prefers-reduced-motion: no-preference` ve <html> üzerinde `.no-motion` yokken (Ayarlar > Animasyonlar).
+ * <html> üzerinde `.no-motion` yokken (Ayarlar > Animasyonlar).
  * Konsol satırları, tablo satırları ve uzun listeler tek tek canlandırılmaz.
  * ===================================================================== */
 
@@ -550,7 +548,7 @@ a { color: var(--info); }
 .splash-line .tag.wait { color: var(--warn); }
 .splash-skip { position: absolute; bottom: 26px; left: 0; right: 0; text-align: center; font: 500 12.5px var(--font-cond); color: var(--text-3); }
 
-@media (prefers-reduced-motion: no-preference) {
+/* Hareketler: Ayarlar > Animasyonlar belirler (Windows "animasyonları azalt" ayarı Windows Server/RDP'de varsayılan kapalı olduğu için dikkate alınmaz) */
   /* -- içerik girişi: sekme / görünüm / sunucu değişiminde yeniden bağlanan .content'in çocukları -- */
   :root:not(.no-motion) .content > *,
   :root:not(.no-motion) .welcome > *,
@@ -638,7 +636,7 @@ a { color: var(--info); }
     animation: oz-glint 950ms linear infinite;
   }
   :root:not(.no-motion) .splash-line { opacity: 0; animation: oz-type 240ms ease-out forwards; animation-delay: var(--d, 0ms); }
-}
+
 
 @keyframes oz-rise { from { opacity: 0; transform: translateY(10px); } }
 @keyframes oz-fade { from { opacity: 0; } }

@@ -850,7 +850,7 @@ export const tr = {
 
   // animasyonlar
   'set.motion': 'Animasyonlar',
-  'help.set.motion': 'Geçişler, açılış ekranı ve vurgu efektleri. İşletim sisteminde "hareketi azalt" açıksa her durumda kapalıdır.',
+  'help.set.motion': 'Geçişler, açılış ekranı ve vurgu efektleri.',
   'splash.boot': 'Sistemler başlatılıyor…',
   'splash.scan': 'Sunucular taranıyor…',
   'splash.ready': 'Hazır',
