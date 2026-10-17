@@ -24,12 +24,14 @@ const api = {
   app: area('app', ['info', 'getSettings', 'saveSettings', 'openExternal', 'pickFile', 'pickFolder', 'saveFile', 'readPickedFile', 'copyText', 'setDirty', 'updateState', 'checkForUpdates', 'installUpdate']),
   hosts: area('hosts', ['list', 'save', 'remove', 'test', 'browse']),
   profiles: area('profiles', ['list', 'get', 'create', 'save', 'remove', 'duplicate', 'validate', 'preview', 'importServerCfg', 'importArma3Profile', 'exportJson', 'importJson']),
-  server: area('server', ['start', 'stop', 'restart', 'deploy', 'status', 'logs']),
+  server: area('server', ['start', 'stop', 'restart', 'deploy', 'status', 'logs', 'metrics']),
+  backup: area('backup', ['run', 'list', 'delete', 'openFolder', 'next']),
+  history: area('history', ['search', 'sessions', 'setNote', 'stats']),
   missions: area('missions', ['scan', 'upload']),
   mods: area('mods', ['scan']),
-  rcon: area('rcon', ['command', 'players', 'bans', 'say', 'kick', 'ban', 'addBan', 'removeBan', 'setLock', 'reconnect']),
+  rcon: area('rcon', ['command', 'players', 'bans', 'say', 'kick', 'ban', 'addBan', 'removeBan', 'setLock', 'reconnect', 'banEverywhere']),
   steam: area('steam', ['updateServer', 'syncWorkshop', 'workshopInfo', 'collection', 'parsePreset', 'installSteamCmd', 'fixSteamClient', 'answerGuard', 'cancel', 'jobs']),
-  notify: area('notify', ['test']),
+  notify: area('notify', ['test', 'refreshStatus']),
   onEvent(cb: (e: AppEvent) => void) {
     const listener = (_: unknown, e: AppEvent) => cb(e);
     ipcRenderer.on(EVENT_CHANNEL, listener);

@@ -3,6 +3,11 @@
  * Node/Electron API'lerine doğrudan erişimi yoktur (sandbox + contextIsolation).
  */
 import type {
+  BackupFileInfo,
+  MetricSample,
+  PlayerHistoryStats,
+  PlayerSession,
+  PlayerSummary,
   DirEntry,
   FoundMission,
   FoundMod,
@@ -19,6 +24,11 @@ import type {
 } from '@oezi/arma-core';
 
 export type {
+  BackupFileInfo,
+  MetricSample,
+  PlayerHistoryStats,
+  PlayerSession,
+  PlayerSummary,
   DirEntry,
   FoundMission,
   FoundMod,
@@ -156,6 +166,10 @@ export type AppEvent =
   | { type: 'profiles-changed' }
   | { type: 'hosts-changed' }
   | { type: 'settings-changed'; settings: AppSettings }
+  /** Performans örneği (her monitoring.sampleSec'te) */
+  | { type: 'metrics'; profileId: string; sample: MetricSample }
+  /** Oyuncu geçmişi değişti (giriş/çıkış/not) */
+  | { type: 'history-changed'; profileId: string }
   | { type: 'update'; update: UpdateState };
 
 export interface OeziApi {
@@ -207,6 +221,24 @@ export interface OeziApi {
     deploy(id: string): Promise<string[]>;
     status(id: string): Promise<StatusInfo>;
     logs(id: string): Promise<LogLine[]>;
+    /** Son 24 saate kadar performans örnekleri (sinceMs: epoch ms; yoksa hepsi) */
+    metrics(id: string, sinceMs?: number): Promise<MetricSample[]>;
+  };
+  backup: {
+    /** Yedeği iş (job) olarak başlatır; job id döner. İlerleme 'job' olaylarıyla gelir. */
+    run(profileId: string): Promise<string>;
+    list(profileId: string): Promise<BackupFileInfo[]>;
+    delete(profileId: string, file: string): Promise<void>;
+    /** Yedek klasörünü Explorer'da açar (sadece bu bilgisayardaki sunucular) */
+    openFolder(profileId: string): Promise<void>;
+    /** Bir sonraki zamanlı yedek (epoch ms) ya da null */
+    next(profileId: string): Promise<number | null>;
+  };
+  history: {
+    search(profileId: string, query: { text?: string; limit?: number; offset?: number; onlineOnly?: boolean }): Promise<PlayerSummary[]>;
+    sessions(profileId: string, guid: string, limit?: number): Promise<PlayerSession[]>;
+    setNote(profileId: string, guid: string, note: string): Promise<void>;
+    stats(profileId: string, sinceMs: number): Promise<PlayerHistoryStats>;
   };
   missions: {
     /** wrongCaseDir: Linux'ta sadece büyük harfli (okunmayan) MPMissions klasörü varsa */
@@ -227,6 +259,8 @@ export interface OeziApi {
     removeBan(id: string, banId: number): Promise<void>;
     setLock(id: string, locked: boolean): Promise<void>;
     reconnect(id: string): Promise<void>;
+    /** RCON'u bağlı olan bütün sunucularda GUID/IP banla */
+    banEverywhere(guidOrIp: string, minutes: number, reason: string): Promise<{ profileId: string; name: string; ok: boolean; error?: string }[]>;
   };
   steam: {
     updateServer(profileId: string): Promise<string>;
@@ -242,6 +276,8 @@ export interface OeziApi {
   };
   notify: {
     test(profileId: string): Promise<void>;
+    /** Discord durum mesajını hemen güncelle (yoksa oluştur) */
+    refreshStatus(profileId: string): Promise<void>;
   };
   onEvent(cb: (e: AppEvent) => void): () => void;
 }
