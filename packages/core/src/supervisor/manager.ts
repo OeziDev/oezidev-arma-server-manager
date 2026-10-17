@@ -414,6 +414,11 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     return this.metricsStore.toJSON();
   }
 
+  /** Discord durum mesajını hemen güncelle (yoksa oluştur). Kapalıysa bir şey yapmaz; hata fırlatabilir. */
+  refreshDiscordStatus(): Promise<void> {
+    return this.statusUpdater.update();
+  }
+
   getLogBuffer(): LogLine[] {
     return this.logBuffer.slice();
   }

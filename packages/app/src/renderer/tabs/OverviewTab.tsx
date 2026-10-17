@@ -3,9 +3,9 @@ import { useEffect } from 'react';
 import type { Issue, ServerProfile } from '../../shared/api';
 import { Button } from '../components/ui';
 import { fieldLabel, localizeError, useI18n } from '../i18n';
-import { formatTime, loadLogs, useStore } from '../state';
+import { formatMem, formatTime, fpsClass, loadLogs, useStore } from '../state';
 
-export function OverviewTab({ id, profile, issues, errors, onFix }: { id: string; profile: ServerProfile; issues: Issue[]; errors: Record<string, string>; onFix: (path: string) => void }) {
+export function OverviewTab({ id, profile, issues, errors, onFix, onPerf }: { id: string; profile: ServerProfile; issues: Issue[]; errors: Record<string, string>; onFix: (path: string) => void; onPerf: () => void }) {
   const { t, lang } = useI18n();
   const status = useStore((s) => s.statuses[id]);
   const logs = useStore((s) => s.logs[id]);
@@ -20,6 +20,8 @@ export function OverviewTab({ id, profile, issues, errors, onFix }: { id: string
   ].sort((a, b) => order[a.sev] - order[b.sev]);
 
   const recent = (logs ?? []).slice(-12);
+  const perf = status?.perf;
+  const running = status?.status === 'running' || status?.status === 'starting';
 
   return (
     <div className="two-col wide-left">
@@ -59,6 +61,34 @@ export function OverviewTab({ id, profile, issues, errors, onFix }: { id: string
       </div>
 
       <div>
+        {running && perf && (
+          <section className="section">
+            <div className="hstack" style={{ justifyContent: 'space-between' }}>
+              <h2>{t('ov.perf')}</h2>
+              <Button size="sm" kind="ghost" onClick={onPerf}>
+                {t('ov.perfMore')}
+              </Button>
+            </div>
+            <div className="perf-mini">
+              <div>
+                <span className="muted small">FPS</span>
+                <strong className={fpsClass(perf.fps)}>{perf.fps !== undefined ? perf.fps.toFixed(1) : '-'}</strong>
+              </div>
+              <div>
+                <span className="muted small">CPU</span>
+                <strong>{perf.cpu !== undefined ? `${Math.round(perf.cpu)}%` : '-'}</strong>
+              </div>
+              <div>
+                <span className="muted small">RAM</span>
+                <strong>{perf.memMB !== undefined ? formatMem(perf.memMB) : '-'}</strong>
+              </div>
+              <div>
+                <span className="muted small">AI</span>
+                <strong>{perf.ai ?? '-'}</strong>
+              </div>
+            </div>
+          </section>
+        )}
         <section className="section">
           <h2>{t('ov.facts')}</h2>
           <div className="diff-grid">

@@ -39,6 +39,8 @@ let dirty = false;
 /** true: çıkış onaylandı / gerekmiyor, before-quit ve pencere kapatma engellenmez */
 let allowQuit = false;
 let quitFlow: Promise<void> | null = null;
+/** Windows oturum açılışında (--hidden) başlatıldı: pencere gösterilmez, tepside kalır */
+const startHidden = process.argv.includes('--hidden');
 
 const resourcesDir = app.isPackaged ? process.resourcesPath : path.join(__dirname, '..', '..', 'build');
 const indexHtml = path.resolve(__dirname, '..', 'renderer', 'index.html');
@@ -62,7 +64,21 @@ function isDevNavigation(url: string): boolean {
   }
 }
 
-function createWindow() {
+/**
+ * "Windows açılınca başlat": sadece kurulu (paketlenmiş) Windows uygulamasında.
+ * Portable sürümde açılış kaydı geçici klasördeki exe'yi değil, asıl portable exe'yi göstermeli.
+ */
+function applyLoginItem(enabled: boolean) {
+  if (!app.isPackaged || process.platform !== 'win32') return;
+  try {
+    const portable = process.env.PORTABLE_EXECUTABLE_FILE;
+    app.setLoginItemSettings({ openAtLogin: enabled, args: ['--hidden'], ...(portable ? { path: portable } : {}) });
+  } catch (err) {
+    log('error', 'Açılışta başlatma ayarı uygulanamadı:', err);
+  }
+}
+
+function createWindow(showOnReady = true) {
   win = new BrowserWindow({
     width: 1360,
     height: 860,
@@ -82,7 +98,7 @@ function createWindow() {
       devTools: !app.isPackaged || process.env.OEZI_DEVTOOLS === '1',
     },
   });
-  win.once('ready-to-show', () => win?.show());
+  if (showOnReady) win.once('ready-to-show', () => win?.show());
 
   // Harici bağlantılar uygulama içinde açılmaz; sadece izinli adresler tarayıcıda açılır
   win.webContents.setWindowOpenHandler(({ url }) => {
@@ -248,8 +264,10 @@ if (!app.requestSingleInstanceLock()) {
 
     const store = new Store(app.getPath('userData'), { appVersion: app.getVersion(), log: (level, msg) => log(level, msg) });
     settings = store.getSettings();
+    applyLoginItem(settings.launchAtLogin);
     store.onSettingsChanged = (s) => {
       const langChanged = settings?.language !== s.language;
+      if (settings?.launchAtLogin !== s.launchAtLogin) applyLoginItem(s.launchAtLogin);
       settings = s;
       if (langChanged) {
         tray?.destroy();
@@ -289,13 +307,15 @@ if (!app.requestSingleInstanceLock()) {
         dirty = d;
       },
     });
-    createWindow();
+    createWindow(!startHidden);
     createTray();
     warnUnreadableSecrets(store);
     const q = store.quarantinedProfiles();
     if (q.length) log('warn', `Karantinadaki profiller (silinmedi): ${q.map((x) => `${x.name} [${x.id}]`).join(', ')}`);
     updater.start();
     await services.init();
+    // "Uygulama açılınca başlat" işaretli sunucular (sırayla; hatalar bildirim olarak gösterilir)
+    void services.autoStartOnLaunch().catch((err) => log('error', 'Otomatik başlatma:', err));
   });
 
   app.on('before-quit', (e) => {

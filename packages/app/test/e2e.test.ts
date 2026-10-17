@@ -28,6 +28,8 @@ i=0
 while true; do
   if [ -f "$dir/shutdown.flag" ]; then rm -f "$dir/shutdown.flag"; echo "Server shutting down (RCON)"; exit 0; fi
   i=$((i+1)); if [ $((i % 20)) -eq 0 ]; then echo " Server load: FPS 47, memory used: 2133 MB, out: 1820 Kbps, in: 412 Kbps, NG:0, G:340, BE-NG:0, BE-G:0, Players: 31 (L:0, R:31, B:0, G:0)"; fi
+  # @oezi_monitor benzeri performans satırı (~2 sn'de bir, değerler biraz oynar)
+  if [ $((i % 20)) -eq 10 ]; then echo ' 14:30:06 [OEZI-PERF] {"fps":'$((42 + RANDOM % 8)).$((RANDOM % 10))',"fpsMin":'$((28 + RANDOM % 6)).$((RANDOM % 10))',"players":'$((29 + RANDOM % 4))',"ai":'$((400 + RANDOM % 30))',"groups":'$((55 + RANDOM % 6))',"vehicles":96,"objects":12,"time":120,"mission":"altislife","world":"Altis"}'; fi
   sleep 0.1
 done
 `;
@@ -185,13 +187,31 @@ describe.skipIf(!RUN)('Electron uçtan uca', () => {
     await page.getByRole('button', { name: 'Gönder' }).click();
     await page.waitForTimeout(400);
     expect(rcon.received).toContain('say -1 Sunucu 5 dakika sonra yeniden başlayacak');
+    // Performans: izleme varsayılan açık; ilk örnek monitoring.sampleSec (10 sn) içinde gelir
+    await page.getByRole('tab', { name: 'Performans' }).click();
+    await page.waitForSelector('.perf-tiles');
+    await page.waitForFunction(() => [...document.querySelectorAll('.chart path.line')].some((p) => (p.getAttribute('d') ?? '').includes('L')), undefined, { timeout: 30_000 }).catch(() => undefined);
+    await shot('19-performance');
     await page.getByRole('tab', { name: 'Genel bakış' }).click();
     await shot('14-overview-running');
     await page.locator('.head-actions').getByRole('button', { name: 'Durdur' }).click();
     await page.locator('.modal').getByRole('button', { name: 'Onayla' }).click();
     await page.waitForSelector('.fact-value[data-s="stopped"]', { timeout: 30_000 });
     expect(rcon.received).toContain('#shutdown-handled');
-  }, 120_000);
+  }, 180_000);
+
+  it('yedekler sekmesi', async () => {
+    await page.getByRole('tab', { name: 'Yedekler' }).click();
+    await page.waitForSelector('.panel-head h3:has-text("Yedekler")');
+    await page.getByRole('button', { name: 'Şimdi yedekle' }).waitFor();
+    await page.waitForTimeout(500);
+    await shot('20-backups');
+    // Oyuncular > Geçmiş alt sekmesi RCON olmadan da açılır
+    await page.getByRole('tab', { name: 'Oyuncular' }).click();
+    await page.getByRole('tab', { name: 'Geçmiş' }).click();
+    await page.waitForSelector('input[placeholder="Ad, GUID, IP ya da not ara"]');
+    await page.getByRole('tab', { name: 'Çevrimiçi' }).click();
+  });
 
   it('makineler ve ayarlar ekranları', async () => {
     await page.getByRole('button', { name: 'Makineler' }).click();

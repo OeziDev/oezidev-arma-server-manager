@@ -1,7 +1,7 @@
 import type { Navigate, Route } from '../App';
 import { StatusMark } from '../components/ui';
 import { useI18n } from '../i18n';
-import { api, hostLabel, useStore } from '../state';
+import { api, fpsClass, hostLabel, useStore } from '../state';
 
 export function Sidebar({ route, onNavigate, onNew }: { route: Route; onNavigate: Navigate; onNew: () => void }) {
   const { t } = useI18n();
@@ -43,7 +43,18 @@ export function Sidebar({ route, onNavigate, onNew }: { route: Route; onNavigate
                     {hostLabel(s.hostId, hosts, t('common.local'))} : {s.port}
                   </div>
                 </span>
-                {st.status === 'running' && st.rcon === 'connected' ? <span className="server-item-players">{st.players}</span> : <span />}
+                {st.status === 'running' ? (
+                  <span className="server-item-side">
+                    {st.rcon === 'connected' && <span className="server-item-players">{st.players}</span>}
+                    {st.perf?.fps !== undefined && (
+                      <span className={`server-item-fps ${fpsClass(st.perf.fps)}`} title={t('side.fps')}>
+                        {Math.round(st.perf.fps)} FPS
+                      </span>
+                    )}
+                  </span>
+                ) : (
+                  <span />
+                )}
               </button>
             </li>
           );

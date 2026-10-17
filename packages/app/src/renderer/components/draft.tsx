@@ -134,7 +134,7 @@ export function SelectF<T extends string | number>(props: BaseProps & { options:
   );
 }
 
-export function PasswordF(props: BaseProps & { generate?: number }) {
+export function PasswordF(props: BaseProps & { generate?: number; placeholder?: string }) {
   const { draft, set } = useDraft();
   const m = useFieldMeta(props.path, props.labelKey);
   return (
@@ -143,6 +143,7 @@ export function PasswordF(props: BaseProps & { generate?: number }) {
         id={m.id}
         value={String(getPath(draft, props.path) ?? '')}
         invalid={!!m.error}
+        placeholder={props.placeholder}
         onChange={(v) => set(props.path, v)}
         {...(props.generate ? { onGenerate: () => set(props.path, randomPassword(props.generate)) } : {})}
       />

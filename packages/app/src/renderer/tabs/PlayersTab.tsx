@@ -4,19 +4,127 @@ import type { RconBan, RconPlayer } from '../../shared/api';
 import { Button, Empty, Field, Modal, NumberInput, Toggle } from '../components/ui';
 import { useI18n } from '../i18n';
 import { api, attempt, formatTime, setState, tryRun, useStore } from '../state';
+import { BanDialog } from './BanDialog';
+import { PlayerHistory } from './PlayerHistory';
 
 type Action = { kind: 'kick' | 'ban' | 'msg'; player: RconPlayer } | null;
+type Sub = 'online' | 'history' | 'bans';
+const SUBS: Sub[] = ['online', 'history', 'bans'];
 
 export function PlayersTab({ id }: { id: string }) {
+  const { t } = useI18n();
+  const [sub, setSub] = useState<Sub>('online');
+  const count = useStore((s) => (s.statuses[id]?.rcon === 'connected' ? (s.players[id]?.length ?? 0) : null));
+  return (
+    <>
+      <div className="subtabs" role="tablist" aria-label={t('tab.players')}>
+        {SUBS.map((x) => (
+          <button key={x} role="tab" aria-selected={sub === x} className="subtab" onClick={() => setSub(x)}>
+            {t(`pl.sub.${x}`)}
+            {x === 'online' && count !== null && <span className="subtab-count">{count}</span>}
+          </button>
+        ))}
+      </div>
+      {sub === 'online' && <OnlinePlayers id={id} />}
+      {sub === 'history' && <PlayerHistory id={id} />}
+      {sub === 'bans' && <BansPanel id={id} />}
+    </>
+  );
+}
+
+function RconOff({ id }: { id: string }) {
+  const { t } = useI18n();
+  const status = useStore((s) => s.statuses[id]);
+  return (
+    <div className="banner" data-level="info">
+      <div className="vstack">
+        <span>{t('pl.rconOff')}</span>
+        {(status?.status === 'running' || status?.status === 'starting') && (
+          <div>
+            <Button size="sm" onClick={() => attempt(() => api.rcon.reconnect(id))}>
+              {t('pl.reconnect')}
+            </Button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function BansPanel({ id }: { id: string }) {
+  const { t } = useI18n();
+  const connected = useStore((s) => s.statuses[id]?.rcon === 'connected');
+  const [bans, setBans] = useState<RconBan[] | null>(null);
+  const [addBan, setAddBan] = useState(false);
+  const load = async () => setBans((await attempt(() => api.rcon.bans(id))) ?? null);
+  useEffect(() => {
+    if (connected) void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connected]);
+  if (!connected) return <RconOff id={id} />;
+  return (
+    <div className="panel">
+      <div className="panel-head">
+        <h3>{t('pl.bans')}</h3>
+        <span className="muted small">{bans ? bans.length : ''}</span>
+        <span className="spacer" />
+        <Button size="sm" onClick={() => setAddBan(true)}>
+          {t('pl.addBan')}
+        </Button>
+        <Button size="sm" onClick={load}>
+          {t('common.refresh')}
+        </Button>
+      </div>
+      {bans === null ? null : bans.length === 0 ? (
+        <Empty title={t('pl.noBans')} />
+      ) : (
+        <table className="table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>{t('ban.value')}</th>
+              <th>{t('pl.minutes')}</th>
+              <th>{t('pl.reason')}</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {bans.map((b) => (
+              <tr key={b.id}>
+                <td className="muted">{b.id}</td>
+                <td className="mono small">{b.value}</td>
+                <td>{b.minutesLeft < 0 ? t('pl.permanent') : `${b.minutesLeft} ${t('common.minutes')}`}</td>
+                <td>{b.reason}</td>
+                <td className="actions">
+                  <Button
+                    size="sm"
+                    kind="ghost"
+                    onClick={async () => {
+                      await attempt(() => api.rcon.removeBan(id, b.id));
+                      await load();
+                    }}
+                  >
+                    {t('pl.unban')}
+                  </Button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      {addBan && <BanDialog id={id} onClose={() => setAddBan(false)} onDone={load} />}
+    </div>
+  );
+}
+
+function OnlinePlayers({ id }: { id: string }) {
   const { t } = useI18n();
   const status = useStore((s) => s.statuses[id]);
   const players = useStore((s) => s.players[id]) ?? [];
   const chat = useStore((s) => s.chat[id]) ?? [];
   const connected = status?.rcon === 'connected';
   const [broadcast, setBroadcast] = useState('');
-  const [bans, setBans] = useState<RconBan[] | null>(null);
   const [action, setAction] = useState<Action>(null);
-  const [addBan, setAddBan] = useState(false);
   const [locked, setLocked] = useState(false);
   const [sending, setSending] = useState(false);
   const sendingRef = useRef(false);
@@ -50,22 +158,7 @@ export function PlayersTab({ id }: { id: string }) {
     if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
   }, [chat.length]);
 
-  if (!connected) {
-    return (
-      <div className="banner" data-level="info">
-        <div className="vstack">
-          <span>{t('pl.rconOff')}</span>
-          {(status?.status === 'running' || status?.status === 'starting') && (
-            <div>
-              <Button size="sm" onClick={() => attempt(() => api.rcon.reconnect(id))}>
-                {t('pl.reconnect')}
-              </Button>
-            </div>
-          )}
-        </div>
-      </div>
-    );
-  }
+  if (!connected) return <RconOff id={id} />;
 
   return (
     <>
@@ -181,49 +274,7 @@ export function PlayersTab({ id }: { id: string }) {
         </div>
       </div>
 
-      <div className="panel mt">
-        <div className="panel-head">
-          <h3>{t('pl.bans')}</h3>
-          <span className="spacer" />
-          <Button size="sm" onClick={() => setAddBan(true)}>
-            {t('pl.addBan')}
-          </Button>
-          <Button size="sm" onClick={async () => setBans((await attempt(() => api.rcon.bans(id))) ?? null)}>
-            {t('pl.loadBans')}
-          </Button>
-        </div>
-        {bans === null ? null : bans.length === 0 ? (
-          <Empty title={t('common.none')} />
-        ) : (
-          <table className="table">
-            <tbody>
-              {bans.map((b) => (
-                <tr key={b.id}>
-                  <td className="muted">{b.id}</td>
-                  <td className="mono small">{b.value}</td>
-                  <td>{b.minutesLeft < 0 ? t('pl.permanent') : `${b.minutesLeft} ${t('common.minutes')}`}</td>
-                  <td>{b.reason}</td>
-                  <td className="actions">
-                    <Button
-                      size="sm"
-                      kind="ghost"
-                      onClick={async () => {
-                        await attempt(() => api.rcon.removeBan(id, b.id));
-                        setBans((await attempt(() => api.rcon.bans(id))) ?? null);
-                      }}
-                    >
-                      {t('pl.unban')}
-                    </Button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
-
       {action && <ActionDialog id={id} action={action} onClose={() => setAction(null)} onDone={refresh} />}
-      {addBan && <AddBanDialog id={id} onClose={() => setAddBan(false)} />}
     </>
   );
 }
@@ -275,48 +326,6 @@ function ActionDialog({ id, action, onClose, onDone }: { id: string; action: Non
             </div>
           </Field>
         )}
-      </div>
-    </Modal>
-  );
-}
-
-function AddBanDialog({ id, onClose }: { id: string; onClose: () => void }) {
-  const { t } = useI18n();
-  const [value, setValue] = useState('');
-  const [reason, setReason] = useState('');
-  const [minutes, setMinutes] = useState(0);
-  const valid = /^([0-9a-fA-F]{32}|\d{1,3}(\.\d{1,3}){3})$/.test(value.trim());
-  return (
-    <Modal
-      title={t('pl.addBan')}
-      onClose={onClose}
-      footer={
-        <>
-          <Button kind="ghost" onClick={onClose}>
-            {t('common.cancel')}
-          </Button>
-          <Button
-            kind="danger"
-            disabled={!valid}
-            onClick={async () => {
-              if (await tryRun(() => api.rcon.addBan(id, value.trim(), minutes, reason))) onClose();
-            }}
-          >
-            {t('pl.ban')}
-          </Button>
-        </>
-      }
-    >
-      <div className="fields">
-        <Field label="GUID / IP">
-          <input className="input mono" value={value} onChange={(e) => setValue(e.target.value)} aria-invalid={!!value && !valid} />
-        </Field>
-        <Field label={t('pl.reason')}>
-          <input className="input" value={reason} onChange={(e) => setReason(e.target.value)} />
-        </Field>
-        <Field label={t('pl.minutes')} help={`0 = ${t('pl.permanent')}`}>
-          <NumberInput standalone value={minutes} onChange={(v) => setMinutes(Math.max(0, Math.round(v)))} />
-        </Field>
       </div>
     </Modal>
   );

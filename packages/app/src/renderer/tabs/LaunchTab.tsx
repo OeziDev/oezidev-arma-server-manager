@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react';
 import { LinesF, NumberF, PasswordF, TextF, ToggleF, useDraft, useFieldMeta } from '../components/draft';
 import { Button, Field, Section, useFormReset, useLocalInvalid } from '../components/ui';
 import { useI18n } from '../i18n';
-import { api, attempt } from '../state';
+import { api, attempt, tryRun } from '../state';
 
 export function LaunchTab({ id }: { id: string }) {
   const { t } = useI18n();
@@ -55,6 +55,7 @@ export function LaunchTab({ id }: { id: string }) {
           <NumberF path="supervisor.maxRestartsPerHour" />
           <NumberF path="supervisor.gracefulShutdownSec" unit={t('common.seconds')} />
           <NumberF path="supervisor.startTimeoutSec" unit={t('common.seconds')} />
+          <ToggleF path="autoStartOnLaunch" />
         </div>
       </Section>
 
@@ -85,6 +86,8 @@ export function LaunchTab({ id }: { id: string }) {
         </div>
       </Section>
 
+      <AnnouncementsSection />
+
       <Section title={t('ln.rcon')} intro={t('ln.rconIntro')}>
         <div className="fields">
           <ToggleF path="rcon.enabled" />
@@ -113,7 +116,74 @@ export function LaunchTab({ id }: { id: string }) {
           </Field>
         </div>
       </Section>
+
+      <DiscordStatusSection id={id} />
     </>
+  );
+}
+
+const MAX_ANNOUNCE = 400;
+
+function AnnouncementsSection() {
+  const { t } = useI18n();
+  const { draft } = useDraft();
+  const a = draft.announcements;
+  const tooLong = a.messages.filter((m) => m.length > MAX_ANNOUNCE).length;
+  return (
+    <Section title={t('an.title')} intro={t('an.intro')}>
+      <div className="fields">
+        <ToggleF path="announcements.enabled" />
+        <NumberF path="announcements.intervalMin" unit={t('common.minutes')} />
+        <LinesF
+          path="announcements.messages"
+          rows={5}
+          placeholder={t('an.placeholder')}
+          help={
+            <>
+              {t('help.announcements.messages')}
+              <br />
+              <span className={tooLong ? 'bad' : undefined}>
+                {t('an.count', { n: a.messages.length })}
+                {tooLong > 0 && ` · ${t('an.tooLong', { n: tooLong, max: MAX_ANNOUNCE })}`}
+              </span>
+            </>
+          }
+        />
+      </div>
+    </Section>
+  );
+}
+
+function DiscordStatusSection({ id }: { id: string }) {
+  const { t } = useI18n();
+  const { draft, ensureSaved } = useDraft();
+  const ds = draft.discordStatus;
+  const hasWebhook = !!(ds.webhook || draft.notifications.discordWebhook);
+  return (
+    <Section title={t('ds.title')} intro={t('ds.intro')}>
+      <div className="fields">
+        <ToggleF path="discordStatus.enabled" />
+        <PasswordF path="discordStatus.webhook" placeholder={t('ds.webhookPlaceholder')} />
+        <NumberF path="discordStatus.intervalSec" unit={t('common.seconds')} />
+        <ToggleF path="discordStatus.showPlayers" />
+        <Field label="">
+          <div className="hstack">
+            <Button
+              size="sm"
+              disabled={!ds.enabled || !hasWebhook}
+              title={!hasWebhook ? t('ds.noWebhook') : undefined}
+              onClick={async () => {
+                if (!(await ensureSaved())) return;
+                await tryRun(() => api.notify.refreshStatus(id), t('ds.refreshed'));
+              }}
+            >
+              {t('ds.refresh')}
+            </Button>
+            {!hasWebhook && <span className="small muted">{t('ds.noWebhook')}</span>}
+          </div>
+        </Field>
+      </div>
+    </Section>
   );
 }
 

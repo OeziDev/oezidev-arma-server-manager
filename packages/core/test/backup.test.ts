@@ -340,7 +340,7 @@ describe.skipIf(!SSH_AVAILABLE)('runBackup (SshHost)', () => {
       await host.writeFile(`${serverDir}/mpmissions/görev ğ.pbo`, 'x');
       const profile = profileFor(serverDir);
       const res = await runBackup(host, profile);
-      const ls = await host.exec('tar', ['-tzf', res.file]);
+      const ls = await host.exec('tar', ['--quoting-style=literal', '-tzf', res.file]);
       expect(ls.stdout).toContain('profile/server.cfg');
       expect(ls.stdout).toContain('missions/görev ğ.pbo');
       expect(ls.stdout).not.toContain('a.rpt');

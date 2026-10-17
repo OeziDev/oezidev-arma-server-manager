@@ -2,7 +2,19 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import {
+  type BackupFileInfo,
   DiscordNotifier,
+  PlayerHistory,
+  type PlayerHistoryStats,
+  type PlayerSearchQuery,
+  type PlayerSession,
+  type PlayerSummary,
+  deleteBackup,
+  listBackups,
+  nextBackupTime,
+  pruneBackups,
+  resolveBackupDir,
+  runBackup,
   type Host,
   LocalHost,
   type LogLine,
@@ -43,8 +55,10 @@ import {
   type WorkshopDownloadResult,
 } from '@oezi/arma-core';
 import type { AppEvent, HostConfig, HostTestResult, JobInfo, PreviewFiles, SaveResult, ServerSummary } from '../shared/api.js';
+import { BackupScheduleTracker } from './backupSchedule.js';
 import { UserError } from './errors.js';
 import { LazySshHost } from './lazyHost.js';
+import { JsonlHistoryStorage, historyFile, loadMetrics, metricsFile, removeWithLeftovers, saveMetrics } from './perProfileFiles.js';
 import type { Store } from './store.js';
 
 export { UserError };
@@ -68,6 +82,27 @@ interface JobScope {
   hostId?: string;
   /** İşin dokunduğu sunucu klasörü (aynı klasörü kullanan sunucular başlatılamasın) */
   serverDir?: string;
+  /** Sunucu başlatma / güncelleme gibi işlemleri engellemez (ör. yedekleme: sadece okur) */
+  nonBlocking?: boolean;
+}
+
+const BACKUP_SCHEDULER_MS = 30_000;
+const METRICS_SAVE_MS = 5 * 60_000;
+const HISTORY_COMPACT_MS = 24 * 3600_000;
+const HISTORY_EVENT_MIN_MS = 2_000;
+const AUTOSTART_GAP_MS = 4_000;
+
+/** BattlEye ban hedefi: 32 haneli GUID ya da IPv4 */
+export function isBanTarget(v: string): boolean {
+  if (/^[0-9a-f]{32}$/i.test(v)) return true;
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(v);
+  return !!m && m.slice(1).every((o) => Number(o) <= 255);
+}
+
+function formatSize(bytes: number): string {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
 }
 
 class Job {
@@ -165,6 +200,17 @@ export class AppServices {
   private hostOps = new Map<string, number>();
   /** SteamCMD kilitleri: aynı makine + aynı steamcmd için aynı anda tek çalıştırma */
   private steamLocks = new Map<string, Promise<void>>();
+  /** Oyuncu geçmişi (profil başına, tembel açılır) */
+  private histories = new Map<string, { storage: JsonlHistoryStorage; ready: Promise<PlayerHistory> }>();
+  private historyEvents = new Map<string, { last: number; timer: NodeJS.Timeout | null }>();
+  /** Son görülen sunucu durumu (durdu/çöktü geçişini yakalamak için) */
+  private lastStatus = new Map<string, string>();
+  /** Takibe başarıyla başlanmış (attach) yöneticiler */
+  private attached = new WeakSet<ServerManager>();
+  /** Profil başına süren yedek işi */
+  private backupJobs = new Map<string, string>();
+  private readonly backupSchedule = new BackupScheduleTracker();
+  private timers: NodeJS.Timeout[] = [];
 
   constructor(
     private readonly store: Store,
@@ -173,13 +219,36 @@ export class AppServices {
 
   async init() {
     for (const p of this.store.listProfiles()) this.createManager(p);
+    // Geçmiş dosyaları yöneticiler olay yaymadan açılmaya başlar; olaylar hazır olunca sırayla işlenir
+    for (const p of this.store.listProfiles()) void this.history(p.id).then((h) => this.compactHistory(p.id, h)).catch(() => undefined);
+    this.startTimers();
     await Promise.all([...this.managers.values()].map((m) => this.attachWithRetry(m)));
+  }
+
+  private startTimers() {
+    this.stopTimers();
+    const every = (ms: number, fn: () => void) => {
+      const t = setInterval(fn, ms);
+      t.unref?.();
+      this.timers.push(t);
+    };
+    every(BACKUP_SCHEDULER_MS, () => this.backupTick());
+    every(METRICS_SAVE_MS, () => this.saveAllMetrics());
+    every(HISTORY_COMPACT_MS, () => {
+      for (const id of this.histories.keys()) void this.history(id).then((h) => this.compactHistory(id, h)).catch(() => undefined);
+    });
+  }
+
+  private stopTimers() {
+    for (const t of this.timers) clearInterval(t);
+    this.timers = [];
   }
 
   /** Makineye ulaşılamıyorsa (VPS kapalı, ağ yok) 30 sn'de bir yeniden dene; bulunca takibe başla. */
   private async attachWithRetry(m: ServerManager, notify = true): Promise<void> {
     try {
       await m.attach();
+      this.attached.add(m);
     } catch (err) {
       if (notify) {
         const msg = (err as Error).message;
@@ -193,8 +262,16 @@ export class AppServices {
 
   /** Bağlantıları kapatır, takibi bırakır. Arma sunucuları DURDURULMAZ (ayrı süreç / systemd servisi). */
   async shutdown() {
+    this.stopTimers();
+    this.saveAllMetrics();
     for (const m of this.managers.values()) m.dispose();
     this.managers.clear();
+    this.lastStatus.clear();
+    for (const e of this.historyEvents.values()) if (e.timer) clearTimeout(e.timer);
+    this.historyEvents.clear();
+    const histories = [...this.histories.values()];
+    this.histories.clear();
+    await Promise.all(histories.map((h) => h.ready.then((x) => x.flush()).catch(() => undefined)));
     const hosts = [...this.ssh.values()];
     this.ssh.clear();
     await Promise.all(hosts.map((h) => h.close().catch(() => undefined)));
@@ -433,6 +510,10 @@ export class AppServices {
     const host: Host = p.hostId === 'local' ? this.local : this.sshHost(p.hostId);
     const cfg = p.hostId === 'local' ? undefined : this.store.getHost(p.hostId);
     const serviceUser = this.linuxServiceUser(p.hostId);
+    const id = p.id;
+    // Yönetici yeniden kuruluyorsa (makine değişti) bellekteki geçmiş, yoksa diskteki kullanılır
+    const prev = this.managers.get(id);
+    const metrics = prev ? prev.metricsSnapshot() : loadMetrics(this.store.dir, id);
     const m = new ServerManager({
       profile: p,
       host,
@@ -443,12 +524,29 @@ export class AppServices {
       defaultRconHost: cfg ? cfg.host : '127.0.0.1',
       notifier: this.notifierFor(p.id),
       updater: (profile, log) => this.runScheduledUpdate(profile, log),
+      ...(metrics ? { metrics } : {}),
+      onDiscordStatusMessageId: (msgId) => this.persistDiscordMessageId(id, msgId),
+      discordStatusLang: this.store.getSettings().language,
     });
-    const id = p.id;
-    m.on('status', (status) => this.emit({ type: 'status', profileId: id, status }));
+    m.on('status', (status) => {
+      this.emit({ type: 'status', profileId: id, status });
+      const before = this.lastStatus.get(id);
+      this.lastStatus.set(id, status.status);
+      const down = status.status === 'stopped' || status.status === 'crashed';
+      if (down && before !== undefined && before !== 'stopped' && before !== 'crashed') this.feedHistory(id, (h) => h.onServerStopped());
+    });
     m.on('notice', (notice) => this.emit({ type: 'notice', profileId: id, notice }));
-    m.on('players', (players) => this.emit({ type: 'players', profileId: id, players }));
-    m.on('rconMessage', (message) => this.emit({ type: 'rconMessage', profileId: id, message, t: Date.now() }));
+    m.on('players', (players) => {
+      this.emit({ type: 'players', profileId: id, players });
+      const t = Date.now();
+      this.feedHistory(id, (h) => h.onPlayerList(players, t));
+    });
+    m.on('rconMessage', (message) => {
+      const t = Date.now();
+      this.emit({ type: 'rconMessage', profileId: id, message, t });
+      this.feedHistory(id, (h) => h.onServerMessage(message, t));
+    });
+    m.on('metrics', (sample) => this.emit({ type: 'metrics', profileId: id, sample }));
     m.on('log', (lines) => this.queueLog(id, lines));
     this.managers.set(id, m);
     return m;
@@ -525,14 +623,14 @@ export class AppServices {
 
   private jobFor(p: ServerProfile): Job | undefined {
     return this.runningJobs().find(
-      (j) => j.scope.profileId === p.id || (!!j.scope.hostId && this.sameDir(j.scope.hostId, j.scope.serverDir, p.hostId, p.paths.serverDir)),
+      (j) => !j.scope.nonBlocking && (j.scope.profileId === p.id || (!!j.scope.hostId && this.sameDir(j.scope.hostId, j.scope.serverDir, p.hostId, p.paths.serverDir))),
     );
   }
 
   /** Bu sunucu (veya aynı sunucu klasörü) için süren bir iş varsa reddet */
   private assertNoJob(profileId: string) {
     const p = this.store.getProfile(profileId);
-    const job = p ? this.jobFor(p) : this.runningJobs().find((j) => j.scope.profileId === profileId);
+    const job = p ? this.jobFor(p) : this.runningJobs().find((j) => !j.scope.nonBlocking && j.scope.profileId === profileId);
     if (job) throw new UserError(`Bu sunucu için devam eden bir iş var ("${job.info.title}"). Bitmesini bekle veya iptal et.`);
   }
 
@@ -583,6 +681,8 @@ export class AppServices {
       for (let i = 2; taken.has(dir); i++) dir = L.join(base.paths.serverDir, 'oezi-profiles', `${slugify(base.name)}-${i}`);
       base.paths.profilesDir = dir;
     }
+    // Yeni (kopyalanmış / içe aktarılmış) profil başka profilin Discord durum mesajını düzenlemesin
+    base.discordStatus.messageId = '';
     if (!base.rcon.password) base.rcon.password = strongPassword(20);
     if (!base.general.passwordAdmin) base.general.passwordAdmin = strongPassword(16);
     // Aynı makinede port çakışmasın: 10'ar artır
@@ -613,6 +713,8 @@ export class AppServices {
     if (!v.profile) return v;
     const p = v.profile;
     const existing = this.store.getProfile(p.id);
+    // Mesaj kimliğini uygulama yönetir: arayüzdeki (eski) değer kullanıcı kaydında onu ezmesin
+    if (existing && opts.cleanup !== false) p.discordStatus.messageId = existing.discordStatus.messageId;
     const m = this.managers.get(p.id);
     const running = isActive(m);
     if (existing && existing.hostId !== p.hostId && running) {
@@ -729,6 +831,7 @@ export class AppServices {
     const m = this.managers.get(id);
     if (m && !['stopped', 'crashed'].includes(m.getStatus().status)) throw new UserError('Çalışan sunucu silinemez. Önce durdur.');
     this.assertNoJob(id);
+    if (this.backupRunning(id)) throw new UserError('Bu sunucu için yedekleme sürüyor. Bitmesini bekle veya iptal et.');
     if (this.isBusy(id, m)) throw new UserError('Sunucu şu an bir işlem yapıyor. Bitince tekrar dene.');
     if (m?.mode === 'systemd' && m.host.systemd) {
       try {
@@ -746,7 +849,23 @@ export class AppServices {
     this.store.removeProfile(id);
     m?.dispose();
     this.managers.delete(id);
+    await this.cleanupProfileResources(id);
     this.emit({ type: 'profiles-changed' });
+  }
+
+  /** Silinen profilin performans / oyuncu geçmişi dosyaları ve zamanlayıcı kayıtları */
+  private async cleanupProfileResources(id: string) {
+    this.lastStatus.delete(id);
+    this.backupJobs.delete(id);
+    this.backupSchedule.forget(id);
+    const ev = this.historyEvents.get(id);
+    if (ev?.timer) clearTimeout(ev.timer);
+    this.historyEvents.delete(id);
+    const h = this.histories.get(id);
+    this.histories.delete(id);
+    if (h) await h.ready.then((x) => x.flush()).catch(() => undefined);
+    removeWithLeftovers(metricsFile(this.store.dir, id));
+    removeWithLeftovers(historyFile(this.store.dir, id));
   }
 
   duplicateProfile(id: string): ServerProfile {
@@ -1175,6 +1294,282 @@ export class AppServices {
 
   listJobs(): JobInfo[] {
     return [...this.jobs.values()].map((j) => ({ ...j.info, lines: j.info.lines.slice(-400) }));
+  }
+
+  /* ---------------- performans geçmişi ---------------- */
+
+  /** Bütün yöneticilerin performans geçmişini diske yaz (5 dk'da bir ve kapanışta) */
+  saveAllMetrics() {
+    for (const [id, m] of this.managers) {
+      if (!this.store.getProfile(id)) continue;
+      try {
+        saveMetrics(this.store.dir, id, m.metricsSnapshot());
+      } catch (err) {
+        console.error(`Performans geçmişi kaydedilemedi (${id}):`, err);
+      }
+    }
+  }
+
+  metrics(id: string, sinceMs?: number) {
+    return this.manager(id).getMetrics(sinceMs);
+  }
+
+  /* ---------------- Discord durum mesajı ---------------- */
+
+  /** Yeni mesaj kimliği profile kaydedilir (kullanıcı kaydı değil: Workshop temizliği yapılmaz) */
+  private persistDiscordMessageId(id: string, msgId: string) {
+    const cur = this.store.getProfile(id);
+    if (!cur || cur.discordStatus.messageId === msgId) return;
+    void this.saveProfile({ ...cur, discordStatus: { ...cur.discordStatus, messageId: msgId } }, { cleanup: false })
+      .then((r) => {
+        if (r.errors.length) console.error('Discord mesaj kimliği kaydedilemedi:', r.errors);
+      })
+      .catch((err: unknown) => console.error('Discord mesaj kimliği kaydedilemedi:', err));
+  }
+
+  async refreshDiscordStatus(id: string): Promise<void> {
+    const p = this.getProfile(id);
+    if (!p.discordStatus.enabled) throw new UserError('Discord durum mesajı kapalı. Önce açıp kaydet.');
+    const hook = p.discordStatus.webhook.trim() || p.notifications.discordWebhook.trim();
+    if (!isDiscordWebhook(hook)) throw new UserError('Geçerli bir Discord webhook adresi gir (https://discord.com/api/webhooks/...)');
+    try {
+      await this.manager(id).refreshDiscordStatus();
+    } catch (err) {
+      throw new UserError(`Discord durum mesajı güncellenemedi: ${(err as Error).message}`);
+    }
+  }
+
+  /* ---------------- oyuncu geçmişi ---------------- */
+
+  /** Profilin oyuncu geçmişi (ilk çağrıda dosyadan yüklenir) */
+  private history(id: string): Promise<PlayerHistory> {
+    let h = this.histories.get(id);
+    if (!h) {
+      const storage = new JsonlHistoryStorage(historyFile(this.store.dir, id));
+      let lastErr = 0;
+      const ready = PlayerHistory.open(storage, {
+        onError: (err) => {
+          // Yazma hatası: geçmiş bellekte tutulmaya devam eder; günlüğü doldurmasın
+          if (Date.now() - lastErr > 60_000) console.error(`Oyuncu geçmişi yazılamadı (${id}):`, err);
+          lastErr = Date.now();
+        },
+      });
+      ready.catch((err: unknown) => console.error(`Oyuncu geçmişi okunamadı (${id}):`, err));
+      h = { storage, ready };
+      this.histories.set(id, h);
+    }
+    return h.ready;
+  }
+
+  /** Olayı geçmişe işle; bir şey değiştiyse (depoya satır eklendiyse) arayüze bildir */
+  private feedHistory(id: string, fn: (h: PlayerHistory) => Promise<void>) {
+    const ready = this.history(id);
+    const entry = this.histories.get(id);
+    void ready
+      .then((h) => {
+        // Bu arada profil silinmiş / servis kapanmış olabilir
+        if (this.histories.get(id) !== entry) return;
+        const before = h.storageStats.lines;
+        const p = fn(h);
+        if (h.storageStats.lines !== before) this.historyChanged(id);
+        return p;
+      })
+      .catch(() => undefined);
+  }
+
+  /** 'history-changed' olayı: profil başına en fazla 2 sn'de bir */
+  private historyChanged(id: string) {
+    let e = this.historyEvents.get(id);
+    if (!e) this.historyEvents.set(id, (e = { last: 0, timer: null }));
+    if (e.timer) return;
+    const wait = e.last + HISTORY_EVENT_MIN_MS - Date.now();
+    const fire = () => {
+      e!.timer = null;
+      e!.last = Date.now();
+      this.emit({ type: 'history-changed', profileId: id });
+    };
+    if (wait <= 0) fire();
+    else {
+      e.timer = setTimeout(fire, wait);
+      e.timer.unref?.();
+    }
+  }
+
+  /** Dosyada aynı kaydın çok satırı biriktiyse yeniden yaz */
+  private async compactHistory(id: string, h: PlayerHistory, force = false): Promise<void> {
+    if (!force && !h.shouldCompact()) return;
+    await h.flush();
+    const entry = this.histories.get(id);
+    if (!entry || (await entry.ready) !== h) return;
+    // flush ile yazma arasında araya başka yazma girmesin diye senkron: compact() + atomik yazma
+    try {
+      entry.storage.rewrite(h.compact());
+    } catch (err) {
+      console.error(`Oyuncu geçmişi sıkıştırılamadı (${id}):`, err);
+    }
+  }
+
+  private requireProfileForHistory(id: string): Promise<PlayerHistory> {
+    this.getProfile(id);
+    return this.history(id);
+  }
+
+  async historySearch(id: string, query: PlayerSearchQuery): Promise<PlayerSummary[]> {
+    return (await this.requireProfileForHistory(id)).search(query);
+  }
+
+  async historySessions(id: string, guid: string, limit?: number): Promise<PlayerSession[]> {
+    return (await this.requireProfileForHistory(id)).sessions(guid, limit);
+  }
+
+  async historySetNote(id: string, guid: string, note: string): Promise<void> {
+    const h = await this.requireProfileForHistory(id);
+    await h.setNote(guid, note);
+    this.historyChanged(id);
+  }
+
+  async historyStats(id: string, sinceMs: number): Promise<PlayerHistoryStats> {
+    return (await this.requireProfileForHistory(id)).stats(sinceMs);
+  }
+
+  /* ---------------- yedekleme ---------------- */
+
+  private backupRunning(profileId: string): boolean {
+    const jobId = this.backupJobs.get(profileId);
+    return !!jobId && !!this.jobs.get(jobId)?.running;
+  }
+
+  /** Yedeği iş olarak başlatır; job id döner. */
+  backupJob(profileId: string, scheduled = false): string {
+    const p = this.getProfile(profileId);
+    this.requireServerDir(p);
+    if (this.backupRunning(profileId)) throw new UserError('Bu sunucu için zaten bir yedekleme sürüyor. Bitmesini bekle veya iptal et.');
+    const title = `Yedek: ${p.name}${scheduled ? ' (zamanlı)' : ''}`;
+    const jobId = this.startJob(title, { profileId, nonBlocking: true }, async (job) => {
+      try {
+        // Şifreler (veritabanı) çözülmüş güncel profil
+        const fresh = this.getProfile(profileId);
+        const host = this.getHost(fresh.hostId);
+        await host.connect();
+        const res = await runBackup(host, fresh, { signal: job.abort.signal, onLine: (l) => job.line(l) });
+        const size = formatSize(res.sizeBytes);
+        job.line(`Yedek tamamlandı: ${res.file} (${size})`);
+        try {
+          const removed = await pruneBackups(host, fresh, fresh.backup.keep);
+          if (removed.length) job.line(`Eski yedekler silindi (${removed.length}): ${removed.join(', ')}`);
+        } catch (err) {
+          job.line(`Eski yedekler silinemedi: ${(err as Error).message}`);
+        }
+        const skippedTr = res.skipped.length ? ` ${res.skipped.length} öğe atlandı (ayrıntı iş günlüğünde).` : '';
+        const skippedEn = res.skipped.length ? ` ${res.skipped.length} item(s) skipped (see job log).` : '';
+        this.notice(profileId, res.skipped.length ? 'warning' : 'info', `Yedek alındı: ${res.file} (${size}).${skippedTr}`, `Backup created: ${res.file} (${size}).${skippedEn}`);
+      } catch (err) {
+        if (!job.abort.signal.aborted) {
+          const msg = (err as Error).message;
+          this.notice(profileId, 'error', `Yedekleme başarısız: ${msg}`, `Backup failed: ${msg}`);
+        }
+        throw err;
+      }
+    });
+    this.backupJobs.set(profileId, jobId);
+    return jobId;
+  }
+
+  async listBackups(profileId: string): Promise<BackupFileInfo[]> {
+    const p = this.getProfile(profileId);
+    this.requireServerDir(p);
+    const host = this.getHost(p.hostId);
+    await host.connect();
+    return listBackups(host, p);
+  }
+
+  async deleteBackup(profileId: string, file: string): Promise<void> {
+    const p = this.getProfile(profileId);
+    this.requireServerDir(p);
+    const host = this.getHost(p.hostId);
+    await host.connect();
+    try {
+      await deleteBackup(host, p, file);
+    } catch (err) {
+      throw new UserError((err as Error).message);
+    }
+  }
+
+  nextBackup(profileId: string, now = new Date()): number | null {
+    const p = this.getProfile(profileId);
+    if (!p.backup.enabled || !p.backup.times.length) return null;
+    return nextBackupTime(p.backup.times, now)?.getTime() ?? null;
+  }
+
+  /** Bu bilgisayardaki sunucunun yedek klasörü (VPS'tekiler için hata) */
+  localBackupDir(profileId: string): string {
+    const p = this.getProfile(profileId);
+    this.requireServerDir(p);
+    const dir = resolveBackupDir(p, this.hostOs(p.hostId));
+    if (p.hostId !== 'local') throw new UserError(`Yedekler sunucunun bulunduğu makinede (VPS) duruyor: ${dir}. Bu klasör bu bilgisayarda açılamaz; dosyalara SFTP ile ulaşabilirsin.`);
+    return dir;
+  }
+
+  /** Zamanlı yedek denetimi (30 sn'de bir) */
+  backupTick(now = new Date()) {
+    for (const p of this.store.listProfiles()) {
+      if (!p.backup.enabled || !p.backup.times.length) continue;
+      for (const t of this.backupSchedule.due(p.id, p.backup.times, now)) {
+        try {
+          this.backupJob(p.id, true);
+        } catch (err) {
+          const msg = (err as Error).message;
+          this.notice(p.id, 'warning', `Zamanlı yedek (${t}) başlatılamadı: ${msg}`, `Scheduled backup (${t}) could not start: ${msg}`);
+        }
+      }
+    }
+  }
+
+  /* ---------------- toplu işlemler ---------------- */
+
+  /** RCON'u bağlı olan bütün sunucularda GUID/IP banla */
+  async banEverywhere(guidOrIp: string, minutes: number, reason: string): Promise<{ profileId: string; name: string; ok: boolean; error?: string }[]> {
+    const target = guidOrIp.trim();
+    if (!isBanTarget(target)) throw new UserError('Geçersiz hedef: 32 haneli BattlEye GUID ya da IPv4 adresi gir.');
+    const value = /^[0-9a-f]{32}$/i.test(target) ? target.toLowerCase() : target;
+    const mins = Math.max(0, Math.trunc(minutes));
+    const list = [...this.managers.entries()].filter(([, m]) => m.rcon?.state === 'connected');
+    return Promise.all(
+      list.map(async ([profileId, m]) => {
+        const name = m.getProfile().name;
+        try {
+          await m.rcon!.addBan(value, mins, reason);
+          return { profileId, name, ok: true };
+        } catch (err) {
+          return { profileId, name, ok: false, error: (err as Error).message };
+        }
+      }),
+    );
+  }
+
+  /** Uygulama açılışında: "otomatik başlat" işaretli, kapalı sunucuları sırayla başlat */
+  async autoStartOnLaunch(gapMs = AUTOSTART_GAP_MS): Promise<void> {
+    const ids = this.store
+      .listProfiles()
+      .filter((p) => p.autoStartOnLaunch)
+      .map((p) => p.id);
+    let first = true;
+    for (const id of ids) {
+      const m = this.managers.get(id);
+      if (!m || !this.attached.has(m)) continue;
+      const st = m.getStatus();
+      if (st.unreachable || !['stopped', 'crashed'].includes(st.status)) continue;
+      if (!first) await sleep(gapMs);
+      first = false;
+      // Bekleme sırasında silinmiş / başlatılmış olabilir
+      if (this.managers.get(id) !== m || !['stopped', 'crashed'].includes(m.getStatus().status)) continue;
+      try {
+        await this.startServer(id);
+      } catch (err) {
+        const msg = (err as Error).message;
+        this.notice(id, 'error', `Otomatik başlatma başarısız: ${msg}`, `Auto-start failed: ${msg}`);
+      }
+    }
   }
 
   /* ---------------- bildirim ---------------- */

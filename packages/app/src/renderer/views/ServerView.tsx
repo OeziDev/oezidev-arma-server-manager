@@ -4,7 +4,7 @@ import type { Route } from '../App';
 import { DraftContext, setPath } from '../components/draft';
 import { Button, FormContext, StatusMark, useConfirm } from '../components/ui';
 import { useI18n } from '../i18n';
-import { api, attempt, draftGuard, errorText, formatDuration, hostLabel, toast, useStore } from '../state';
+import { api, attempt, draftGuard, errorText, formatDuration, formatMem, fpsClass, hostLabel, toast, useStore } from '../state';
 import { OverviewTab } from '../tabs/OverviewTab';
 import { ConfigTab, type ConfigSection } from '../tabs/ConfigTab';
 import { MissionsTab } from '../tabs/MissionsTab';
@@ -14,9 +14,11 @@ import { ConsoleTab } from '../tabs/ConsoleTab';
 import { PlayersTab } from '../tabs/PlayersTab';
 import { SteamTab } from '../tabs/SteamTab';
 import { FilesTab } from '../tabs/FilesTab';
+import { PerformanceTab } from '../tabs/PerformanceTab';
+import { BackupsTab } from '../tabs/BackupsTab';
 
-export type TabId = 'overview' | 'config' | 'missions' | 'mods' | 'launch' | 'console' | 'players' | 'steam' | 'files';
-const TABS: TabId[] = ['overview', 'config', 'missions', 'mods', 'launch', 'console', 'players', 'steam', 'files'];
+export type TabId = 'overview' | 'performance' | 'config' | 'missions' | 'mods' | 'launch' | 'console' | 'players' | 'steam' | 'files' | 'backups';
+const TABS: TabId[] = ['overview', 'performance', 'config', 'missions', 'mods', 'launch', 'console', 'players', 'steam', 'files', 'backups'];
 
 /** Bir alan yolunun hangi sekme/bölümde düzenlendiği */
 export function locate(path: string): { tab: TabId; section?: ConfigSection } {
@@ -32,6 +34,8 @@ export function locate(path: string): { tab: TabId; section?: ConfigSection } {
   if (head === 'missions') return { tab: 'missions' };
   if (head === 'launch') return { tab: sub === 'mods' || sub === 'serverMods' ? 'mods' : 'launch' };
   if (head === 'steam') return { tab: 'steam' };
+  if (head === 'monitoring' || (head === 'notifications' && sub === 'onPerformance')) return { tab: 'performance' };
+  if (head === 'backup') return { tab: 'backups' };
   return { tab: 'launch' };
 }
 
@@ -335,6 +339,16 @@ export function ServerView({ id, tab, onTab, onNavigate }: { id: string; tab: Ta
               <span className="fact-value">{new Date(status.nextScheduledRestart).toTimeString().slice(0, 5)}</span>
             </div>
           )}
+          {running && status?.perf && (
+            <button className="fact fact-link" onClick={() => onTab('performance')} title={t('tab.performance')}>
+              <span className="fact-label">{t('head.perf')}</span>
+              <span className="fact-value perf-inline">
+                {status.perf.fps !== undefined && <span className={fpsClass(status.perf.fps)}>{Math.round(status.perf.fps)} FPS</span>}
+                {status.perf.cpu !== undefined && <span>CPU {Math.round(status.perf.cpu)}%</span>}
+                {status.perf.memMB !== undefined && <span>{formatMem(status.perf.memMB)}</span>}
+              </span>
+            </button>
+          )}
         </div>
         <div className="tabs" role="tablist">
           {TABS.map((x) => (
@@ -375,7 +389,9 @@ export function ServerView({ id, tab, onTab, onNavigate }: { id: string; tab: Ta
           </div>
         ) : (
           <div className="content">
-            {tab === 'overview' && <OverviewTab id={id} profile={saved} issues={issues} errors={errors} onFix={goTo} />}
+            {tab === 'overview' && <OverviewTab id={id} profile={saved} issues={issues} errors={errors} onFix={goTo} onPerf={() => onTab('performance')} />}
+            {tab === 'performance' && <PerformanceTab id={id} />}
+            {tab === 'backups' && <BackupsTab id={id} />}
             {tab === 'config' && <ConfigTab section={section} onSection={setSection} />}
             {tab === 'missions' && <MissionsTab id={id} />}
             {tab === 'mods' && <ModsTab id={id} />}

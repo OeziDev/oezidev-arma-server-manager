@@ -6,6 +6,7 @@ import type {
   HostConfig,
   JobInfo,
   LogLine,
+  MetricSample,
   OeziApi,
   RconPlayer,
   ServerSummary,
@@ -56,6 +57,10 @@ export interface State {
   jobs: Record<string, JobInfo>;
   hosts: HostConfig[];
   toasts: Toast[];
+  /** Canlı gelen performans örnekleri (profil başına, sınırlı); geçmiş server.metrics ile yüklenir */
+  metrics: Record<string, MetricSample[]>;
+  /** Oyuncu geçmişi her değiştiğinde artar (arayüz yeniden yükler) */
+  historyRev: Record<string, number>;
 }
 
 let state: State = {
@@ -72,6 +77,8 @@ let state: State = {
   jobs: {},
   hosts: [],
   toasts: [],
+  metrics: {},
+  historyRev: {},
 };
 
 const listeners = new Set<() => void>();
@@ -144,6 +151,8 @@ export async function refreshHosts() {
 }
 
 const MAX_LOG = 5000;
+/** Canlı performans örneği üst sınırı (10 sn aralıkla ~11 saat) */
+export const MAX_LIVE_METRICS = 4000;
 const MAX_LOCAL_LOG = 500;
 
 /** Yeni satırları seq'e göre ekle; zaten olanları atla. */
@@ -213,6 +222,18 @@ export function startEventLoop(lang: () => 'tr' | 'en') {
       case 'update':
         setState({ update: e.update });
         break;
+      case 'metrics':
+        setState((s) => {
+          const prev = s.metrics[e.profileId] ?? [];
+          const last = prev[prev.length - 1];
+          if (last && e.sample.t <= last.t) return {};
+          const next = prev.length >= MAX_LIVE_METRICS ? [...prev.slice(-(MAX_LIVE_METRICS - 1)), e.sample] : [...prev, e.sample];
+          return { metrics: { ...s.metrics, [e.profileId]: next } };
+        });
+        break;
+      case 'history-changed':
+        setState((s) => ({ historyRev: { ...s.historyRev, [e.profileId]: (s.historyRev[e.profileId] ?? 0) + 1 } }));
+        break;
     }
   });
 }
@@ -276,4 +297,31 @@ export function formatBytes(n: number): string {
   if (n < 1024 ** 2) return `${(n / 1024).toFixed(0)} KB`;
   if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)} MB`;
   return `${(n / 1024 ** 3).toFixed(2)} GB`;
+}
+
+/** "12 sa 30 dk" / "12 h 30 min" */
+export function formatPlaytime(ms: number, lang: 'tr' | 'en'): string {
+  const totalMin = Math.floor(Math.max(0, ms) / 60000);
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  const u = lang === 'tr' ? { h: 'sa', m: 'dk' } : { h: 'h', m: 'min' };
+  if (totalMin < 1) return lang === 'tr' ? '< 1 dk' : '< 1 min';
+  if (h === 0) return `${m} ${u.m}`;
+  return `${h} ${u.h} ${m} ${u.m}`;
+}
+
+/** Kısa tarih + saat (yerel) */
+export function formatDateTime(t: number, lang: 'tr' | 'en'): string {
+  return new Date(t).toLocaleString(lang === 'tr' ? 'tr-TR' : 'en-GB', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+/** MB -> "850 MB" / "2.1 GB" */
+export function formatMem(mb: number): string {
+  return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`;
+}
+
+/** FPS renk sınıfı: >= 30 iyi, 15-30 uyarı, < 15 kötü */
+export function fpsClass(fps: number | undefined): '' | 'ok' | 'warn' | 'bad' {
+  if (fps === undefined) return '';
+  return fps >= 30 ? 'ok' : fps >= 15 ? 'warn' : 'bad';
 }

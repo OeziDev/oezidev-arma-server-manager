@@ -32,6 +32,7 @@ const HostSchema = z.object({
 const SettingsPatchSchema = z.object({
   language: z.enum(['tr', 'en']).optional(),
   minimizeToTray: z.boolean().optional(),
+  launchAtLogin: z.boolean().optional(),
   localSteamcmdPath: z.string().max(1000).optional(),
   steamUsername: z.string().max(100).optional(),
   steamPassword: z.string().max(1000).optional(),
@@ -169,6 +170,42 @@ export function registerIpc(opts: IpcOptions) {
   handle('server', 'deploy', (id) => s.deployServer(Id.parse(id)));
   handle('server', 'status', (id) => s.manager(Id.parse(id)).getStatus());
   handle('server', 'logs', (id) => s.manager(Id.parse(id)).getLogBuffer());
+  handle('server', 'metrics', (id, since) => s.metrics(Id.parse(id), since === undefined || since === null ? undefined : z.number().finite().min(0).parse(since)));
+
+  /* backup */
+  handle('backup', 'run', (id) => s.backupJob(Id.parse(id)));
+  handle('backup', 'list', (id) => s.listBackups(Id.parse(id)));
+  handle('backup', 'delete', (id, file) => s.deleteBackup(Id.parse(id), z.string().min(1).max(4096).parse(file)));
+  handle('backup', 'next', (id) => s.nextBackup(Id.parse(id)));
+  handle('backup', 'openFolder', async (id) => {
+    const dir = s.localBackupDir(Id.parse(id));
+    if (!fs.existsSync(dir)) throw new UserError(`Yedek klasörü henüz yok (ilk yedekte oluşturulur): ${dir}`);
+    const err = await shell.openPath(dir);
+    if (err) throw new UserError(`Klasör açılamadı: ${err}`);
+  });
+
+  /* history */
+  const Guid = z.string().trim().regex(/^[0-9a-fA-F]{32}$/, 'Geçersiz GUID');
+  const HistoryQuery = z.object({
+    text: z.string().max(200).optional(),
+    limit: z.number().int().min(1).max(1000).optional(),
+    offset: z.number().int().min(0).max(1_000_000).optional(),
+    onlineOnly: z.boolean().optional(),
+  });
+  handle('history', 'search', (id, q) => {
+    const query = HistoryQuery.parse(q ?? {});
+    return s.historySearch(Id.parse(id), {
+      ...(query.text !== undefined ? { text: query.text } : {}),
+      ...(query.limit !== undefined ? { limit: query.limit } : {}),
+      ...(query.offset !== undefined ? { offset: query.offset } : {}),
+      ...(query.onlineOnly !== undefined ? { onlineOnly: query.onlineOnly } : {}),
+    });
+  });
+  handle('history', 'sessions', (id, guid, limit) =>
+    s.historySessions(Id.parse(id), Guid.parse(guid), limit === undefined || limit === null ? undefined : z.number().int().min(1).max(1000).parse(limit)),
+  );
+  handle('history', 'setNote', (id, guid, note) => s.historySetNote(Id.parse(id), Guid.parse(guid), z.string().max(2000).parse(note ?? '')));
+  handle('history', 'stats', (id, since) => s.historyStats(Id.parse(id), z.number().finite().min(0).parse(since)));
 
   /* missions / mods */
   handle('missions', 'scan', (id) => s.scanMissions(Id.parse(id)));
@@ -196,6 +233,9 @@ export function registerIpc(opts: IpcOptions) {
   handle('rcon', 'removeBan', async (id, banId) => void (await s.rcon(Id.parse(id)).removeBan(z.coerce.number().int().min(0).parse(banId))));
   handle('rcon', 'setLock', async (id, locked) => void (await (locked ? s.rcon(Id.parse(id)).lock() : s.rcon(Id.parse(id)).unlock())));
   handle('rcon', 'reconnect', (id) => s.reconnectRcon(Id.parse(id)));
+  handle('rcon', 'banEverywhere', (v, minutes, reason) =>
+    s.banEverywhere(z.string().trim().max(64).parse(v), z.coerce.number().int().min(0).parse(minutes), Reason.parse(reason)),
+  );
 
   /* steam */
   const Ids = z.array(z.string().regex(/^\d+$/)).max(500);
@@ -212,4 +252,5 @@ export function registerIpc(opts: IpcOptions) {
 
   /* notify */
   handle('notify', 'test', (id) => s.testNotification(Id.parse(id)));
+  handle('notify', 'refreshStatus', (id) => s.refreshDiscordStatus(Id.parse(id)));
 }
