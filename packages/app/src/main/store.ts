@@ -25,6 +25,8 @@ const PROFILE_SECRET_PATHS = [
   'rcon.password',
   'steam.branchPassword',
   'notifications.discordWebhook',
+  'backup.database.password',
+  'discordStatus.webhook',
 ] as const;
 
 type PublicSettings = Omit<AppSettings, 'steamPassword' | 'hasSteamPassword' | 'clearSteamPassword'>;
@@ -41,6 +43,7 @@ interface DataFile {
 const DEFAULT_SETTINGS: PublicSettings = {
   language: 'tr',
   minimizeToTray: true,
+  launchAtLogin: false,
   localSteamcmdPath: '',
   steamUsername: '',
 };
@@ -500,6 +503,7 @@ export class Store {
         const next: PublicSettings = { ...this.data.settings };
         if (patch.language !== undefined) next.language = patch.language === 'en' ? 'en' : 'tr';
         if (patch.minimizeToTray !== undefined) next.minimizeToTray = !!patch.minimizeToTray;
+        if (patch.launchAtLogin !== undefined) next.launchAtLogin = !!patch.launchAtLogin;
         if (patch.localSteamcmdPath !== undefined) next.localSteamcmdPath = String(patch.localSteamcmdPath ?? '');
         if (patch.steamUsername !== undefined) next.steamUsername = String(patch.steamUsername ?? '');
         this.data.settings = next;

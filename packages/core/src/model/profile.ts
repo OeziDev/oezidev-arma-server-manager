@@ -317,8 +317,80 @@ export const ServerProfileSchema = z.object({
       onStop: z.boolean().default(true),
       onCrash: z.boolean().default(true),
       onUpdate: z.boolean().default(true),
+      /** FPS uyarısı (performans izleme) Discord'a da gitsin */
+      onPerformance: z.boolean().default(true),
     })
     .prefault({}),
+
+  /** Performans izleme: @oezi_monitor sunucu modu FPS / birim sayılarını loga yazar, uygulama CPU/RAM ölçer */
+  monitoring: z
+    .object({
+      enabled: z.boolean().default(true),
+      /** Ölçüm aralığı (sn) */
+      sampleSec: int(5, 300).default(10),
+      /** Sunucu FPS'i bu değerin altına düşüp ... */
+      fpsAlertBelow: int(0, 100).default(15),
+      /** ... bu kadar dakika kalırsa uyar (0: uyarı kapalı) */
+      fpsAlertMinutes: int(0, 120).default(3),
+    })
+    .prefault({}),
+
+  /** Zamanlı yedekleme */
+  backup: z
+    .object({
+      enabled: z.boolean().default(false),
+      /** Günlük yedek saatleri "HH:MM" */
+      times: z.array(z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/)).default(['04:30']),
+      /** Yedek klasörü; boşsa sunucu klasörünün yanında oezi-backups/<profil> */
+      targetDir: z.string().default(''),
+      /** Saklanacak yedek sayısı (eskiler silinir) */
+      keep: int(1, 365).default(14),
+      includeProfile: z.boolean().default(true),
+      includeMissions: z.boolean().default(true),
+      includeBattlEye: z.boolean().default(true),
+      includeKeys: z.boolean().default(false),
+      /** Ek dosya/klasörler (mutlak ya da sunucu klasörüne göre) */
+      extraPaths: z.array(z.string()).default([]),
+      database: z
+        .object({
+          enabled: z.boolean().default(false),
+          host: z.string().default('127.0.0.1'),
+          port: int(1, 65535).default(3306),
+          user: z.string().default(''),
+          password: z.string().default(''),
+          database: z.string().default(''),
+          /** mysqldump yolu; boşsa PATH'te aranır */
+          dumpPath: z.string().default(''),
+        })
+        .prefault({}),
+    })
+    .prefault({}),
+
+  /** Discord'da kendini güncelleyen durum mesajı (webhook ile) */
+  discordStatus: z
+    .object({
+      enabled: z.boolean().default(false),
+      /** Boşsa notifications.discordWebhook kullanılır */
+      webhook: z.string().default(''),
+      intervalSec: int(30, 3600).default(60),
+      showPlayers: z.boolean().default(true),
+      /** Uygulamanın yönettiği mesaj kimliği (elle değiştirme) */
+      messageId: z.string().default(''),
+    })
+    .prefault({}),
+
+  /** RCON ile belirli aralıklarla oyunculara gönderilen duyurular */
+  announcements: z
+    .object({
+      enabled: z.boolean().default(false),
+      intervalMin: int(1, 1440).default(15),
+      /** Sırayla gönderilir */
+      messages: z.array(z.string().max(400)).default([]),
+    })
+    .prefault({}),
+
+  /** Uygulama açılınca bu sunucu (kapalıysa) otomatik başlatılsın */
+  autoStartOnLaunch: z.boolean().default(false),
 });
 
 export type ServerProfile = z.infer<typeof ServerProfileSchema>;

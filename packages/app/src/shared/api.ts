@@ -69,6 +69,8 @@ export interface HostTestResult {
 export interface AppSettings {
   language: Lang;
   minimizeToTray: boolean;
+  /** Windows oturumu açılınca uygulama da (tepside) başlasın */
+  launchAtLogin: boolean;
   localSteamcmdPath: string;
   steamUsername: string;
   /** Sadece kaydederken; okurken boş */
