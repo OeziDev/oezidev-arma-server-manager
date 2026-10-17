@@ -20,6 +20,7 @@ import {
 } from './types.js';
 import { createSystemdApi } from './systemd.js';
 import { followWithRestart } from './follow.js';
+import { LinuxCpuTracker, type ProcessStat, linuxProcessStatsCommand, parseLinuxProcessStatsOutput } from '../monitor/procstat.js';
 
 const { Client } = ssh2;
 const posix = path.posix;
@@ -357,6 +358,28 @@ export class SshHost implements Host {
 
   exec(file: string, args: string[], opts: ExecOptions & { privileged?: boolean } = {}): Promise<ExecResult> {
     return this.runRaw(this.buildCommand(file, args, opts), opts);
+  }
+
+  private cpuTracker = new LinuxCpuTracker();
+
+  /** Süreç CPU% / RAM: tek kabuk komutuyla /proc/stat + /proc/<pid>/stat (ilk çağrıda 0,5 sn ara ile iki ölçüm). */
+  async processStats(pids: number[]): Promise<ProcessStat[]> {
+    const list = [...new Set(pids.filter((p) => Number.isInteger(p) && p > 0))];
+    if (!list.length) return [];
+    const read = async () => {
+      const res = await this.runShell(linuxProcessStatsCommand(list), { timeoutMs: 15000 });
+      if (res.code !== 0) throw new HostError(`Süreç bilgisi okunamadı: ${res.stderr.trim() || 'bağlantı yok'}`, 'query_failed');
+      const out = parseLinuxProcessStatsOutput(res.stdout);
+      if (out.total === null) throw new HostError('/proc/stat okunamadı', 'query_failed');
+      return { ...out, total: out.total };
+    };
+    if (!this.cpuTracker.hasBaseline(list)) {
+      const first = await read();
+      this.cpuTracker.update(first.total, first.samples, first.pageSize, list);
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    const r = await read();
+    return this.cpuTracker.update(r.total, r.samples, r.pageSize, list);
   }
 
   /** Host saatine göre şu an (Unix ms); ağ gecikmesinin yarısı eklenir. */

@@ -20,6 +20,17 @@ import {
 } from './types.js';
 import { createSystemdApi } from './systemd.js';
 import { followWithRestart } from './follow.js';
+import os from 'node:os';
+import {
+  LinuxCpuTracker,
+  type LinuxProcSample,
+  type ProcessStat,
+  WindowsCpuTracker,
+  parseProcPidStat,
+  parseProcStatTotal,
+  parseWinProcessStats,
+  winProcessStatsScript,
+} from '../monitor/procstat.js';
 
 const isWin = process.platform === 'win32';
 
@@ -518,6 +529,53 @@ export class LocalHost implements Host {
 
   async getRemoteTime(): Promise<number> {
     return Date.now();
+  }
+
+  private linuxCpu = new LinuxCpuTracker();
+  private winCpu = new WindowsCpuTracker();
+  private pageSize: Promise<number> | null = null;
+
+  /** Süreç CPU% / RAM: Windows'ta tek PowerShell çağrısı, Linux'ta /proc okuması (ilk çağrıda 0,5 sn ara ile iki ölçüm). */
+  async processStats(pids: number[]): Promise<ProcessStat[]> {
+    const list = [...new Set(pids.filter((p) => Number.isInteger(p) && p > 0))];
+    if (!list.length) return [];
+    if (isWin) {
+      const read = async () => {
+        const res = await this.exec('powershell', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encodePowerShellCommand(winProcessStatsScript(list))], {
+          timeoutMs: 20000,
+        });
+        return { rows: parseWinProcessStats(res.stdout), at: Date.now() };
+      };
+      if (!this.winCpu.hasBaseline(list)) {
+        const first = await read();
+        this.winCpu.update(first.rows, first.at, os.cpus().length, list);
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      const r = await read();
+      return this.winCpu.update(r.rows, r.at, os.cpus().length, list);
+    }
+    this.pageSize ??= this.exec('getconf', ['PAGESIZE'], { timeoutMs: 5000 })
+      .then((r) => Number(r.stdout.trim()) || 4096)
+      .catch(() => 4096);
+    const pageSize = await this.pageSize;
+    const read = async () => {
+      const total = parseProcStatTotal(await fsp.readFile('/proc/stat', 'utf8'));
+      const samples: LinuxProcSample[] = [];
+      for (const pid of list) {
+        const text = await fsp.readFile(`/proc/${pid}/stat`, 'utf8').catch(() => null);
+        const s = text ? parseProcPidStat(text) : null;
+        if (s) samples.push(s);
+      }
+      if (total === null) throw new HostError('/proc/stat okunamadı', 'query_failed');
+      return { total, samples };
+    };
+    if (!this.linuxCpu.hasBaseline(list)) {
+      const first = await read();
+      this.linuxCpu.update(first.total, first.samples, pageSize, list);
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    const r = await read();
+    return this.linuxCpu.update(r.total, r.samples, pageSize, list);
   }
 
   tail(p: string, onLines: (lines: string[]) => void, opts: TailOptions = {}): TailHandle {

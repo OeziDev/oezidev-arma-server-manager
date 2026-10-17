@@ -203,6 +203,12 @@ export interface Host {
    * journalctl --since gibi uzak saatle karşılaştırılan değerler için (VPS saati kayık olabilir).
    */
   getRemoteTime?(): Promise<number>;
+  /**
+   * Süreçlerin CPU / RAM kullanımı (performans izleme). CPU yüzdesi bu çağrı ile bir önceki çağrı arasındaki
+   * farktan, bütün makinenin kapasitesine göre (0-100) hesaplanır; ilk çağrı kısa bir ölçüm yapar.
+   * Olmayan süreçler sonuçta yer almaz.
+   */
+  processStats?(pids: number[]): Promise<{ pid: number; cpuPercent: number; memMB: number }[]>;
 }
 
 export class HostError extends Error {

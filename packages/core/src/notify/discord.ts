@@ -1,6 +1,6 @@
 /** Discord webhook bildirimleri (sunucu başladı, durdu, çöktü, güncellendi...). */
 
-export type NotifyEvent = 'start' | 'stop' | 'crash' | 'restart' | 'update' | 'info';
+export type NotifyEvent = 'start' | 'stop' | 'crash' | 'restart' | 'update' | 'info' | 'performance';
 
 const COLORS: Record<NotifyEvent, number> = {
   start: 0x2ecc71,
@@ -9,6 +9,7 @@ const COLORS: Record<NotifyEvent, number> = {
   restart: 0xf1c40f,
   update: 0x3498db,
   info: 0x7f8c8d,
+  performance: 0xe67e22,
 };
 
 export interface Notifier {
@@ -61,7 +62,7 @@ export class DiscordNotifier implements Notifier {
 }
 
 /** 429 cevabındaki bekleme süresi (gövdedeki retry_after saniye, yoksa Retry-After başlığı). */
-async function retryAfterMs(res: Response): Promise<number> {
+export async function retryAfterMs(res: Response): Promise<number> {
   try {
     const data = (await res.clone().json()) as { retry_after?: unknown };
     const sec = Number(data?.retry_after);
