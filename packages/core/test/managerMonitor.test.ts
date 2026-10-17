@@ -7,7 +7,7 @@ import { createProfile, type ServerProfileInput } from '../src/model/profile.js'
 import { parsePbo } from '../src/monitor/pbo.js';
 import type { MetricSample } from '../src/monitor/metrics.js';
 import type { Notifier, NotifyEvent } from '../src/notify/discord.js';
-import { type Notice, ServerManager } from '../src/supervisor/manager.js';
+import { type Notice, ServerManager, processStatIntervalMs } from '../src/supervisor/manager.js';
 import { FakeRconServer } from './fakeRcon.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -44,7 +44,7 @@ afterEach(async () => {
   servers.splice(0).forEach((s) => s.close());
 });
 
-async function setup(input: ServerProfileInput = {}, extra: { notifier?: Notifier } = {}) {
+async function setup(input: ServerProfileInput = {}, extra: { notifier?: Notifier; timers?: Record<string, number>; fetchImpl?: typeof fetch } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oezi-mon-mgr-'));
   fs.writeFileSync(path.join(dir, 'arma3server_x64'), FAKE_ARMA, { mode: 0o755 });
   const rcon = new FakeRconServer('RconSifresi123');
@@ -63,7 +63,8 @@ async function setup(input: ServerProfileInput = {}, extra: { notifier?: Notifie
     profile,
     host: new LocalHost(),
     notifier: extra.notifier ?? null,
-    timers: { monitorMs: 200, runningAfterMs: 300, rconDelayMs: 100, playersMs: 300, stopTimeoutMs: 3000, schedulerMs: 3_600_000, perfMs: 300, announceMs: 250 },
+    timers: { monitorMs: 200, runningAfterMs: 300, rconDelayMs: 100, playersMs: 300, stopTimeoutMs: 3000, schedulerMs: 3_600_000, perfMs: 300, announceMs: 250, ...extra.timers },
+    ...(extra.fetchImpl ? { fetchImpl: extra.fetchImpl } : {}),
   });
   managers.push(mgr);
   return { dir, rcon, mgr };
@@ -109,30 +110,94 @@ describe('ServerManager performans izleme', () => {
     expect(fs.existsSync(path.join(b.dir, '@oezi_monitor'))).toBe(false);
   });
 
-  it('FPS uyarısı: bildirim (onPerformance) bir kez, düzelince yeniden kurulur', async () => {
+  it('ek parametrede -serverMod= varsa ayrı -serverMod eklenmez, mevcut değere eklenir', async () => {
+    const { mgr } = await setup({ launch: { serverMods: [], extraArgs: '-noSound "-serverMod=@extdb3;@life server"' } });
+    await mgr.start();
+    await waitFor(() => mgr.getLogBuffer().some((l) => l.line.startsWith('FAKE ARMA')), 5000, 'log');
+    const line = mgr.getLogBuffer().find((l) => l.line.startsWith('FAKE ARMA'))!.line;
+    expect(line).toContain('-serverMod=@extdb3;@life server;@oezi_monitor');
+    expect(line.match(/-serverMod=/g)).toHaveLength(1);
+    expect(mgr.getLogBuffer().some((l) => l.line.includes('@oezi_monitor oradaki listeye eklendi'))).toBe(true);
+  });
+
+  it('süreç CPU/RAM ölçümü FPS örneklerinden ayrı: aradaki örnekler son ölçümü kullanır', async () => {
+    const { mgr } = await setup({}, { timers: { procStatMs: 1500 } });
+    const host = (mgr as unknown as { host: LocalHost }).host;
+    const orig = host.processStats.bind(host);
+    let calls = 0;
+    host.processStats = async (pids: number[]) => {
+      calls++;
+      return orig(pids);
+    };
+    const samples: MetricSample[] = [];
+    mgr.on('metrics', (s) => samples.push(s));
+    await mgr.start();
+    await waitFor(() => samples.filter((s) => s.cpu !== undefined).length >= 8, 8000, 'örnekler');
+    const withCpu = samples.filter((s) => s.cpu !== undefined);
+    expect(calls).toBeLessThanOrEqual(Math.ceil(withCpu.length / 3) + 1);
+    expect(withCpu.some((s, i) => i > 0 && s.cpu === withCpu[i - 1]!.cpu && s.memMB === withCpu[i - 1]!.memMB)).toBe(true);
+  });
+
+  it('ölçüm aralığı: Windows\'ta en az 30 sn, Linux\'ta sampleSec', () => {
+    expect(processStatIntervalMs('windows', 10)).toBe(30_000);
+    expect(processStatIntervalMs('windows', 60)).toBe(60_000);
+    expect(processStatIntervalMs('linux', 10)).toBe(10_000);
+  });
+
+  it('Discord durum mesajı ilk attach tamamlanmadan gönderilmez', async () => {
+    const calls: string[] = [];
+    const fetchImpl = (async (url: string, init: RequestInit) => {
+      calls.push(`${init.method} ${url}`);
+      return new Response(JSON.stringify({ id: '42' }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const { mgr } = await setup(
+      { discordStatus: { enabled: true, webhook: 'https://discord.com/api/webhooks/1/abc' } },
+      { fetchImpl },
+    );
+    await sleep(1500);
+    expect(calls).toEqual([]);
+    await mgr.attach();
+    await waitFor(() => calls.length > 0, 4000, 'discord');
+    expect(calls[0]).toBe('POST https://discord.com/api/webhooks/1/abc?wait=true');
+  });
+
+  it('FPS uyarısı: bildirim (onPerformance) bir kez, düzelince yeniden kurulur; aynı sunucu en fazla 30 dk\'da bir uyarır', async () => {
     const events: { event: NotifyEvent; title: string }[] = [];
     const notifier: Notifier = { notify: async (event, title) => void events.push({ event, title }) };
-    const { mgr } = await setup({ monitoring: { fpsAlertBelow: 15, fpsAlertMinutes: 1 } }, { notifier });
+    const { mgr } = await setup({ monitoring: { fpsAlertBelow: 15, fpsAlertMinutes: 1 }, notifications: { onPerformance: true } }, { notifier });
     const notices: Notice[] = [];
     mgr.on('notice', (n) => notices.push(n));
     const check = (t: number, fps: number) => (mgr as unknown as { checkFps(t: number, fps: number): void }).checkFps(t, fps);
-    for (let t = 0; t <= 120_000; t += 10_000) check(t, 8);
+    const feed = (from: number, to: number, fps: number) => {
+      for (let t = from; t <= to; t += 10_000) check(t, fps);
+    };
+    feed(0, 120_000, 8);
     const warn = notices.filter((n) => n.level === 'warning');
     expect(warn).toHaveLength(1);
     expect(warn[0]!.message.tr).toContain("FPS'i 1 dakikadır 15 altında");
     expect(warn[0]!.message.en).toContain('below 15 for 1 minutes');
     await sleep(20);
     expect(events).toEqual([{ event: 'performance', title: 'Düşük sunucu FPS' }]);
-    for (let t = 130_000; t <= 260_000; t += 10_000) check(t, 40);
-    for (let t = 270_000; t <= 340_000; t += 10_000) check(t, 8);
+    // Düzelip yeniden düşse de 30 dk dolmadan ikinci uyarı yok
+    feed(130_000, 260_000, 40);
+    feed(270_000, 340_000, 8);
+    expect(notices.filter((n) => n.level === 'warning')).toHaveLength(1);
+    // İlk uyarıdan (60 sn) 30 dk sonra yeniden
+    feed(350_000, 1_870_000, 8);
     expect(notices.filter((n) => n.level === 'warning')).toHaveLength(2);
+    await sleep(20);
+    expect(events).toHaveLength(2);
     // onPerformance kapalıysa Discord'a gitmez
     mgr.updateProfile(createProfile({ ...mgr.getProfile(), notifications: { onPerformance: false } }));
-    for (let t = 350_000; t <= 480_000; t += 10_000) check(t, 40);
-    for (let t = 490_000; t <= 560_000; t += 10_000) check(t, 8);
+    feed(1_880_000, 2_010_000, 40);
+    feed(2_020_000, 3_700_000, 8);
     await sleep(20);
     expect(notices.filter((n) => n.level === 'warning')).toHaveLength(3);
     expect(events).toHaveLength(2);
+  });
+
+  it('onPerformance varsayılan olarak kapalı', () => {
+    expect(createProfile({}).notifications.onPerformance).toBe(false);
   });
 });
 

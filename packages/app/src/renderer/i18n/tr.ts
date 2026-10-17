@@ -716,6 +716,7 @@ export const tr = {
   'field.monitoring.enabled': 'Performans izleme',
   'help.monitoring.enabled': '"OeziDev Monitor" sunucu modunu otomatik ekler ve CPU/RAM ölçer.',
   'field.monitoring.sampleSec': 'Ölçüm aralığı',
+  'help.monitoring.sampleSec': 'FPS her 10 sn\'de bir moddan gelir. Bu ayar CPU/RAM ölçümünün ve grafiğe kayıt aralığıdır (Windows\'ta CPU/RAM en az 30 sn\'de bir ölçülür).',
   'field.monitoring.fpsAlertBelow': 'FPS uyarı sınırı',
   'help.monitoring.fpsAlertBelow': 'Sunucu FPS\'i bunun altına düşerse…',
   'field.monitoring.fpsAlertMinutes': 'Uyarı süresi',

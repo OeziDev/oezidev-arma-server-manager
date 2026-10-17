@@ -118,6 +118,62 @@ describe('Discord durum mesajı', () => {
     expect(embed.fields.some((x: any) => x.name.startsWith('Oyuncu listesi'))).toBe(false);
   });
 
+  it('webhook adresindeki thread_id POST ve PATCH isteklerinde korunur', async () => {
+    const { impl, calls } = fakeFetch([json(200, { id: '7777' }), json(200, { id: '7777' })]);
+    const src = source();
+    src.setProfile(createProfile({ ...src.getProfile(), discordStatus: { enabled: true, webhook: `${HOOK}?thread_id=998877&wait=false` } }));
+    const up = new DiscordStatusUpdater({ source: src, fetchImpl: impl });
+    expect(up.isEnabled()).toBe(true);
+    await up.update();
+    await up.update();
+    expect(calls.map((c) => `${c.method} ${c.url}`)).toEqual([`POST ${HOOK}?wait=true&thread_id=998877`, `PATCH ${HOOK}/messages/7777?thread_id=998877`]);
+  });
+
+  it('silinmiş mesaj logu 10 dk\'da bir; 10015 (Unknown Webhook) gelince webhook değişene kadar istek atılmaz', async () => {
+    const { impl, calls } = fakeFetch([
+      json(404, { message: 'Unknown Message', code: 10008 }),
+      json(200, { id: '1' }),
+      json(404, { message: 'Unknown Message', code: 10008 }),
+      json(200, { id: '2' }),
+      json(404, { message: 'Unknown Webhook', code: 10015 }),
+    ]);
+    const logs: string[] = [];
+    const warnings: { tr: string; en: string }[] = [];
+    const src = source({}, '5555');
+    const up = new DiscordStatusUpdater({ source: src, fetchImpl: impl, log: (l) => logs.push(l), onWarning: (m) => warnings.push(m) });
+    await up.update(); // PATCH 404 -> POST
+    await up.update(); // PATCH 1 404 -> POST
+    expect(logs.filter((l) => l.includes('silinmiş'))).toHaveLength(1);
+    expect(calls).toHaveLength(4);
+    // Webhook silindi: PATCH 10015 -> doğrudan durur (POST denenmez)
+    await expect(up.update()).rejects.toThrow(/404/);
+    expect(calls).toHaveLength(5);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]!.en).toContain('webhook');
+    await up.update();
+    await up.update();
+    expect(calls).toHaveLength(5);
+    expect(warnings).toHaveLength(1);
+    // Webhook değişince yeniden dener
+    src.setProfile(createProfile({ ...src.getProfile(), discordStatus: { enabled: true, webhook: 'https://discord.com/api/webhooks/999/yeni' } }));
+    await up.update();
+    expect(calls).toHaveLength(6);
+    expect(calls[5]!.url).toBe('https://discord.com/api/webhooks/999/yeni?wait=true');
+  });
+
+  it('POST 10015 de durdurur; resetBackoff ile yeniden denenir', async () => {
+    const { impl, calls } = fakeFetch([json(404, { message: 'Unknown Webhook', code: 10015 }), json(200, { id: '3' })]);
+    const warnings: unknown[] = [];
+    const up = new DiscordStatusUpdater({ source: source(), fetchImpl: impl, onWarning: (m) => warnings.push(m) });
+    await expect(up.update()).rejects.toThrow();
+    await up.update();
+    expect(calls).toHaveLength(1);
+    expect(warnings).toHaveLength(1);
+    up.resetBackoff();
+    await up.update();
+    expect(calls.map((c) => c.method)).toEqual(['POST', 'POST']);
+  });
+
   it('oyuncu listesi 1024 karaktere sığdırılır', () => {
     const names = Array.from({ length: 200 }, (_, i) => `Oyuncu_Adi_Uzun_${i}`);
     const text = fitPlayerList(names, (n) => `... ve ${n} kişi daha`);

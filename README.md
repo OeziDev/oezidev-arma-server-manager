@@ -53,6 +53,14 @@ Windows'ta çalışır; aynı uygulamadan hem bu bilgisayardaki sunucuları hem 
 - Zamanlı restart: günlük saatler, oyunculara RCON ile geri sayım mesajları, istenirse restart sırasında SteamCMD ile güncelleme.
 - Uygulama yeniden açılınca çalışan sunucuları bulur ve takibe devam eder. Aynı exe ile çalışan başka profillerin süreçleri karıştırılmaz.
 
+**Performans ve takip** (1.1)
+- Performans paneli: sunucu FPS'i, CPU, RAM, oyuncu, AI, grup ve araç sayısı; 15 dk ile 24 saat arası grafikler. FPS, uygulamanın kendi eklediği küçük sunucu modu `@oezi_monitor` ile ölçülür (imza gerektirmez, oyuncular indirmez).
+- FPS uzun süre düşük kalırsa uyarı (isteğe bağlı Discord bildirimi).
+- Discord durum mesajı: kanalda kendini güncelleyen tek mesaj (durum, oyuncular, FPS, sonraki restart).
+- Oyuncu geçmişi: kim ne zaman girdi/çıktı, toplam süre, kullandığı isimler, notlar; GUID/IP ile tek sunucuda ya da bütün sunucularda ban.
+- Zamanlı yedekleme: profil, görevler, BattlEye, anahtarlar, ek klasörler ve MySQL dökümü; eski yedekler otomatik silinir.
+- Otomatik duyurular (RCON), Windows açılınca uygulamayı başlatma, uygulama açılınca sunucuyu otomatik başlatma.
+
 **Konsol ve RCON**
 - Canlı log (Windows'ta RPT, Linux'ta journald), filtre, hata/uyarı renklendirme, RCON komut satırı.
 - Oyuncu listesi (ping, GUID), mesaj, kick, ban, ban listesi, GUID/IP ile ban, sunucu kilitleme, sohbet ve giriş/çıkış akışı.

@@ -4,6 +4,7 @@ import os from 'node:os';
 import {
   type BackupFileInfo,
   DiscordNotifier,
+  HISTORY_RETENTION_MS,
   PlayerHistory,
   type PlayerHistoryStats,
   type PlayerSearchQuery,
@@ -1395,15 +1396,19 @@ export class AppServices {
     }
   }
 
-  /** Dosyada aynı kaydın çok satırı biriktiyse yeniden yaz */
-  private async compactHistory(id: string, h: PlayerHistory, force = false): Promise<void> {
-    if (!force && !h.shouldCompact()) return;
+  /**
+   * Dosyada aynı kaydın çok satırı biriktiyse ya da saklama süresini (180 gün) aşan oturum varsa yeniden yaz.
+   * Açılışta ve günde bir çalışır: boyuttan bağımsız olarak eski oturumlar atılır, dosya sınırsız büyümez.
+   */
+  private async compactHistory(id: string, h: PlayerHistory, force = false, now = Date.now()): Promise<void> {
+    const cutoff = now - HISTORY_RETENTION_MS;
+    if (!force && !h.shouldCompact() && !h.hasClosedBefore(cutoff)) return;
     await h.flush();
     const entry = this.histories.get(id);
     if (!entry || (await entry.ready) !== h) return;
     // flush ile yazma arasında araya başka yazma girmesin diye senkron: compact() + atomik yazma
     try {
-      entry.storage.rewrite(h.compact());
+      entry.storage.rewrite(h.compact({ dropClosedBefore: cutoff }));
     } catch (err) {
       console.error(`Oyuncu geçmişi sıkıştırılamadı (${id}):`, err);
     }

@@ -2,14 +2,14 @@ import { EventEmitter } from 'node:events';
 import { generateArma3Profile, generateBasicCfg, generateBeServerCfg, generateServerCfg } from '../config/generators.js';
 import { type Host, type TailHandle, processMatches } from '../host/types.js';
 import { generateSystemdUnit } from '../host/systemd.js';
-import { buildHeadlessLaunch, buildServerLaunch } from '../launch/commandLine.js';
-import { type ResolvedPaths, pathLib, resolvePaths } from '../launch/paths.js';
+import { appendServerModToExtraArgs, buildHeadlessLaunch, buildServerLaunch } from '../launch/commandLine.js';
+import { type HostOs, type ResolvedPaths, pathLib, resolvePaths } from '../launch/paths.js';
 import { type ServerProfile, effectiveRconPort } from '../model/profile.js';
 import type { Notifier, NotifyEvent } from '../notify/discord.js';
 import { DiscordStatusUpdater } from '../notify/discordStatus.js';
 import { FpsAlertTracker } from '../monitor/fpsAlert.js';
 import { type MetricSample, type MetricsJSON, MetricsStore } from '../monitor/metrics.js';
-import { MONITOR_MOD_FOLDER, ensureMonitorMod } from '../monitor/monitorMod.js';
+import { MONITOR_MOD_FOLDER, MONITOR_SCRIPT_INTERVAL_SEC, ensureMonitorMod } from '../monitor/monitorMod.js';
 import { type PerfSample, PERF_TAG, parsePerfLine } from '../monitor/perf.js';
 import { BattlEyeRcon, type RconPlayer, type RconState } from '../rcon/battleye.js';
 import { type Issue, hasBlockingIssues, validateProfile } from '../validate.js';
@@ -101,9 +101,19 @@ export interface ManagerOptions {
     errorMessageGraceMs: number;
     /** Performans ölçüm aralığı; 0 ise profile.monitoring.sampleSec */
     perfMs: number;
+    /** Süreç CPU/RAM ölçüm aralığı; 0 ise processStatIntervalMs(os, sampleSec) */
+    procStatMs: number;
     /** Duyuru aralığı; 0 ise profile.announcements.intervalMin */
     announceMs: number;
   }>;
+}
+
+/**
+ * Süreç CPU/RAM ölçüm aralığı (ms). Windows'ta her ölçüm bir PowerShell çalıştırır (pahalı): en az 30 sn.
+ * Aradaki birleşik örnekler son ölçümü yeniden kullanır; FPS @oezi_monitor'dan ayrıca gelir.
+ */
+export function processStatIntervalMs(os: HostOs, sampleSec: number): number {
+  return (os === 'windows' ? Math.max(30, sampleSec) : sampleSec) * 1000;
 }
 
 interface DirectState {
@@ -240,7 +250,11 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
   private currentPerf: StatusInfo['perf'];
   private perfTimer: NodeJS.Timeout | null = null;
   private perfSampling = false;
+  /** Son süreç CPU/RAM ölçümü (aradaki örneklerde yeniden kullanılır) */
+  private lastProcStat: { t: number; cpu?: number; memMB?: number } | null = null;
   private readonly fpsAlert = new FpsAlertTracker();
+  /** -serverMod birleştirme bilgisi bir kez loglansın */
+  private serverModMergeLogged = false;
   /** Son deploy'da @oezi_monitor yazılabildi mi (yazılamadıysa mod komut satırına eklenmez) */
   private monitorModOk = true;
   private lastPlayers: RconPlayer[] = [];
@@ -265,6 +279,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       deadConfirmations: 2,
       errorMessageGraceMs: ERROR_MESSAGE_GRACE_MS,
       perfMs: 0,
+      procStatMs: 0,
       announceMs: 0,
       ...opts.timers,
     };
@@ -275,6 +290,9 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
       lang: opts.discordStatusLang ?? 'tr',
       log: (line) => this.appLog(line),
+      onWarning: (m) => {
+        if (!this.disposed) this.notice('warning', m.tr, m.en);
+      },
       onMessageId: (id) => {
         if (this.disposed) return;
         try {
@@ -285,7 +303,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
         this.emit('discordStatusMessageId', id);
       },
     });
-    this.statusUpdater.start();
+    // Güncelleyici ilk attach (ya da ilk durum değişikliği) sonrası başlar: açılışta çalışan sunucu için "Kapalı" yazmasın
   }
 
   /* ---------------- durum ---------------- */
@@ -349,6 +367,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     }
     if (prev.monitoring.fpsAlertBelow !== p.monitoring.fpsAlertBelow || prev.monitoring.fpsAlertMinutes !== p.monitoring.fpsAlertMinutes) this.fpsAlert.reset();
     if (JSON.stringify({ ...prev.discordStatus, messageId: '' }) !== JSON.stringify({ ...p.discordStatus, messageId: '' }) || prev.notifications.discordWebhook !== p.notifications.discordWebhook) {
+      this.statusUpdater.resetBackoff();
       this.statusUpdater.poke();
     }
     const before = this.rconSnapshotFrom(prev);
@@ -416,6 +435,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
 
   /** Discord durum mesajını hemen güncelle (yoksa oluştur). Kapalıysa bir şey yapmaz; hata fırlatabilir. */
   refreshDiscordStatus(): Promise<void> {
+    this.statusUpdater.resetBackoff();
     return this.statusUpdater.update();
   }
 
@@ -433,7 +453,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       this.currentPerf = undefined;
       this.lastPlayers = [];
     }
-    this.statusUpdater.poke();
+    this.kickStatusUpdater();
     // "starting" dışına çıkınca hazır olma beklemesi biter
     if (s !== 'starting') {
       this.clearReadiness();
@@ -638,7 +658,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     const m = this.profile.monitoring;
     if (!m.enabled) return;
     try {
-      const res = await ensureMonitorMod(this.host, rp.serverDir, m.sampleSec);
+      const res = await ensureMonitorMod(this.host, rp.serverDir);
       this.monitorModOk = true;
       if (res.changed) this.appLog(`Performans izleme modu yazıldı: ${res.folder}`);
     } catch (err) {
@@ -653,6 +673,21 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     if (!p.monitoring.enabled || !this.monitorModOk) return p;
     const has = p.launch.serverMods.some((m) => m.enabled && m.path.trim().split(/[\\/]/).filter(Boolean).pop()?.toLowerCase() === MONITOR_MOD_FOLDER);
     if (has) return p;
+    // Ek parametrelerde kendi -serverMod= varsa ikinci bir -serverMod üretme (Arma birini yok sayar): mevcut değere ekle
+    let merged: string | null = null;
+    try {
+      merged = appendServerModToExtraArgs(p.launch.extraArgs, MONITOR_MOD_FOLDER);
+    } catch (err) {
+      this.appLog(`Ek parametreler okunamadı, ${MONITOR_MOD_FOLDER} eklenmedi: ${(err as Error).message}`);
+      return p;
+    }
+    if (merged !== null) {
+      if (merged !== p.launch.extraArgs && !this.serverModMergeLogged) {
+        this.serverModMergeLogged = true;
+        this.appLog(`Ek parametrelerde -serverMod= var: ${MONITOR_MOD_FOLDER} oradaki listeye eklendi`);
+      }
+      return { ...p, launch: { ...p.launch, extraArgs: merged } };
+    }
     return {
       ...p,
       launch: {
@@ -758,6 +793,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     this.rconCfg = this.rconSnapshotFrom(this.profile);
     this.fpsAlert.reset();
     this.lastPerf = undefined;
+    this.lastProcStat = null;
     this.currentPerf = undefined;
     this.setStatus('starting');
     this.deadStreak = 0;
@@ -1212,7 +1248,20 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     return this.exclusive(() => this.attachInner());
   }
 
+  /** Discord durum güncelleyicisini başlat (ilk seferde) ya da hemen güncellemeye dürt */
+  private kickStatusUpdater() {
+    if (this.disposed) return;
+    if (this.statusUpdater.isRunning) this.statusUpdater.poke();
+    else this.statusUpdater.start();
+  }
+
   private async attachInner(): Promise<void> {
+    await this.attachBody();
+    // Durum artık gerçek: Discord durum mesajı bundan sonra güncellenebilir
+    if (this.attached && !this.disposed && !this.statusUpdater.isRunning) this.statusUpdater.start();
+  }
+
+  private async attachBody(): Promise<void> {
     try {
       await this.host.connect();
     } catch (err) {
@@ -1349,7 +1398,15 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     try {
       let cpu: number | undefined;
       let memMB: number | undefined;
-      if (typeof this.host.processStats === 'function') {
+      const now = Date.now();
+      const tickMs = this.t.perfMs > 0 ? this.t.perfMs : m.sampleSec * 1000;
+      const procMs = this.t.procStatMs > 0 ? this.t.procStatMs : processStatIntervalMs(this.host.os, m.sampleSec);
+      // Zamanlayıcı kayması için biraz tolerans: 10 sn'lik tikte 30 sn'lik ölçüm 3. tikte yapılsın
+      const reuse = this.lastProcStat && now - this.lastProcStat.t < procMs - Math.min(1000, tickMs / 2);
+      if (reuse) {
+        cpu = this.lastProcStat!.cpu;
+        memMB = this.lastProcStat!.memMB;
+      } else if (typeof this.host.processStats === 'function') {
         const pids = await this.monitoredPids();
         if (pids.length) {
           try {
@@ -1357,6 +1414,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
             if (stats.length) {
               cpu = Math.round(stats.reduce((a, x) => a + x.cpuPercent, 0) * 10) / 10;
               memMB = Math.round(stats.reduce((a, x) => a + x.memMB, 0));
+              this.lastProcStat = { t: now, cpu, memMB };
             }
           } catch (err) {
             this.appLogThrottled(`Süreç CPU/RAM ölçülemedi: ${(err as Error).message}`);
@@ -1373,7 +1431,8 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
   /** Birleşik örneği kaydet ve yay (test için ayrı) */
   private recordSample(t: number, cpu?: number, memMB?: number) {
     const m = this.profile.monitoring;
-    const freshMs = Math.max(this.t.perfMs > 0 ? this.t.perfMs : m.sampleSec * 1000, 1000) * 2.5;
+    // FPS satırı mod'dan sabit aralıkla gelir: örnekleme daha sıksa bile o aralığa göre taze say
+    const freshMs = (this.t.perfMs > 0 ? Math.max(this.t.perfMs, 1000) : Math.max(m.sampleSec, MONITOR_SCRIPT_INTERVAL_SEC) * 1000) * 2.5;
     const perf = this.lastPerf && t - this.lastPerf.t <= freshMs ? this.lastPerf : undefined;
     if (!perf && cpu === undefined && memMB === undefined) return;
     const sample: MetricSample = {

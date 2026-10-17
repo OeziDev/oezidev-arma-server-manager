@@ -143,6 +143,24 @@ describe('oyuncu geçmişi', () => {
     expect(fs.existsSync(file)).toBe(false);
   });
 
+  it('açılışta 180 günden eski kapanmış oturumlar dosya küçük olsa da atılır', async () => {
+    const p = svc.createProfile({ name: 'Eski', hostId: 'local', paths: { serverDir: path.join(dir, 'srv') } });
+    const now = Date.now();
+    const day = 24 * 3600_000;
+    const line = (id: string, guid: string, join: number, leave: number) => JSON.stringify({ v: 1, k: 's', id, guid, name: id, ip: '', pid: 0, join, leave });
+    const file = historyFile(dataDir, p.id);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, [line('eski', 'a'.repeat(32), now - 200 * day, now - 200 * day + 60_000), line('yeni', 'b'.repeat(32), now - day, now - day + 60_000)].join('\n') + '\n');
+    await svc.shutdown();
+    svc = makeSvc();
+    await svc.init();
+    await wait(100);
+    const kept = fs.readFileSync(file, 'utf8').trim().split('\n');
+    expect(kept).toHaveLength(1);
+    expect(kept[0]).toContain('"id":"yeni"');
+    expect((await svc.historySearch(p.id, {})).map((x) => x.name)).toEqual(['yeni']);
+  });
+
   it('JSONL depo: yarım satır yok sayılır, yeniden yazma atomik', async () => {
     const file = path.join(dir, 'h', 'x.jsonl');
     const st = new JsonlHistoryStorage(file);

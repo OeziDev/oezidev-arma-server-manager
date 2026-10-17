@@ -15,7 +15,9 @@ import {
   buildWindowsZipScript,
   deleteBackup,
   encodePowerShell,
+  isUnderProgramFiles,
   listBackups,
+  mysqlOptionValue,
   nextBackupTime,
   planBackupItems,
   pruneBackups,
@@ -87,7 +89,37 @@ describe('yedek adlandırma', () => {
   });
 
   it('mysql seçenek dosyası şifreyi doğru tırnaklar', () => {
-    expect(buildMysqlOptionFile('a"b\\c #d')).toBe('[client]\npassword="a"b\\\\c #d"\n');
+    expect(buildMysqlOptionFile('a"b\\c #d')).toBe('[client]\npassword="a\\"b\\\\c #d"\n');
+  });
+
+  it('mysql seçenek değeri MySQL kaçışlarıyla aynen geri okunur', () => {
+    // MySQL (my_default.cc) okuyucusu: aynı tırnakla başlayıp bitiyorsa soy, \\ kaçışlarını çöz
+    const mysqlRead = (raw: string): string => {
+      let v = raw;
+      if (v.length >= 2 && (v[0] === '"' || v[0] === "'") && v[v.length - 1] === v[0]) v = v.slice(1, -1);
+      const map: Record<string, string> = { n: '\n', t: '\t', r: '\r', b: '\b', s: ' ', '"': '"', "'": "'", '\\': '\\' };
+      let out = '';
+      for (let i = 0; i < v.length; i++) {
+        if (v[i] === '\\' && i < v.length - 1) {
+          const c = v[++i]!;
+          out += map[c] ?? `\\${c}`;
+        } else out += v[i];
+      }
+      return out;
+    };
+    const pw = 'a"b\\c#d e';
+    expect(mysqlOptionValue(pw)).toBe('"a\\"b\\\\c#d e"');
+    for (const x of [pw, 'son\\', '"', '\\"', 'sekme\tsatır\nson', "tek'tırnak", 'şifre ğüş']) {
+      expect(mysqlRead(mysqlOptionValue(x))).toBe(x);
+    }
+  });
+
+  it('Program Files altındaki yedek klasörü algılanır', () => {
+    expect(isUnderProgramFiles('C:\\Program Files (x86)\\Steam\\steamapps\\common\\oezi-backups\\a1b2c3d4', 'windows')).toBe(true);
+    expect(isUnderProgramFiles('c:\\program files\\Arma', 'windows')).toBe(true);
+    expect(isUnderProgramFiles('D:\\Program Files Yedek\\x', 'windows')).toBe(false);
+    expect(isUnderProgramFiles('D:\\Yedek\\Program Files', 'windows')).toBe(false);
+    expect(isUnderProgramFiles('/Program Files/x', 'linux')).toBe(false);
   });
 
   it('Windows zip betiği (saf)', () => {
@@ -281,7 +313,7 @@ echo "CREATE TABLE players (id int);" >> "$out"
       expect(argv.endsWith(' altislife')).toBe(true);
       expect(rec).toContain('ENV_MYSQL_PWD: yok');
       expect(rec).toContain('MODE: 600');
-      expect(rec).toContain('CNF: [client]|password="Gizli Şifre"#1"|');
+      expect(rec).toContain('CNF: [client]|password="Gizli Şifre\\"#1"|');
       const cnfPath = rec.split('\n').find((l) => l.startsWith('CNFPATH: '))!.slice(9);
       expect(fs.existsSync(cnfPath)).toBe(false);
       expect(tarList(res.file)).toContain('database/altislife.sql');
@@ -304,6 +336,20 @@ echo "CREATE TABLE players (id int);" >> "$out"
     const profile = profileFor(srv.serverDir, { includeProfile: false, includeMissions: false });
     const plan = await planBackupItems(host, profile);
     expect(plan.items.map((i) => i.name)).toEqual(['battleye', 'battleye-profile']);
+  });
+
+  it('planBackupItems: sunucu klasörünün kendisi ya da üstü (profil / ek yol) yedeklenmez', async () => {
+    const profile = createProfile({
+      id: ID,
+      name: 'Tam',
+      paths: { serverDir: srv.serverDir, profilesDir: srv.serverDir },
+      backup: { includeMissions: false, includeBattlEye: false, includeKeys: false, extraPaths: ['.', path.dirname(srv.serverDir), srv.extraFile] },
+    });
+    const plan = await planBackupItems(host, profile);
+    const reason = 'Sunucu klasörünün tamamı yedeklenmez';
+    expect(plan.skipped.filter((x) => x.reason === reason).map((x) => x.path)).toEqual([srv.serverDir, srv.serverDir, path.dirname(srv.serverDir)]);
+    // Sunucu klasöründeki tek dosya yine yedeklenir
+    expect(plan.items.map((i) => i.source)).toEqual([srv.extraFile]);
   });
 
   it('hiçbir öğe yoksa hata verir', async () => {

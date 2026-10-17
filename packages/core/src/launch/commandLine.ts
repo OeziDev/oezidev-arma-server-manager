@@ -7,17 +7,29 @@ import { type HostOs, type ResolvedPaths, resolvePaths } from './paths.js';
  * güvenle geçer (TADST'deki tırnaksız -name/-pid sorunları burada yok).
  */
 
-/** Kullanıcının yazdığı ek parametreleri tırnak kurallarına uyarak böler. */
-export function splitArgs(input: string): string[] {
-  const out: string[] = [];
+interface ArgToken {
+  value: string;
+  /** Ham metindeki başlangıç / bitiş (bitiş hariç) */
+  start: number;
+  end: number;
+  /** Ham token kapanış tırnağıyla mı bitiyor */
+  endsQuoted: boolean;
+}
+
+/** splitArgs'ın konum bilgili hâli: değiştirilecek tek token'ı ham metinde bulabilmek için. */
+function tokenizeArgs(input: string): ArgToken[] {
+  const out: ArgToken[] = [];
   let cur = '';
   let inQuote: '"' | "'" | null = null;
   let hasToken = false;
+  let start = 0;
+  let endsQuoted = false;
   for (let i = 0; i < input.length; i++) {
     const ch = input[i]!;
     if (inQuote) {
       if (ch === inQuote) {
         inQuote = null;
+        endsQuoted = true;
       } else if (ch === '\\' && inQuote === '"' && input[i + 1] === '"') {
         cur += '"';
         i++;
@@ -26,25 +38,57 @@ export function splitArgs(input: string): string[] {
       }
       continue;
     }
-    if (ch === '"' || ch === "'") {
-      inQuote = ch;
-      hasToken = true;
-      continue;
-    }
     if (/\s/.test(ch)) {
       if (hasToken) {
-        out.push(cur);
+        out.push({ value: cur, start, end: i, endsQuoted });
         cur = '';
         hasToken = false;
       }
       continue;
     }
+    if (!hasToken) {
+      start = i;
+      hasToken = true;
+    }
+    endsQuoted = false;
+    if (ch === '"' || ch === "'") {
+      inQuote = ch;
+      continue;
+    }
     cur += ch;
-    hasToken = true;
   }
   if (inQuote) throw new Error('Ek parametrelerde kapanmamış tırnak var');
-  if (hasToken) out.push(cur);
+  if (hasToken) out.push({ value: cur, start, end: input.length, endsQuoted });
   return out;
+}
+
+/** Kullanıcının yazdığı ek parametreleri tırnak kurallarına uyarak böler. */
+export function splitArgs(input: string): string[] {
+  return tokenizeArgs(input).map((t) => t.value);
+}
+
+const SERVERMOD_RE = /^-servermod=/i;
+
+/** Ek parametrelerde -serverMod= var mı (tırnaklar dikkate alınır). */
+export function extraArgsHaveServerMod(extraArgs: string): boolean {
+  return splitArgs(extraArgs).some((a) => SERVERMOD_RE.test(a));
+}
+
+/**
+ * Ek parametrelerdeki (son) -serverMod= değerinin sonuna bir mod ekler; ham metnin geri kalanına dokunmaz,
+ * tırnaklıysa kapanış tırnağının içine yazar. -serverMod= yoksa null; mod zaten listedeyse metni aynen döndürür.
+ */
+export function appendServerModToExtraArgs(extraArgs: string, modPath: string): string | null {
+  const tokens = tokenizeArgs(extraArgs);
+  const t = [...tokens].reverse().find((x) => SERVERMOD_RE.test(x.value));
+  if (!t) return null;
+  const value = t.value.slice(t.value.indexOf('=') + 1);
+  const leaf = (x: string) => x.trim().split(/[\\/]/).filter(Boolean).pop()?.toLowerCase();
+  if (value.split(';').some((m) => leaf(m) === leaf(modPath))) return extraArgs;
+  // Değer içinde boşluk vb. yoksa ekleme ham metinde tırnaksız güvenle durur
+  const add = (value.trim() && !value.trim().endsWith(';') ? ';' : '') + modPath;
+  const insertAt = t.endsQuoted ? t.end - 1 : t.end;
+  return extraArgs.slice(0, insertAt) + add + extraArgs.slice(insertAt);
 }
 
 export function modListArg(mods: ModRef[]): string {

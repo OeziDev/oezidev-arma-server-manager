@@ -546,7 +546,7 @@ export class LocalHost implements Host {
         });
         return { rows: parseWinProcessStats(res.stdout), at: Date.now() };
       };
-      if (!this.winCpu.hasBaseline(list)) {
+      if (this.winCpu.needsPrime(list)) {
         const first = await read();
         this.winCpu.update(first.rows, first.at, os.cpus().length, list);
         await new Promise((r) => setTimeout(r, 500));

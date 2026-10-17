@@ -50,15 +50,14 @@ describe('PBO yazıcı', () => {
   });
 
   it('aynı içerik aynı baytları üretir; aynı dosya iki kez eklenemez', () => {
-    expect(buildMonitorPbo(10).equals(buildMonitorPbo(10))).toBe(true);
-    expect(buildMonitorPbo(10).equals(buildMonitorPbo(20))).toBe(false);
+    expect(buildMonitorPbo().equals(buildMonitorPbo())).toBe(true);
     expect(() => buildPbo([{ path: 'a.sqf', data: '' }, { path: 'A.sqf', data: '' }], {})).toThrow();
   });
 });
 
 describe('@oezi_monitor modu', () => {
-  it('PBO içeriği: prefix, config.cpp (postInit) ve ölçüm aralığı gömülü script', () => {
-    const parsed = parsePbo(buildMonitorPbo(15));
+  it('PBO içeriği: prefix, config.cpp (postInit) ve sabit 10 sn aralıklı script', () => {
+    const parsed = parsePbo(buildMonitorPbo());
     expect(parsed.checksumOk).toBe(true);
     expect(parsed.props.prefix).toBe('oezi_monitor');
     const cfg = parsed.files.find((f) => f.path === 'config.cpp')!.data.toString();
@@ -68,24 +67,28 @@ describe('@oezi_monitor modu', () => {
     expect(cfg).toContain('postInit = 1;');
     const sqf = parsed.files.find((f) => f.path === 'functions\\fn_init.sqf')!.data.toString();
     expect(sqf).toContain('if (!isServer) exitWith {};');
-    expect(sqf).toContain('oezi_monitor_sampleSec = 15;');
+    expect(sqf).toContain('oezi_monitor_sampleSec = 10;');
     expect(sqf).toContain('diag_log text ("[OEZI-PERF] " + _json);');
     expect(sqf).toContain('allPlayers - _hcs');
-    expect(generateMonitorScript(0.2)).toContain('oezi_monitor_sampleSec = 1;');
+    // Profil ayarı gömülmez: her zaman aynı baytlar
+    expect(generateMonitorScript()).toBe(generateMonitorScript());
+    expect(buildMonitorPbo().equals(buildMonitorPbo())).toBe(true);
   });
 
   it('ensureMonitorMod sadece içerik değişince yazar', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oezi-mon-'));
     const host = new LocalHost();
-    const a = await ensureMonitorMod(host, dir, 10);
+    const a = await ensureMonitorMod(host, dir);
     expect(a).toEqual({ folder: path.join(dir, '@oezi_monitor'), changed: true });
     const pbo = path.join(dir, '@oezi_monitor', 'addons', 'oezi_monitor.pbo');
     expect(parsePbo(fs.readFileSync(pbo)).checksumOk).toBe(true);
     expect(fs.readFileSync(path.join(dir, '@oezi_monitor', 'mod.cpp'), 'utf8')).toContain('name = "OeziDev Monitor";');
     const mtime = fs.statSync(pbo).mtimeMs;
-    expect((await ensureMonitorMod(host, dir, 10)).changed).toBe(false);
+    // Aynı klasörü paylaşan (farklı sampleSec'li) profiller birbirinin dosyasını yeniden yazmaz
+    expect((await ensureMonitorMod(host, dir)).changed).toBe(false);
     expect(fs.statSync(pbo).mtimeMs).toBe(mtime);
-    expect((await ensureMonitorMod(host, dir, 30)).changed).toBe(true);
+    fs.writeFileSync(pbo, 'bozuk');
+    expect((await ensureMonitorMod(host, dir)).changed).toBe(true);
   });
 });
 
@@ -162,8 +165,27 @@ describe('FPS uyarısı', () => {
     // 2 dk düzelme: yeniden kurulur
     feed(810_000, 930_000, 30);
     expect(events).toEqual(['alert@180', 'recovered@930']);
-    feed(940_000, 1_120_000, 5);
-    expect(events).toEqual(['alert@180', 'recovered@930', 'alert@1120']);
+    // Yeniden kuruldu ama 30 dk bekleme süresi dolmadan yeni uyarı yok (ilk uyarı 180 sn'de)
+    feed(940_000, 1_970_000, 5);
+    expect(events).toEqual(['alert@180', 'recovered@930']);
+    feed(1_980_000, 1_990_000, 5);
+    expect(events).toEqual(['alert@180', 'recovered@930', 'alert@1980']);
+    // reset() (yeniden başlatma) bekleme süresini sıfırlamaz
+    a.reset();
+    feed(2_000_000, 2_400_000, 30);
+    feed(2_410_000, 2_700_000, 5);
+    expect(events).toHaveLength(3);
+  });
+  it('bekleme süresi ayarlanabilir', () => {
+    const a = new FpsAlertTracker();
+    const c = { ...cfg, cooldownMs: 0 };
+    const events: string[] = [];
+    for (let t = 0; t <= 1_200_000; t += 10_000) {
+      const fps = t < 400_000 || t > 600_000 ? 5 : 30;
+      const e = a.update(t, fps, c);
+      if (e) events.push(e.kind);
+    }
+    expect(events).toEqual(['alert', 'recovered', 'alert']);
   });
   it('arada iyi bir örnek seriyi bozar; en az 3 örnek gerekir; 0 dk kapalı', () => {
     const a = new FpsAlertTracker();
@@ -196,6 +218,22 @@ describe('süreç CPU / RAM', () => {
     ]);
     w.update([{ pid: 12, cpuMs: 1000, workingSet: 1048576 }], 0, 4);
     expect(w.update([{ pid: 12, cpuMs: 3000, workingSet: 1048576 }], 1000, 4)).toEqual([{ pid: 12, cpuPercent: 50, memMB: 1 }]);
+  });
+
+  it('Windows: 500 ms\'lik çift okuma pid başına en fazla bir kez', () => {
+    const w = new WindowsCpuTracker();
+    expect(w.needsPrime([12])).toBe(true);
+    // Önceki ölçüm yokken bile ikinci kez istenmez (ör. ilk okuma başarısız oldu ya da ölçüm unutuldu)
+    expect(w.needsPrime([12])).toBe(false);
+    w.update([{ pid: 12, cpuMs: 1000, workingSet: 1 }], 0, 4);
+    expect(w.needsPrime([12])).toBe(false);
+    // Yeni pid (headless client) gelince bir kez daha
+    expect(w.needsPrime([12, 13])).toBe(true);
+    expect(w.needsPrime([12, 13])).toBe(false);
+    // Uzun aradan sonra (önceki ölçüm silindi) yine çift okuma yok
+    w.update([{ pid: 12, cpuMs: 2000, workingSet: 1 }], 11 * 60_000, 4, [12]);
+    expect(w.hasBaseline([13])).toBe(false);
+    expect(w.needsPrime([13])).toBe(false);
   });
 
   it.runIf(process.platform === 'linux')('yerel Linux: meşgul döngü CPU > 0, olmayan PID atlanır', async () => {

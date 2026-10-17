@@ -52,9 +52,12 @@ export function SettingsView() {
           <Field label={t('set.tray')} help={t('help.set.tray')}>
             <Toggle checked={settings.minimizeToTray} onChange={(v) => void save({ minimizeToTray: v })} />
           </Field>
-          <Field label={t('set.launchAtLogin')} help={t('help.set.launchAtLogin')}>
-            <Toggle checked={!!settings.launchAtLogin} onChange={(v) => void save({ launchAtLogin: v })} />
-          </Field>
+          {/* Oturum açılışında başlatma sadece Windows'ta (giriş öğesi) destekleniyor */}
+          {info.platform === 'windows' && (
+            <Field label={t('set.launchAtLogin')} help={t('help.set.launchAtLogin')}>
+              <Toggle checked={!!settings.launchAtLogin} onChange={(v) => void save({ launchAtLogin: v })} />
+            </Field>
+          )}
         </div>
       </Section>
 

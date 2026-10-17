@@ -3,7 +3,7 @@ import { pathLib } from '../launch/paths.js';
 import { buildPbo } from './pbo.js';
 
 /**
- * @oezi_monitor: sadece sunucuda (-serverMod) yüklenen küçük mod. Her N saniyede bir RPT'ye tek satır yazar:
+ * @oezi_monitor: sadece sunucuda (-serverMod) yüklenen küçük mod. Her 10 saniyede bir RPT'ye tek satır yazar:
  *   [OEZI-PERF] {"fps":47.3,"fpsMin":31.0,"players":12,"ai":240,"groups":60,"vehicles":85,"objects":14,"time":3605,"mission":"..","world":".."}
  * Uygulama bu satırı logdan okuyup grafiğe çevirir (parsePerfLine). Sadece ucuz komutlar kullanılır.
  * config.cpp binarize edilmez (sunucu düz metin config.cpp'yi okur); imza gerekmez (serverMod istemciye gitmez).
@@ -12,6 +12,12 @@ import { buildPbo } from './pbo.js';
 export const MONITOR_MOD_FOLDER = '@oezi_monitor';
 export const MONITOR_PBO_PREFIX = 'oezi_monitor';
 export const MONITOR_PBO_NAME = 'oezi_monitor.pbo';
+/**
+ * Script'in FPS satırı yazma aralığı (sn). Profilden bağımsız sabit: aynı sunucu klasörünü paylaşan profiller
+ * bayt bayt aynı PBO üretir, ensureMonitorMod birbirinin dosyasını yeniden yazmaz.
+ * profile.monitoring.sampleSec sadece uygulamanın CPU/RAM ölçüp birleşik örnek kaydetme aralığıdır.
+ */
+export const MONITOR_SCRIPT_INTERVAL_SEC = 10;
 
 export function generateMonitorConfigCpp(): string {
   return `// OeziDev Monitor - OeziDev Arma Server Manager tarafindan uretildi, elle degistirmeyin.
@@ -46,9 +52,9 @@ class CfgFunctions
 `;
 }
 
-/** Ölçüm aralığı script'e sabit olarak gömülür (değişirse PBO yeniden yazılır). */
-export function generateMonitorScript(sampleSec: number): string {
-  const sec = Math.max(1, Math.min(3600, Math.round(sampleSec)));
+/** Ölçüm aralığı sabittir (MONITOR_SCRIPT_INTERVAL_SEC): profil ayarı PBO'ya gömülmez. */
+export function generateMonitorScript(): string {
+  const sec = MONITOR_SCRIPT_INTERVAL_SEC;
   return `// OeziDev Monitor - sunucu performansini RPT'ye yazar (OeziDev Arma Server Manager)
 // Sadece sunucuda calisir; headless client ve oyuncularda hicbir sey yapmaz.
 if (!isServer) exitWith {};
@@ -102,11 +108,11 @@ overview = "Sunucu FPS, oyuncu ve AI sayilarini RPT'ye yazar. Sadece -serverMod 
 `;
 }
 
-export function buildMonitorPbo(sampleSec: number): Buffer {
+export function buildMonitorPbo(): Buffer {
   return buildPbo(
     [
       { path: 'config.cpp', data: generateMonitorConfigCpp() },
-      { path: 'functions\\fn_init.sqf', data: generateMonitorScript(sampleSec) },
+      { path: 'functions\\fn_init.sqf', data: generateMonitorScript() },
     ],
     { prefix: MONITOR_PBO_PREFIX, product: 'OeziDev Arma Server Manager' },
   );
@@ -116,11 +122,11 @@ export function buildMonitorPbo(sampleSec: number): Buffer {
  * <serverDir>/@oezi_monitor/addons/oezi_monitor.pbo ve mod.cpp'yi yazar; içerik aynıysa dokunmaz.
  * Dönen `folder` mutlak klasör yoludur; -serverMod için göreli "@oezi_monitor" kullanılır (cwd = serverDir).
  */
-export async function ensureMonitorMod(host: Host, serverDir: string, sampleSec: number): Promise<{ folder: string; changed: boolean }> {
+export async function ensureMonitorMod(host: Host, serverDir: string): Promise<{ folder: string; changed: boolean }> {
   const L = pathLib(host.os);
   const folder = L.join(serverDir, MONITOR_MOD_FOLDER);
   const want: [string, Buffer][] = [
-    [L.join(folder, 'addons', MONITOR_PBO_NAME), buildMonitorPbo(sampleSec)],
+    [L.join(folder, 'addons', MONITOR_PBO_NAME), buildMonitorPbo()],
     [L.join(folder, 'mod.cpp'), Buffer.from(generateMonitorModCpp(), 'utf8')],
   ];
   let changed = false;

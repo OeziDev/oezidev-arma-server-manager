@@ -79,6 +79,15 @@ export function profileShortId(profile: Pick<ServerProfile, 'id'>): string {
  * Yedek klasörü: backup.targetDir (mutlak ya da sunucu klasörüne göre), boşsa
  * `<sunucu klasörünün üstü>/oezi-backups/<id8>`. Profil adı değişse de klasör değişmesin diye id kullanılır.
  */
+/**
+ * Windows: klasör "Program Files" altında mı (büyük/küçük harf duyarsız). Oraya yazmak yönetici izni ister,
+ * UAC sanallaştırması yüzünden dosyalar başka yerde görünebilir: kullanıcı uyarılır.
+ */
+export function isUnderProgramFiles(dir: string, os: HostOs): boolean {
+  if (os !== 'windows') return false;
+  return /^(?:[a-z]:)?\\program files(?: \(x86\))?(?:\\|$)/i.test(pathLib(os).normalize(dir.trim()));
+}
+
 export function resolveBackupDir(profile: ServerProfile, os: HostOs): string {
   const p = pathLib(os);
   const { serverDir } = resolvePaths(profile, os);
@@ -264,6 +273,11 @@ export async function planBackupItems(host: Host, profile: ServerProfile): Promi
       skipped.push({ path: source, reason: 'Yedek klasörünün içinde' });
       return;
     }
+    // -profiles ya da ek yol sunucu klasörünün kendisi / üstü ise: bütün Arma kurulumu (onlarca GB) arşivlenmesin
+    if (st.isDir && isInside(os, paths.serverDir, source)) {
+      skipped.push({ path: source, reason: 'Sunucu klasörünün tamamı yedeklenmez' });
+      return;
+    }
     // Zaten eklenmiş bir klasörün içindeyse tekrar eklenmez (ör. profil içindeki BattlEye)
     const parent = items.find((i) => i.isDir && isInside(os, source, i.source));
     if (parent) {
@@ -356,11 +370,18 @@ async function runProcess(
 /* ---------------- veritabanı ---------------- */
 
 /**
- * MySQL seçenek dosyası değeri. MySQL değeri sadece ilk ve son karakter aynı tırnaksa soyar
- * (içerdeki " sorun olmaz); tırnak içinde \\ \n \r \t \b kaçışları işlenir.
+ * MySQL seçenek dosyası değeri (çift tırnaklı). MySQL ilk ve son karakter aynı tırnaksa soyar ve
+ * içerdeki \\ \" \' \n \r \t \b \s kaçışlarını işler; tırnak içindeki # yorum sayılmaz.
+ * \ ve " de kaçırılır: a"b\c#d e gibi şifreler aynen geri okunur.
  */
 export function mysqlOptionValue(v: string): string {
-  const esc = v.replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t');
+  const esc = v
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t')
+    .replace(/\x08/g, '\\b');
   return `"${esc}"`;
 }
 
@@ -515,6 +536,9 @@ export async function runBackup(host: Host, profile: ServerProfile, opts: Backup
 
   const now = opts.now ?? new Date();
   const backupDir = resolveBackupDir(profile, os);
+  if (isUnderProgramFiles(backupDir, os)) {
+    log(`Uyarı: yedek klasörü "Program Files" altında (${backupDir}); yazma izni sorun çıkarabilir, ayarlardan başka bir yedek klasörü seçmeniz önerilir`);
+  }
   await host.mkdirp(backupDir);
 
   // Aynı saniyede ikinci yedek: -2, -3 ...

@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
+  appendServerModToExtraArgs,
   buildHeadlessLaunch,
+  extraArgsHaveServerMod,
   buildServerLaunch,
   createProfile,
   formatCommandLine,
@@ -129,7 +131,26 @@ describe('komut satırı', () => {
 
   it('splitArgs tırnakları doğru böler', () => {
     expect(splitArgs(`-a "-b=c d" '-e=f g' -h=""`)).toEqual(['-a', '-b=c d', '-e=f g', '-h=']);
+    expect(splitArgs(`"" x"y z"w \t-k="a\\"b"`)).toEqual(['', 'xy zw', '-k=a"b']);
     expect(() => splitArgs('"açık')).toThrow();
+  });
+
+  it('ek parametredeki -serverMod= değerine mod eklenir (tırnaklar korunur)', () => {
+    const add = (x: string) => appendServerModToExtraArgs(x, '@oezi_monitor');
+    expect(add('-noSound -world=empty')).toBeNull();
+    expect(extraArgsHaveServerMod('-noSound')).toBe(false);
+    expect(extraArgsHaveServerMod('"-serverMod=@a b"')).toBe(true);
+    expect(add('-serverMod=@extdb3 -noSound')).toBe('-serverMod=@extdb3;@oezi_monitor -noSound');
+    expect(add('-noSound -servermod=@a;@b;')).toBe('-noSound -servermod=@a;@b;@oezi_monitor');
+    expect(add('-serverMod=')).toBe('-serverMod=@oezi_monitor');
+    expect(add('"-serverMod=@life server;@extdb3" -x')).toBe('"-serverMod=@life server;@extdb3;@oezi_monitor" -x');
+    expect(add("-serverMod='C:\\Mod Klasörü\\@a'")).toBe("-serverMod='C:\\Mod Klasörü\\@a;@oezi_monitor'");
+    // Zaten listedeyse (yol ile de) aynen kalır
+    expect(add('-serverMod=@a;mods/@OEZI_MONITOR')).toBe('-serverMod=@a;mods/@OEZI_MONITOR');
+    // Birden fazla varsa sonuncusuna eklenir
+    expect(add('-serverMod=@a -serverMod=@b')).toBe('-serverMod=@a -serverMod=@b;@oezi_monitor');
+    // Sonuç splitArgs ile doğru okunur
+    expect(splitArgs(add('"-serverMod=@life server" -x')!)).toEqual(['-serverMod=@life server;@oezi_monitor', '-x']);
   });
 
   it('Windows tırnaklama CommandLineToArgvW kurallarına uyar', () => {

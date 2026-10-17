@@ -83,9 +83,23 @@ export class LinuxCpuTracker {
 /** Windows: Get-Process CPU süresi (ms) farkı / (geçen süre x mantıksal çekirdek). */
 export class WindowsCpuTracker {
   private prev = new Map<number, { cpuMs: number | null; at: number }>();
+  /** Çift okuma (0,5 sn arayla) yapılmış pid'ler: her PowerShell çağrısı pahalı, pid başına en fazla bir kez */
+  private primed = new Set<number>();
 
   hasBaseline(pids: number[]): boolean {
     return pids.every((p) => this.prev.has(p));
+  }
+
+  /**
+   * Önceki ölçümü olmayan ve daha önce hiç çift okunmamış pid var mı. Varsa bu pid'ler "çift okundu" işaretlenir;
+   * önceki ölçüm sonradan kaybolsa da (uzun ara) ikinci kez 500 ms'lik ek çağrı yapılmaz, o tur CPU 0 görünür.
+   */
+  needsPrime(pids: number[]): boolean {
+    const missing = pids.filter((p) => !this.prev.has(p) && !this.primed.has(p));
+    if (!missing.length) return false;
+    if (this.primed.size > 1000) this.primed.clear();
+    for (const p of missing) this.primed.add(p);
+    return true;
   }
 
   update(

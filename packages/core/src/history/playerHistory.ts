@@ -159,6 +159,9 @@ export function foldSearchText(s: string): string {
     .replace(/[̀-ͯ]/g, '');
 }
 
+/** Kapanmış oturumların saklama süresi (sıkıştırmada daha eskiler atılır): 180 gün */
+export const HISTORY_RETENTION_MS = 180 * 24 * 3600_000;
+
 interface NoteRec {
   note: string;
   t: number;
@@ -182,6 +185,20 @@ export class PlayerHistory {
   private storedLines = 0;
   private storedBytes = 0;
   private loaded = false;
+  /** Her değişiklikte artar: özet önbelleği geçersiz olur */
+  private rev = 0;
+  /**
+   * GUID özetleri önbelleği. Açık oturumu olan GUID'lerin (çevrimiçi / eski açık) süresi saate bağlıdır:
+   * bunlar (`dynamic`) her sorguda yeniden hesaplanır, diğerleri değişiklik olana kadar aynen kullanılır.
+   */
+  private summaryCache: {
+    rev: number;
+    byGuid: Map<string, PlayerSession[]>;
+    map: Map<string, PlayerSummary>;
+    /** Arama için katlanmış metin (adlar + not) */
+    folded: Map<string, string>;
+    dynamic: Set<string>;
+  } | null = null;
 
   constructor(
     private readonly storage: PlayerHistoryStorage,
@@ -203,6 +220,7 @@ export class PlayerHistory {
   async load(): Promise<void> {
     if (this.loaded) return;
     this.loaded = true;
+    this.rev++;
     const lines = await this.storage.readAll();
     for (const line of lines) {
       this.storedLines++;
@@ -275,6 +293,8 @@ export class PlayerHistory {
   }
 
   private write(line: string): Promise<void> {
+    // Bütün durum değişiklikleri buradan geçer (oturum / not satırı yazılır)
+    this.rev++;
     this.storedLines++;
     this.storedBytes += Buffer.byteLength(line, 'utf8') + 1;
     // Sıra korunur: bir satır yazılmadan sonraki başlamaz
@@ -467,7 +487,13 @@ export class PlayerHistory {
     return [...this.openByPid.values()].filter((s) => !this.stale.has(s.id)).map((s) => ({ ...s }));
   }
 
+  /** Özetler (önbellekli): değişiklik yoksa sadece açık oturumu olan GUID'ler yeniden hesaplanır. */
   private summarize(now: number): Map<string, PlayerSummary> {
+    const c = this.summaryCache;
+    if (c && c.rev === this.rev) {
+      for (const guid of c.dynamic) this.putSummary(c, guid, c.byGuid.get(guid)!, now);
+      return c.map;
+    }
     const byGuid = new Map<string, PlayerSession[]>();
     for (const s of this.sessionsById.values()) {
       if (!s.guid) continue;
@@ -475,77 +501,83 @@ export class PlayerHistory {
       if (!arr) byGuid.set(s.guid, (arr = []));
       arr.push(s);
     }
-    const out = new Map<string, PlayerSummary>();
+    const cache = { rev: this.rev, byGuid, map: new Map<string, PlayerSummary>(), folded: new Map<string, string>(), dynamic: new Set<string>() };
     for (const [guid, list] of byGuid) {
       list.sort((a, b) => b.joinAt - a.joinAt);
-      const names: string[] = [];
-      const ips: string[] = [];
-      let total = 0;
-      let kicks = 0;
-      let lastKick: string | undefined;
-      let lastSeen = 0;
-      let online = false;
-      for (const s of list) {
-        if (!names.includes(s.name) && s.name) names.push(s.name);
-        if (s.ip && !ips.includes(s.ip) && ips.length < 5) ips.push(s.ip);
-        const end = this.sessionEnd(s, now);
-        total += Math.max(0, end - s.joinAt);
-        if (s.kicked !== undefined) {
-          kicks++;
-          if (lastKick === undefined) lastKick = s.kicked;
-        }
-        if (this.isOnline(s)) {
-          online = true;
-          lastSeen = Math.max(lastSeen, now);
-        } else lastSeen = Math.max(lastSeen, end);
-      }
-      const note = this.notes.get(guid)?.note;
-      out.set(guid, {
-        guid,
-        name: list[0]!.name,
-        names,
-        ips,
-        firstSeen: list[list.length - 1]!.joinAt,
-        lastSeen,
-        totalPlaytimeMs: total,
-        sessionCount: list.length,
-        kickCount: kicks,
-        ...(lastKick !== undefined ? { lastKickReason: lastKick } : {}),
-        ...(note ? { note } : {}),
-        online,
-      });
+      if (list.some((s) => s.leaveAt === undefined)) cache.dynamic.add(guid);
+      this.putSummary(cache, guid, list, now);
     }
     // Oturumu olmayan ama notu olan GUID'ler de aranabilsin
     for (const [guid, n] of this.notes) {
-      if (out.has(guid)) continue;
-      out.set(guid, { guid, name: '', names: [], ips: [], firstSeen: n.t, lastSeen: n.t, totalPlaytimeMs: 0, sessionCount: 0, kickCount: 0, note: n.note, online: false });
+      if (cache.map.has(guid)) continue;
+      cache.map.set(guid, { guid, name: '', names: [], ips: [], firstSeen: n.t, lastSeen: n.t, totalPlaytimeMs: 0, sessionCount: 0, kickCount: 0, note: n.note, online: false });
+      cache.folded.set(guid, foldSearchText(n.note));
     }
-    return out;
+    this.summaryCache = cache;
+    return cache.map;
+  }
+
+  /** Tek GUID'in özeti (liste en yeniden eskiye sıralı) */
+  private putSummary(cache: NonNullable<PlayerHistory['summaryCache']>, guid: string, list: PlayerSession[], now: number): void {
+    const names: string[] = [];
+    const ips: string[] = [];
+    let total = 0;
+    let kicks = 0;
+    let lastKick: string | undefined;
+    let lastSeen = 0;
+    let online = false;
+    for (const s of list) {
+      if (!names.includes(s.name) && s.name) names.push(s.name);
+      if (s.ip && !ips.includes(s.ip) && ips.length < 5) ips.push(s.ip);
+      const end = this.sessionEnd(s, now);
+      total += Math.max(0, end - s.joinAt);
+      if (s.kicked !== undefined) {
+        kicks++;
+        if (lastKick === undefined) lastKick = s.kicked;
+      }
+      if (this.isOnline(s)) {
+        online = true;
+        lastSeen = Math.max(lastSeen, now);
+      } else lastSeen = Math.max(lastSeen, end);
+    }
+    const note = this.notes.get(guid)?.note;
+    if (!cache.folded.has(guid)) cache.folded.set(guid, foldSearchText([...names, note ?? ''].join('\u0000')));
+    cache.map.set(guid, {
+      guid,
+      name: list[0]!.name,
+      names,
+      ips,
+      firstSeen: list[list.length - 1]!.joinAt,
+      lastSeen,
+      totalPlaytimeMs: total,
+      sessionCount: list.length,
+      kickCount: kicks,
+      ...(lastKick !== undefined ? { lastKickReason: lastKick } : {}),
+      ...(note ? { note } : {}),
+      online,
+    });
   }
 
   /** GUID'e göre toplanmış oyuncular; çevrimiçiler önce, sonra son görülmeye göre. */
   search(query: PlayerSearchQuery = {}, now: number = this.clock()): PlayerSummary[] {
     const q = query.text ? foldSearchText(query.text.trim()) : '';
     let list = [...this.summarize(now).values()];
+    const folded = this.summaryCache!.folded;
     if (query.onlineOnly) list = list.filter((p) => p.online);
     if (q) {
-      list = list.filter(
-        (p) =>
-          p.guid.includes(q) ||
-          p.names.some((n) => foldSearchText(n).includes(q)) ||
-          p.ips.some((ip) => ip.includes(q)) ||
-          (p.note !== undefined && foldSearchText(p.note).includes(q)),
-      );
+      list = list.filter((p) => p.guid.includes(q) || (folded.get(p.guid) ?? '').includes(q) || p.ips.some((ip) => ip.includes(q)));
     }
     list.sort((a, b) => Number(b.online) - Number(a.online) || b.lastSeen - a.lastSeen || a.guid.localeCompare(b.guid));
     const offset = Math.max(0, query.offset ?? 0);
     const limit = Math.max(0, query.limit ?? 50);
-    return list.slice(offset, offset + limit);
+    // Önbellekteki nesneler dışarı verilmez (kopya)
+    return list.slice(offset, offset + limit).map(copySummary);
   }
 
   /** Tek oyuncunun özeti */
   player(guid: string, now: number = this.clock()): PlayerSummary | undefined {
-    return this.summarize(now).get(guid.trim().toLowerCase());
+    const s = this.summarize(now).get(guid.trim().toLowerCase());
+    return s ? copySummary(s) : undefined;
   }
 
   /** Bir oyuncunun oturumları, en yeniden eskiye */
@@ -599,6 +631,12 @@ export class PlayerHistory {
     return this.storedBytes > maxBytes && this.storedLines > live * 1.2;
   }
 
+  /** `t`den (Unix ms) önce bitmiş oturum var mı (saklama süresi dolanları atmak için sıkıştırma gerekir mi) */
+  hasClosedBefore(t: number): boolean {
+    for (const s of this.sessionsById.values()) if (s.leaveAt !== undefined && s.leaveAt < t) return true;
+    return false;
+  }
+
   /** Depodaki tahmini boyut (yüklenen + yazılan satırlar) */
   get storageStats(): { lines: number; bytes: number } {
     return { lines: this.storedLines, bytes: this.storedBytes };
@@ -611,6 +649,7 @@ export class PlayerHistory {
    * Tahmini depo boyutu bu satırlara göre sıfırlanır.
    */
   compact(opts: { dropClosedBefore?: number } = {}): string[] {
+    this.rev++;
     if (opts.dropClosedBefore !== undefined) {
       for (const [id, s] of this.sessionsById) {
         if (s.leaveAt !== undefined && s.leaveAt < opts.dropClosedBefore) this.sessionsById.delete(id);
@@ -623,3 +662,5 @@ export class PlayerHistory {
     return lines;
   }
 }
+
+const copySummary = (s: PlayerSummary): PlayerSummary => ({ ...s, names: [...s.names], ips: [...s.ips] });

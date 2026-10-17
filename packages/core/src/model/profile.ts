@@ -317,8 +317,8 @@ export const ServerProfileSchema = z.object({
       onStop: z.boolean().default(true),
       onCrash: z.boolean().default(true),
       onUpdate: z.boolean().default(true),
-      /** FPS uyarısı (performans izleme) Discord'a da gitsin */
-      onPerformance: z.boolean().default(true),
+      /** FPS uyarısı (performans izleme) Discord'a da gitsin (varsayılan kapalı: kullanıcı açıkça istesin) */
+      onPerformance: z.boolean().default(false),
     })
     .prefault({}),
 
@@ -326,7 +326,7 @@ export const ServerProfileSchema = z.object({
   monitoring: z
     .object({
       enabled: z.boolean().default(true),
-      /** Ölçüm aralığı (sn) */
+      /** Uygulamanın CPU/RAM ölçüp birleşik örnek kaydetme aralığı (sn); FPS moddan sabit 10 sn'de gelir, Windows'ta CPU/RAM en az 30 sn'de bir ölçülür */
       sampleSec: int(5, 300).default(10),
       /** Sunucu FPS'i bu değerin altına düşüp ... */
       fpsAlertBelow: int(0, 100).default(15),

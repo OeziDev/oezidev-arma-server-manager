@@ -699,6 +699,7 @@ export const en: Dict = {
   'field.monitoring.enabled': 'Performance monitoring',
   'help.monitoring.enabled': 'Adds the "OeziDev Monitor" server mod automatically and measures CPU/RAM.',
   'field.monitoring.sampleSec': 'Sample interval',
+  'help.monitoring.sampleSec': 'FPS arrives every 10 s from the mod. This sets how often CPU/RAM is sampled and stored in the chart (on Windows CPU/RAM is sampled at most every 30 s).',
   'field.monitoring.fpsAlertBelow': 'FPS alert threshold',
   'help.monitoring.fpsAlertBelow': 'If server FPS drops below this…',
   'field.monitoring.fpsAlertMinutes': 'Alert after',

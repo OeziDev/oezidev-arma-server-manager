@@ -28,6 +28,24 @@ export interface DiscordStatusOptions {
   lang?: 'tr' | 'en';
   /** 429 cevabında en fazla bu kadar beklenir (ms) */
   maxRetryWaitMs?: number;
+  /** Kullanıcının görmesi gereken tek seferlik uyarı (ör. webhook silinmiş) */
+  onWarning?: (message: { tr: string; en: string }) => void;
+}
+
+/** Discord JSON hata kodu: webhook silinmiş / geçersiz */
+export const DISCORD_UNKNOWN_WEBHOOK = 10015;
+
+/** Webhook adresini temel adres + thread_id olarak ayırır (diğer sorgu parametreleri atılır). */
+export function parseStatusWebhook(raw: string): { base: string; threadId: string } {
+  const trimmed = raw.trim();
+  const q = trimmed.indexOf('?');
+  const base = q >= 0 ? trimmed.slice(0, q) : trimmed;
+  let threadId = '';
+  if (q >= 0) {
+    const t = new URLSearchParams(trimmed.slice(q + 1)).get('thread_id')?.trim() ?? '';
+    if (/^\d+$/.test(t)) threadId = t;
+  }
+  return { base, threadId };
 }
 
 const STATUS_COLORS: Record<ServerStatus, number> = {
@@ -122,8 +140,12 @@ function fmtDuration(ms: number, u: { d: string; h: string; m: string }): string
 }
 
 class HttpError extends Error {
-  constructor(readonly status: number) {
-    super(`Discord HTTP ${status}`);
+  constructor(
+    readonly status: number,
+    /** Discord JSON gövdesindeki `code` (varsa) */
+    readonly code?: number,
+  ) {
+    super(`Discord HTTP ${status}${code ? ` (kod ${code})` : ''}`);
   }
 }
 
@@ -138,6 +160,10 @@ export class DiscordStatusUpdater {
   /** Webhook değişince profildeki eski kimlik (başka webhook'a ait) yok sayılır */
   private ignoreProfileId: string | null = null;
   private lastErrorLog = { text: '', at: 0 };
+  /** "Mesaj silinmiş" logu en fazla 10 dk'da bir */
+  private lastDeletedLogAt = 0;
+  /** Discord 10015 (Unknown Webhook) dönen webhook: değişene kadar istek atılmaz */
+  private deadHook: string | null = null;
   private lastRun = 0;
 
   constructor(private readonly opts: DiscordStatusOptions) {
@@ -155,7 +181,15 @@ export class DiscordStatusUpdater {
   }
 
   private webhookOf(p: ServerProfile): string {
-    return (p.discordStatus.webhook.trim() || p.notifications.discordWebhook.trim()).replace(/\?.*$/, '');
+    return parseStatusWebhook(this.rawWebhookOf(p)).base;
+  }
+
+  private rawWebhookOf(p: ServerProfile): string {
+    return p.discordStatus.webhook.trim() || p.notifications.discordWebhook.trim();
+  }
+
+  get isRunning(): boolean {
+    return this.running;
   }
 
   start(): void {
@@ -170,6 +204,11 @@ export class DiscordStatusUpdater {
     if (this.pokeTimer) clearTimeout(this.pokeTimer);
     this.timer = null;
     this.pokeTimer = null;
+  }
+
+  /** Profil / webhook değişti ya da elle yenilendi: silinmiş webhook bekleyişini kaldır */
+  resetBackoff(): void {
+    this.deadHook = null;
   }
 
   /** Durum değişti: kısa süre içinde (en az 5 sn arayla) güncelle */
@@ -214,40 +253,62 @@ export class DiscordStatusUpdater {
     this.lastRun = Date.now();
     const profile = this.opts.source.getProfile();
     if (!profile.discordStatus.enabled) return;
-    const hook = this.webhookOf(profile);
+    const { base: hook, threadId } = parseStatusWebhook(this.rawWebhookOf(profile));
     if (!isDiscordWebhook(hook)) {
       this.logThrottled('Discord durum mesajı: geçerli bir webhook adresi yok');
       return;
     }
-    if (this.lastHook !== null && this.lastHook !== hook) {
+    // Webhook kimliği: thread değişince de mesaj başka yerde demektir
+    const hookKey = threadId ? `${hook}?thread_id=${threadId}` : hook;
+    if (this.lastHook !== null && this.lastHook !== hookKey) {
       this.ignoreProfileId = profile.discordStatus.messageId || null;
       this.messageId = null;
     }
-    this.lastHook = hook;
+    this.lastHook = hookKey;
+    if (this.deadHook !== null) {
+      if (this.deadHook === hookKey) return;
+      this.deadHook = null;
+    }
+    const thread = threadId ? `thread_id=${threadId}` : '';
     const profileId = profile.discordStatus.messageId.trim();
     let id = this.messageId ?? (profileId && profileId !== this.ignoreProfileId && /^\d+$/.test(profileId) ? profileId : '');
     const embed = this.buildEmbed(profile);
     try {
       if (id) {
         try {
-          await this.request('PATCH', `${hook}/messages/${id}`, { embeds: [embed] });
+          await this.request('PATCH', `${hook}/messages/${id}${thread ? `?${thread}` : ''}`, { embeds: [embed] });
           this.messageId = id;
           return;
         } catch (err) {
-          if (!(err instanceof HttpError) || err.status !== 404) throw err;
+          if (!(err instanceof HttpError) || err.status !== 404 || err.code === DISCORD_UNKNOWN_WEBHOOK) throw err;
           // Mesaj (ya da kanal) silinmiş: yenisini at
-          this.opts.log?.('Discord durum mesajı bulunamadı (silinmiş); yenisi gönderiliyor');
+          const now = Date.now();
+          if (now - this.lastDeletedLogAt >= 10 * 60_000) {
+            this.lastDeletedLogAt = now;
+            this.opts.log?.('Discord durum mesajı bulunamadı (silinmiş); yenisi gönderiliyor');
+          }
           id = '';
           this.messageId = null;
         }
       }
-      const res = await this.request('POST', `${hook}?wait=true`, { username: 'Arma Server Manager', embeds: [embed] });
+      const res = await this.request('POST', `${hook}?wait=true${thread ? `&${thread}` : ''}`, { username: 'Arma Server Manager', embeds: [embed] });
       const newId = String((res as { id?: unknown } | null)?.id ?? '');
       if (!/^\d+$/.test(newId)) throw new Error('Discord mesaj kimliği dönmedi');
       this.messageId = newId;
       this.ignoreProfileId = null;
       this.opts.onMessageId?.(newId);
     } catch (err) {
+      if (err instanceof HttpError && err.status === 404 && err.code === DISCORD_UNKNOWN_WEBHOOK) {
+        // Webhook silinmiş: her turda boşuna denemeyelim; adres (ya da profil) değişince yeniden denenir
+        this.deadHook = hookKey;
+        this.messageId = null;
+        this.opts.log?.('Discord durum mesajı durduruldu: webhook bulunamadı (silinmiş ya da geçersiz). Webhook adresi değişince yeniden denenecek.');
+        this.opts.onWarning?.({
+          tr: 'Discord durum mesajı gönderilemiyor: webhook silinmiş ya da geçersiz. Yeni bir webhook adresi girin.',
+          en: 'Discord status message cannot be sent: the webhook was deleted or is invalid. Enter a new webhook URL.',
+        });
+        throw err;
+      }
       this.logThrottled(`Discord durum mesajı güncellenemedi: ${(err as Error).message}`);
       throw err;
     }
@@ -267,7 +328,10 @@ export class DiscordStatusUpdater {
       await new Promise((r) => setTimeout(r, waitMs));
       res = await send();
     }
-    if (!res.ok) throw new HttpError(res.status);
+    if (!res.ok) {
+      const body = (await res.json().catch(() => null)) as { code?: unknown } | null;
+      throw new HttpError(res.status, typeof body?.code === 'number' ? body.code : undefined);
+    }
     if (res.status === 204) return null;
     return res.json().catch(() => null);
   }

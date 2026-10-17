@@ -1,17 +1,22 @@
 /**
  * Düşük FPS uyarısı: FPS `belowFps` altında art arda `minutes` dakika kalırsa (en az 3 örnek) bir kez uyarır.
  * FPS eşiğin üstünde (>= belowFps) 2 dakika kalınca yeniden kurulur.
+ * Aynı sunucu için iki uyarı arasında en az FPS_ALERT_COOLDOWN_MS (30 dk) olur; reset() bu süreyi sıfırlamaz
+ * (yeniden başlatma uyarı yağmuruna yol açmasın).
  */
 
 export interface FpsAlertConfig {
   belowFps: number;
   /** 0: kapalı */
   minutes: number;
+  /** İki uyarı arası en az süre (ms); varsayılan FPS_ALERT_COOLDOWN_MS */
+  cooldownMs?: number;
 }
 
 export type FpsAlertEvent = { kind: 'alert'; avgFps: number; minFps: number; sinceMs: number } | { kind: 'recovered' };
 
 export const FPS_RECOVER_MS = 2 * 60_000;
+export const FPS_ALERT_COOLDOWN_MS = 30 * 60_000;
 const MIN_SAMPLES = 3;
 
 export class FpsAlertTracker {
@@ -20,6 +25,7 @@ export class FpsAlertTracker {
   private lastT = 0;
   private alerted = false;
   private highSince: number | null = null;
+  private lastAlertAt = Number.NEGATIVE_INFINITY;
 
   get active(): boolean {
     return this.alerted;
@@ -48,8 +54,10 @@ export class FpsAlertTracker {
     if (fps < cfg.belowFps) {
       this.low.push({ t, fps });
       this.highSince = null;
-      if (!this.alerted && this.low.length >= MIN_SAMPLES && t - this.low[0]!.t >= windowMs) {
+      const cooldown = cfg.cooldownMs ?? FPS_ALERT_COOLDOWN_MS;
+      if (!this.alerted && this.low.length >= MIN_SAMPLES && t - this.low[0]!.t >= windowMs && t - this.lastAlertAt >= cooldown) {
         this.alerted = true;
+        this.lastAlertAt = t;
         const recent = this.low.filter((x) => x.t >= t - windowMs);
         const avg = recent.reduce((a, x) => a + x.fps, 0) / recent.length;
         return { kind: 'alert', avgFps: Math.round(avg * 10) / 10, minFps: Math.min(...recent.map((x) => x.fps)), sinceMs: this.low[0]!.t };

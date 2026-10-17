@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { MemoryHistoryStorage, PlayerHistory, foldSearchText, parseBeHistoryMessage } from '../src/history/playerHistory.js';
+import { HISTORY_RETENTION_MS, MemoryHistoryStorage, PlayerHistory, foldSearchText, parseBeHistoryMessage } from '../src/history/playerHistory.js';
 import type { RconPlayer } from '../src/rcon/parse.js';
 
 const G1 = 'a'.repeat(31) + '1';
@@ -254,5 +254,48 @@ describe('PlayerHistory', () => {
     await h4.onServerMessage(`Verified GUID (${G1}) of player #0 A`, T0);
     expect(errors.map((e) => e.message)).toEqual(['disk dolu', 'disk dolu']);
     expect(h4.player(G1)!.online).toBe(true);
+  });
+
+  it('özet önbelleği: değişiklik olunca geçersiz olur, çevrimiçi süre saatle güncellenir, dışarı kopya verilir', async () => {
+    let now = T0;
+    const h = await PlayerHistory.open(new MemoryHistoryStorage(), { now: () => now });
+    await h.onServerMessage('Player #0 Ali (1.1.1.1:1) connected', T0);
+    await h.onServerMessage(`Verified GUID (${G1}) of player #0 Ali`, T0);
+    await h.onServerMessage('Player #1 Veli (1.1.1.2:1) connected', T0);
+    await h.onServerMessage(`Verified GUID (${G2}) of player #1 Veli`, T0);
+    await h.onServerMessage('Player #1 Veli disconnected', T0 + 10 * MIN);
+    now = T0 + 20 * MIN;
+    expect(h.player(G1)!.totalPlaytimeMs).toBe(20 * MIN);
+    expect(h.player(G2)!.totalPlaytimeMs).toBe(10 * MIN);
+    // Değişiklik yokken saat ilerler: çevrimiçi oyuncunun süresi güncel
+    now = T0 + 30 * MIN;
+    expect(h.search({ text: 'ali' })[0]!.totalPlaytimeMs).toBe(30 * MIN);
+    // Dönen nesneyi değiştirmek önbelleği bozmaz
+    const s = h.search({ text: 'veli' })[0]!;
+    s.names.push('sahte');
+    s.totalPlaytimeMs = 0;
+    expect(h.player(G2)!.names).toEqual(['Veli']);
+    expect(h.player(G2)!.totalPlaytimeMs).toBe(10 * MIN);
+    // Not ve ad değişikliği önbelleği geçersiz kılar
+    await h.setNote(G2, 'Şüpheli');
+    expect(h.search({ text: 'supheli' }).map((x) => x.guid)).toEqual([G2]);
+    await h.onServerMessage('Player #0 Ali disconnected', T0 + 40 * MIN);
+    now = T0 + 60 * MIN;
+    expect(h.player(G1)!.online).toBe(false);
+    expect(h.player(G1)!.totalPlaytimeMs).toBe(40 * MIN);
+  });
+
+  it('saklama süresi: hasClosedBefore ve 180 günlük sınır', async () => {
+    const h = await PlayerHistory.open(new MemoryHistoryStorage(), { now: () => T0 });
+    await h.onServerMessage('Player #0 Ali (1.1.1.1:1) connected', T0);
+    await h.onServerMessage(`Verified GUID (${G1}) of player #0 Ali`, T0);
+    await h.onServerMessage('Player #0 Ali disconnected', T0 + MIN);
+    expect(HISTORY_RETENTION_MS).toBe(180 * 24 * 3600_000);
+    expect(h.hasClosedBefore(T0)).toBe(false);
+    expect(h.hasClosedBefore(T0 + 2 * MIN)).toBe(true);
+    expect(h.player(G1)).toBeDefined();
+    h.compact({ dropClosedBefore: T0 + 2 * MIN });
+    expect(h.hasClosedBefore(T0 + 2 * MIN)).toBe(false);
+    expect(h.player(G1)).toBeUndefined();
   });
 });
