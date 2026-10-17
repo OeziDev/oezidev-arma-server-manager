@@ -3,6 +3,7 @@ import type { MetricSample } from '../../shared/api';
 import { NumberF, ToggleF, useDraft } from '../components/draft';
 import { type ChartSeries, LineChart } from '../components/LineChart';
 import { Empty, Section, Seg } from '../components/ui';
+import { useCountUp } from '../components/motion';
 import { useI18n } from '../i18n';
 import { api, fpsClass, formatMem, useStore } from '../state';
 
@@ -158,10 +159,12 @@ export function PerformanceTab({ id }: { id: string }) {
 }
 
 function Tile({ label, value, cls, big }: { label: string; value: string; cls?: string; big?: boolean }) {
+  // İlk görünüşte kısa sayma; canlı güncellemelerde doğrudan değer
+  const shown = useCountUp(value);
   return (
     <div className={`perf-tile ${big ? 'big' : ''}`}>
       <div className="perf-tile-label">{label}</div>
-      <div className={`perf-tile-value ${cls ?? ''}`}>{value}</div>
+      <div className={`perf-tile-value ${cls ?? ''}`}>{shown}</div>
     </div>
   );
 }

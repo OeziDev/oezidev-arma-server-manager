@@ -42,8 +42,10 @@ describe.skipIf(!RUN)('Electron uçtan uca', () => {
   const shot = async (name: string) => {
     fs.mkdirSync(SHOTS, { recursive: true });
     // README görselleri için: bildirimleri gizle (E2E_CLEAN_SHOTS=1)
-    if (process.env.E2E_CLEAN_SHOTS === '1') await page.addStyleTag({ content: '.toasts { display: none !important; }' });
-    await page.waitForTimeout(250);
+    // Tarama çizgisi de gizlenir ve giriş animasyonlarının bitmesi beklenir
+    const clean = process.env.E2E_CLEAN_SHOTS === '1';
+    if (clean) await page.addStyleTag({ content: '.toasts, .sweep { display: none !important; }' });
+    await page.waitForTimeout(clean ? 600 : 250);
     await page.screenshot({ path: path.join(SHOTS, `${name}.png`) });
   };
 
@@ -79,6 +81,8 @@ describe.skipIf(!RUN)('Electron uçtan uca', () => {
     page = await app.firstWindow();
     await page.setViewportSize({ width: 1440, height: 900 });
     await page.waitForSelector('.brand-mark');
+    // Açılış ekranı en fazla ~1,8 sn görünür ve DOM'dan kalkar
+    await page.waitForSelector('.splash', { state: 'detached', timeout: 5_000 });
   }, 60_000);
 
   afterAll(async () => {

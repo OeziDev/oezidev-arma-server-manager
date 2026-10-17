@@ -848,6 +848,14 @@ export const tr = {
   'set.launchAtLogin': 'Windows açılınca uygulamayı başlat (tepside)',
   'help.set.launchAtLogin': '"Uygulama açılınca başlat" seçili sunucularla birlikte, bilgisayar yeniden başladıktan sonra sunucular kendiliğinden ayağa kalkar.',
 
+  // animasyonlar
+  'set.motion': 'Animasyonlar',
+  'help.set.motion': 'Geçişler, açılış ekranı ve vurgu efektleri. İşletim sisteminde "hareketi azalt" açıksa her durumda kapalıdır.',
+  'splash.boot': 'Sistemler başlatılıyor…',
+  'splash.scan': 'Sunucular taranıyor…',
+  'splash.ready': 'Hazır',
+  'splash.skip': 'Geçmek için tıklayın',
+
   'err.generic': 'Bir hata oluştu',
 } as const;
 

@@ -11,6 +11,8 @@ import { Toasts } from './components/Toasts';
 import { JobsPanel } from './components/JobsPanel';
 import { Button, Modal } from './components/ui';
 import { ImportSummary, type ImportSummaryData } from './components/ImportSummary';
+import { Splash } from './components/Splash';
+import { Sweep } from './components/motion';
 
 export type Route = { view: 'welcome' } | { view: 'server'; id: string; tab: TabId } | { view: 'hosts' } | { view: 'settings' };
 export type Navigate = (r: Route, opts?: { force?: boolean }) => void;
@@ -80,6 +82,8 @@ export function App() {
       <div className="shell">
         <Sidebar route={route} onNavigate={navigate} onNew={() => setNewOpen(true)} />
         <main className="main">
+          {/* Sunucu görünümü kendi taramasını sekme değişiminde oynatır */}
+          {ready && route.view !== 'server' && <Sweep key={route.view} />}
           {!ready ? null : route.view === 'server' ? (
             <ServerView key={route.id} id={route.id} tab={route.tab} onTab={(tab) => setRoute({ ...route, tab })} onNavigate={navigate} />
           ) : route.view === 'hosts' ? (
@@ -143,6 +147,7 @@ export function App() {
       )}
       <JobsPanel />
       <Toasts />
+      <Splash ready={ready} />
     </I18nContext.Provider>
   );
 }

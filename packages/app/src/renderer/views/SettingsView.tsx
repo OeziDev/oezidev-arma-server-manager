@@ -4,6 +4,7 @@ import { Button, Field, PasswordInput, Section, Seg, Toggle } from '../component
 import { useI18n } from '../i18n';
 import { api, attempt, setState, tryRun, useStore } from '../state';
 import { InstallSteamCmdDialog } from './HostsView';
+import { getMotionPref, setMotionPref } from '../components/motion';
 
 type SteamEdits = Partial<Pick<AppSettings, 'steamUsername' | 'localSteamcmdPath'>>;
 
@@ -16,6 +17,8 @@ export function SettingsView() {
   const [edits, setEdits] = useState<SteamEdits>({});
   const [password, setPassword] = useState('');
   const [install, setInstall] = useState(false);
+  // Sadece bu bilgisayarda (localStorage) tutulur; <html class="no-motion"> ile uygulanır
+  const [motion, setMotion] = useState(getMotionPref);
   if (!settings || !info) return null;
 
   /** Sadece değişen alanları gönder (ana süreç birleştirir). */
@@ -51,6 +54,15 @@ export function SettingsView() {
           </Field>
           <Field label={t('set.tray')} help={t('help.set.tray')}>
             <Toggle checked={settings.minimizeToTray} onChange={(v) => void save({ minimizeToTray: v })} />
+          </Field>
+          <Field label={t('set.motion')} help={t('help.set.motion')}>
+            <Toggle
+              checked={motion}
+              onChange={(v) => {
+                setMotionPref(v);
+                setMotion(v);
+              }}
+            />
           </Field>
           {/* Oturum açılışında başlatma sadece Windows'ta (giriş öğesi) destekleniyor */}
           {info.platform === 'windows' && (

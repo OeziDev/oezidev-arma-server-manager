@@ -52,7 +52,7 @@ export function ConfigTab({ section, onSection }: { section: ConfigSection; onSe
           </button>
         ))}
       </nav>
-      <div>
+      <div key={section} className="cfg-pane">
         {section === 'server' && <ServerSection />}
         {section === 'general' && <GeneralSection />}
         {section === 'security' && <SecuritySection />}

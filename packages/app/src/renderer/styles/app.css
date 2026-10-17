@@ -64,7 +64,7 @@ a { color: var(--info); }
 
 /* ---------------- Yerleşim ---------------- */
 .shell { display: grid; grid-template-columns: var(--sidebar-w) 1fr; height: 100%; }
-.main { min-width: 0; display: flex; flex-direction: column; height: 100%; overflow: hidden; }
+.main { min-width: 0; display: flex; flex-direction: column; height: 100%; overflow: hidden; position: relative; }
 
 /* ---------------- Kenar çubuğu ---------------- */
 .sidebar {
@@ -79,7 +79,7 @@ a { color: var(--info); }
   display: flex; align-items: center; justify-content: space-between;
   padding: 16px 20px 8px; color: var(--text-3); font: 500 13px var(--font-cond);
 }
-.server-list { list-style: none; margin: 0; padding: 0 10px; overflow-y: auto; flex: 1; min-height: 0; }
+.server-list { list-style: none; margin: 0; padding: 0 10px; overflow-y: auto; flex: 1; min-height: 0; position: relative; }
 .server-item {
   display: grid; grid-template-columns: 24px 1fr auto; align-items: center; gap: 10px;
   width: 100%; padding: 9px 10px; border: 1px solid transparent; border-radius: var(--r-control);
@@ -90,7 +90,7 @@ a { color: var(--info); }
 .server-item-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .server-item-meta { font-size: 12px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .server-item-players { font: 500 13px var(--font-cond); color: var(--text-2); }
-.side-nav { border-top: 1px solid var(--line); padding: 8px 10px; display: grid; gap: 2px; }
+.side-nav { border-top: 1px solid var(--line); padding: 8px 10px; display: grid; gap: 2px; position: relative; }
 .side-nav button {
   display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 0; background: none;
   border-radius: var(--r-control); color: var(--text-2); cursor: pointer; text-align: left;
@@ -143,7 +143,9 @@ a { color: var(--info); }
   font: 500 15px var(--font-cond); border-bottom: 2px solid transparent; white-space: nowrap; position: relative;
 }
 .tab:hover { color: var(--text); }
-.tab[aria-selected='true'] { color: var(--text); border-bottom-color: var(--signal); }
+.tab[aria-selected='true'] { color: var(--text); }
+.tab::after { content: ''; position: absolute; left: 0; right: 0; bottom: -2px; height: 2px; background: var(--signal); transform: scaleX(0); opacity: 0; }
+.tab[aria-selected='true']::after { transform: none; opacity: 1; box-shadow: 0 0 10px rgba(233, 180, 76, 0.45); }
 .tab .dot { position: absolute; top: 8px; right: 4px; width: 6px; height: 6px; border-radius: 50%; background: var(--bad); }
 
 .content { flex: 1; overflow-y: auto; padding: 24px 28px 56px; min-height: 0; }
@@ -154,6 +156,7 @@ a { color: var(--info); }
   display: inline-flex; align-items: center; justify-content: center; gap: 8px;
   height: 34px; padding: 0 14px; border-radius: var(--r-control); border: 1px solid var(--line-strong);
   background: var(--raised); color: var(--text); cursor: pointer; font-weight: 500; white-space: nowrap;
+  position: relative;
 }
 .btn:hover:not(:disabled) { border-color: var(--text-3); background: #2d332c; }
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
@@ -236,7 +239,7 @@ a { color: var(--info); }
 .mono { font-family: var(--font-mono); font-size: 12.5px; }
 .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); } .info { color: var(--info); }
 
-.panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-panel); }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-panel); position: relative; }
 .panel-head { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
 .panel-head h3 { margin: 0; font: 600 16px var(--font-cond); }
 .panel-head .spacer { flex: 1; }
@@ -371,7 +374,7 @@ a { color: var(--info); }
 
 /* ---------------- Performans ---------------- */
 .perf-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(116px, 1fr)); gap: 10px; max-width: 1200px; }
-.perf-tile { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-panel); padding: 10px 14px 12px; min-width: 0; }
+.perf-tile { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-panel); padding: 10px 14px 12px; min-width: 0; position: relative; }
 .perf-tile.big { border-color: color-mix(in srgb, var(--signal) 35%, var(--line)); background: color-mix(in srgb, var(--signal) 5%, var(--panel)); }
 .perf-tile-label { font: 500 12.5px var(--font-cond); color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .perf-tile-value { font: 600 26px/1.15 var(--font-cond); color: var(--text); font-variant-numeric: tabular-nums; margin-top: 2px; }
@@ -424,7 +427,7 @@ a { color: var(--info); }
 
 /* ---------------- Oyuncu geçmişi ---------------- */
 .stat-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; margin-bottom: 16px; max-width: 1200px; }
-.stat-group { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-panel); padding: 10px 16px 12px; }
+.stat-group { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-panel); padding: 10px 16px 12px; position: relative; }
 .stat-group-title { font: 500 12.5px var(--font-cond); color: var(--text-3); margin-bottom: 6px; }
 .stat-items { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 .stat-value { font: 600 24px/1.1 var(--font-cond); font-variant-numeric: tabular-nums; }
@@ -442,3 +445,215 @@ a { color: var(--info); }
 /* ---------------- Yedekler ---------------- */
 .time-chip { display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--line-strong); border-radius: 4px; padding: 2px 4px 2px 10px; }
 .panel + .section { margin-top: 28px; }
+
+/* =====================================================================
+ * Hareket ve HUD efektleri
+ * Durağan görünüm (parıltı, nişangâh köşeleri, gösterge) her zaman; hareketin kendisi sadece
+ * `prefers-reduced-motion: no-preference` ve <html> üzerinde `.no-motion` yokken (Ayarlar > Animasyonlar).
+ * Konsol satırları, tablo satırları ve uzun listeler tek tek canlandırılmaz.
+ * ===================================================================== */
+
+/* ---- Sıralı giriş indeksi (en fazla 8 kademe) ---- */
+:is(.content, .cfg-pane, .welcome, .perf-tiles, .perf-charts, .two-col, .stat-strip, .jobs, .split) > * { --i: 8; }
+:is(.content, .cfg-pane, .welcome, .perf-tiles, .perf-charts, .two-col, .stat-strip, .jobs, .split) > :nth-child(1) { --i: 0; }
+:is(.content, .cfg-pane, .welcome, .perf-tiles, .perf-charts, .two-col, .stat-strip, .jobs, .split) > :nth-child(2) { --i: 1; }
+:is(.content, .cfg-pane, .welcome, .perf-tiles, .perf-charts, .two-col, .stat-strip, .jobs, .split) > :nth-child(3) { --i: 2; }
+:is(.content, .cfg-pane, .welcome, .perf-tiles, .perf-charts, .two-col, .stat-strip, .jobs, .split) > :nth-child(4) { --i: 3; }
+:is(.content, .cfg-pane, .welcome, .perf-tiles, .perf-charts, .two-col, .stat-strip, .jobs, .split) > :nth-child(5) { --i: 4; }
+:is(.content, .cfg-pane, .welcome, .perf-tiles, .perf-charts, .two-col, .stat-strip, .jobs, .split) > :nth-child(6) { --i: 5; }
+:is(.content, .cfg-pane, .welcome, .perf-tiles, .perf-charts, .two-col, .stat-strip, .jobs, .split) > :nth-child(7) { --i: 6; }
+:is(.content, .cfg-pane, .welcome, .perf-tiles, .perf-charts, .two-col, .stat-strip, .jobs, .split) > :nth-child(8) { --i: 7; }
+/* İç ızgaralar, üstlerinin sırasını taşır */
+.content > * { --pi: var(--i); }
+
+/* ---- Nişangâh köşeleri ┌ ┐ └ ┘ ---- */
+.panel::before, .perf-tile::before, .stat-group::before, .reticle::before, .splash-frame::before {
+  --bk: var(--signal);
+  --bl: 10px;
+  --bw: 2px;
+  content: ''; position: absolute; inset: -3px; pointer-events: none; z-index: 3;
+  background:
+    linear-gradient(var(--bk), var(--bk)) left top / var(--bl) var(--bw),
+    linear-gradient(var(--bk), var(--bk)) left top / var(--bw) var(--bl),
+    linear-gradient(var(--bk), var(--bk)) right top / var(--bl) var(--bw),
+    linear-gradient(var(--bk), var(--bk)) right top / var(--bw) var(--bl),
+    linear-gradient(var(--bk), var(--bk)) left bottom / var(--bl) var(--bw),
+    linear-gradient(var(--bk), var(--bk)) left bottom / var(--bw) var(--bl),
+    linear-gradient(var(--bk), var(--bk)) right bottom / var(--bl) var(--bw),
+    linear-gradient(var(--bk), var(--bk)) right bottom / var(--bw) var(--bl);
+  background-repeat: no-repeat;
+  opacity: 0;
+}
+.perf-tile::before, .stat-group::before { --bl: 8px; }
+.panel:hover::before, .panel:focus-within::before { opacity: 0.8; }
+.perf-tile:hover::before, .stat-group:hover::before, .perf-tile:focus-within::before, .stat-group:focus-within::before { opacity: 1; }
+.panel:hover { border-color: color-mix(in srgb, var(--signal) 20%, var(--line)); }
+.perf-tile:hover, .stat-group:hover { border-color: color-mix(in srgb, var(--signal) 32%, var(--line)); box-shadow: 0 0 22px -8px rgba(233, 180, 76, 0.35); }
+
+/* Büyük durum işareti: köşeli çerçeve + durum değişiminde yayılan halka */
+.reticle { --c: var(--line-strong); position: relative; display: inline-grid; place-items: center; padding: 6px 7px; margin: -6px -7px; flex: none; }
+.reticle::before { --bk: var(--c); --bl: 7px; inset: 0; opacity: 1; }
+.reticle::after { content: ''; position: absolute; inset: 6px 7px; border: 2px solid var(--c); border-radius: 2px; opacity: 0; pointer-events: none; }
+.reticle[data-s='running'], .reticle[data-s='starting'], .reticle[data-s='restarting'], .reticle[data-s='stopping'], .reticle[data-s='updating'] { --c: var(--signal); }
+.reticle[data-s='running']::after { border-color: var(--ok); }
+.reticle[data-s='crashed'] { --c: var(--bad); }
+
+/* ---- Parıltı ve odak (durağan) ---- */
+.btn:hover:not(:disabled) { box-shadow: 0 0 0 1px rgba(233, 180, 76, 0.1), 0 0 16px -5px rgba(233, 180, 76, 0.4); }
+.btn.primary:hover:not(:disabled) { box-shadow: 0 0 20px -3px rgba(233, 180, 76, 0.6); }
+.btn.danger:hover:not(:disabled) { box-shadow: 0 0 16px -5px rgba(240, 138, 126, 0.45); }
+.btn.ghost:hover:not(:disabled) { box-shadow: 0 0 14px -6px rgba(233, 180, 76, 0.3); }
+.btn:active:not(:disabled) { filter: brightness(0.9); }
+.btn:focus-visible, .tab:focus-visible, .subtab:focus-visible, .server-item:focus-visible, .side-nav button:focus-visible, .subnav button:focus-visible, .seg button:focus-visible {
+  outline: 2px solid var(--focus); outline-offset: 2px; box-shadow: 0 0 0 5px rgba(242, 196, 102, 0.14), 0 0 18px -4px rgba(233, 180, 76, 0.5);
+}
+.tab:focus-visible, .subtab:focus-visible, .server-item:focus-visible, .side-nav button:focus-visible, .subnav button:focus-visible { outline-offset: -2px; }
+.tab:hover, .subtab:hover { text-shadow: 0 0 14px rgba(233, 180, 76, 0.45); }
+.tab[aria-selected='true'] { text-shadow: 0 0 16px rgba(233, 180, 76, 0.25); }
+.server-item:hover, .side-nav button:hover, .subnav button:hover { box-shadow: inset 0 0 0 1px rgba(233, 180, 76, 0.12); }
+
+/* ---- Kenar çubuğu: kayan seçili göstergesi ---- */
+.side-ind-li { height: 0; margin: 0; padding: 0; }
+.side-ind {
+  position: absolute; top: 0; left: 10px; right: 10px; pointer-events: none; z-index: 0;
+  border: 1px solid var(--line-strong); border-radius: var(--r-control);
+  background: linear-gradient(90deg, rgba(233, 180, 76, 0.13), rgba(233, 180, 76, 0) 75%), var(--raised);
+  box-shadow: inset 2px 0 0 var(--signal), 0 0 16px -8px rgba(233, 180, 76, 0.6);
+}
+.server-item, .side-nav button { position: relative; z-index: 1; }
+.server-list:has(.side-ind) .server-item[aria-current='true'],
+.side-nav:has(.side-ind) button[aria-current='true'] { background: transparent; border-color: transparent; }
+
+/* Tarama çizgisi ve yazı efekti hareket kapalıyken hiç yok */
+.sweep { display: none; }
+
+/* ---- Açılış ekranı ---- */
+.splash {
+  position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; cursor: pointer;
+  background:
+    radial-gradient(ellipse at center, transparent 35%, rgba(0, 0, 0, 0.55) 100%),
+    repeating-linear-gradient(0deg, transparent 0 39px, rgba(231, 229, 217, 0.04) 39px 40px),
+    repeating-linear-gradient(90deg, transparent 0 39px, rgba(231, 229, 217, 0.04) 39px 40px),
+    var(--sunken);
+  transition: opacity 300ms ease;
+}
+.splash.out { opacity: 0; pointer-events: none; }
+.splash-frame { position: relative; padding: 36px 46px 30px; width: min(460px, calc(100vw - 48px)); }
+.splash-frame::before { --bl: 18px; inset: 0; opacity: 1; }
+.splash-mark { font: 400 68px/1 var(--font-stencil); letter-spacing: 0.02em; color: var(--text); }
+.splash-title { font: 600 15px/1 var(--font-cond); letter-spacing: 0.34em; text-transform: uppercase; color: var(--signal); margin-top: 12px; }
+.splash-bar { position: relative; margin-top: 24px; height: 2px; background: var(--line); overflow: hidden; }
+.splash-bar > span { display: block; height: 100%; background: var(--signal); box-shadow: 0 0 10px var(--signal); transform-origin: left center; transform: scaleX(0); }
+.splash.out .splash-bar > span { animation: none; transform: scaleX(1); }
+.splash-log { margin-top: 18px; min-height: 5.2em; font: 400 12.5px/1.7 var(--font-mono); color: var(--text-2); }
+.splash-line .tag { color: var(--ok); }
+.splash-line .tag.wait { color: var(--warn); }
+.splash-skip { position: absolute; bottom: 26px; left: 0; right: 0; text-align: center; font: 500 12.5px var(--font-cond); color: var(--text-3); }
+
+@media (prefers-reduced-motion: no-preference) {
+  /* -- içerik girişi: sekme / görünüm / sunucu değişiminde yeniden bağlanan .content'in çocukları -- */
+  :root:not(.no-motion) .content > *,
+  :root:not(.no-motion) .welcome > *,
+  :root:not(.no-motion) .split > .subnav,
+  :root:not(.no-motion) .cfg-pane > * {
+    animation: oz-rise 300ms cubic-bezier(0.2, 0.7, 0.2, 1) backwards;
+    animation-delay: calc(var(--i, 0) * 34ms);
+  }
+  :root:not(.no-motion) .content > .welcome,
+  :root:not(.no-motion) .content > .split,
+  :root:not(.no-motion) .content > :is(.perf-tiles, .perf-charts, .two-col, .stat-strip) { animation: none; }
+  /* içerikte doğrudan açılan pencereler gecikmesiz gelsin */
+  :root:not(.no-motion) :is(.content, .cfg-pane, .welcome) > .backdrop { animation: oz-fade 180ms ease-out; }
+  :root:not(.no-motion) .cfg-pane > * { animation-delay: calc(40ms + var(--i, 0) * 34ms); }
+  :root:not(.no-motion) :is(.perf-tiles, .perf-charts, .two-col, .stat-strip) > * {
+    animation: oz-rise 300ms cubic-bezier(0.2, 0.7, 0.2, 1) backwards;
+    animation-delay: calc(var(--pi, 0) * 34ms + var(--i, 0) * 30ms);
+  }
+
+  /* -- tarama çizgisi: bir kez yukarıdan aşağı -- */
+  :root:not(.no-motion) .sweep { display: block; position: absolute; inset: 0; overflow: hidden; pointer-events: none; z-index: 4; }
+  :root:not(.no-motion) .sweep::after {
+    content: ''; position: absolute; left: 0; right: 0; top: 0; height: 100%;
+    background: linear-gradient(to bottom, transparent 80%, rgba(233, 180, 76, 0.025) 95%, rgba(233, 180, 76, 0.07) 99.4%, rgba(242, 196, 102, 0.5) 99.8%, transparent 100%);
+    transform: translateY(-100%);
+    animation: oz-sweep 460ms cubic-bezier(0.45, 0, 0.25, 1) forwards;
+  }
+
+  /* -- sunucu adı yazılır -- */
+  :root:not(.no-motion) .tw-ch { opacity: 0; position: relative; animation: oz-show 1ms linear forwards; animation-delay: calc(var(--i) * var(--step)); }
+  :root:not(.no-motion) .tw-ch::after {
+    content: ''; position: absolute; top: 0.12em; bottom: 0.06em; right: -4px; width: 3px; background: var(--signal);
+    box-shadow: 0 0 8px rgba(233, 180, 76, 0.6); opacity: 0;
+    animation: oz-on var(--step) linear; animation-delay: calc(var(--i) * var(--step));
+  }
+  :root:not(.no-motion) .tw-ch:last-child::after { animation: oz-caret 330ms linear 3; animation-delay: calc(var(--i) * var(--step)); }
+
+  /* -- durum değişimi -- */
+  :root:not(.no-motion) .reticle::before { animation: oz-lock 320ms cubic-bezier(0.2, 0.8, 0.2, 1); }
+  :root:not(.no-motion) .reticle.pulse::after { animation: oz-ring 750ms ease-out; }
+  :root:not(.no-motion) .fact-value.pulse { animation: oz-value 900ms ease-out; }
+
+  /* -- nişangâh köşeleri kilitlenir -- */
+  :root:not(.no-motion) :is(.panel, .perf-tile, .stat-group)::before { transform: scale(1.012); transition: opacity 180ms ease, transform 240ms cubic-bezier(0.2, 0.8, 0.2, 1); }
+  :root:not(.no-motion) :is(.perf-tile, .stat-group)::before { transform: scale(1.07); }
+  :root:not(.no-motion) :is(.panel, .perf-tile, .stat-group):is(:hover, :focus-within)::before { transform: none; }
+  :root:not(.no-motion) :is(.perf-tile, .stat-group) { transition: transform 160ms ease, box-shadow 200ms ease, border-color 200ms ease; }
+  :root:not(.no-motion) :is(.perf-tile, .stat-group):hover { transform: translateY(-1px); }
+  :root:not(.no-motion) .panel { transition: border-color 200ms ease; }
+
+  /* -- düğmeler -- */
+  :root:not(.no-motion) .btn { transition: transform 140ms ease, box-shadow 180ms ease, background-color 160ms ease, border-color 160ms ease, color 160ms ease; }
+  :root:not(.no-motion) .btn:hover:not(:disabled) { transform: translateY(-1px); }
+  :root:not(.no-motion) .btn:active:not(:disabled) { transform: translateY(0) scale(0.97); transition-duration: 60ms; }
+  :root:not(.no-motion) .btn.primary { overflow: hidden; }
+  :root:not(.no-motion) .btn.primary::after {
+    content: ''; position: absolute; inset: 0; pointer-events: none;
+    background: linear-gradient(105deg, transparent 32%, rgba(255, 248, 225, 0.55) 50%, transparent 68%);
+    transform: translateX(-120%);
+  }
+  :root:not(.no-motion) .btn.primary:hover:not(:disabled)::after { animation: oz-sheen 650ms ease-out; }
+
+  /* -- sekmeler ve kenar çubuğu -- */
+  :root:not(.no-motion) :is(.tab, .subtab) { transition: color 150ms ease, text-shadow 200ms ease; }
+  :root:not(.no-motion) .tab[aria-selected='true']::after { animation: oz-line 260ms cubic-bezier(0.2, 0.8, 0.2, 1); }
+  :root:not(.no-motion) :is(.server-item, .side-nav button, .subnav button) { transition: background-color 150ms ease, color 150ms ease, box-shadow 180ms ease, transform 150ms ease; }
+  :root:not(.no-motion) :is(.server-item, .side-nav button, .subnav button):hover { transform: translateX(2px); }
+  :root:not(.no-motion) .side-ind.moved { transition: transform 260ms cubic-bezier(0.3, 0.7, 0.2, 1), height 200ms ease; }
+
+  /* -- pencereler, bildirimler, işler, kaydet çubuğu -- */
+  :root:not(.no-motion) .backdrop { animation: oz-fade 180ms ease-out; }
+  :root:not(.no-motion) .modal { animation: oz-modal 220ms cubic-bezier(0.2, 0.8, 0.2, 1); }
+  :root:not(.no-motion) .toast { animation: oz-toast 260ms cubic-bezier(0.2, 0.8, 0.2, 1); }
+  :root:not(.no-motion) .job { animation: oz-rise 260ms cubic-bezier(0.2, 0.7, 0.2, 1) backwards; animation-delay: calc(var(--i, 0) * 34ms); }
+  :root:not(.no-motion) .dirty-bar { animation: oz-bar 220ms cubic-bezier(0.2, 0.8, 0.2, 1); }
+
+  /* -- açılış ekranı -- */
+  :root:not(.no-motion) .splash-frame::before { animation: oz-lock 420ms cubic-bezier(0.2, 0.8, 0.2, 1); }
+  :root:not(.no-motion) .splash-mark { animation: oz-rise 380ms cubic-bezier(0.2, 0.7, 0.2, 1) 60ms backwards; }
+  :root:not(.no-motion) .splash-title { animation: oz-fade 300ms ease-out 200ms backwards; }
+  :root:not(.no-motion) .splash-bar > span { animation: oz-fill 1500ms cubic-bezier(0.3, 0.6, 0.2, 1) 120ms forwards; }
+  :root:not(.no-motion) .splash-bar::after {
+    content: ''; position: absolute; inset: -1px 0; pointer-events: none;
+    background: linear-gradient(90deg, transparent 42%, rgba(255, 230, 170, 0.9) 50%, transparent 58%);
+    animation: oz-glint 950ms linear infinite;
+  }
+  :root:not(.no-motion) .splash-line { opacity: 0; animation: oz-type 240ms ease-out forwards; animation-delay: var(--d, 0ms); }
+}
+
+@keyframes oz-rise { from { opacity: 0; transform: translateY(10px); } }
+@keyframes oz-fade { from { opacity: 0; } }
+@keyframes oz-show { to { opacity: 1; } }
+@keyframes oz-on { from, to { opacity: 1; } }
+@keyframes oz-caret { 0%, 55% { opacity: 1; } 56%, 100% { opacity: 0; } }
+@keyframes oz-sweep { 0% { transform: translateY(-100%); opacity: 1; } 80% { opacity: 1; } 100% { transform: translateY(0); opacity: 0; } }
+@keyframes oz-lock { from { opacity: 0; transform: scale(1.35); } }
+@keyframes oz-ring { 0% { opacity: 0.9; transform: scale(1); } 100% { opacity: 0; transform: scale(1.6, 1.9); } }
+@keyframes oz-value { 0% { opacity: 0.35; } 20% { opacity: 1; text-shadow: 0 0 14px currentColor; } 100% { text-shadow: 0 0 0 transparent; } }
+@keyframes oz-sheen { to { transform: translateX(120%); } }
+@keyframes oz-line { from { transform: scaleX(0); opacity: 0.4; } }
+@keyframes oz-modal { from { opacity: 0; transform: translateY(4px) scale(0.97); } }
+@keyframes oz-toast { from { opacity: 0; transform: translateX(28px); } }
+@keyframes oz-bar { from { opacity: 0; transform: translateY(100%); } }
+@keyframes oz-fill { to { transform: scaleX(1); } }
+@keyframes oz-glint { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+@keyframes oz-type { from { opacity: 0; transform: translateX(-6px); } to { opacity: 1; transform: none; } }

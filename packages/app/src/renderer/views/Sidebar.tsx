@@ -1,7 +1,30 @@
+import { type RefObject, useLayoutEffect, useRef, useState } from 'react';
 import type { Navigate, Route } from '../App';
 import { StatusMark } from '../components/ui';
 import { useI18n } from '../i18n';
 import { api, fpsClass, hostLabel, useStore } from '../state';
+
+/**
+ * Seçili öğenin arkasında kayan gösterge: konteyner içindeki aria-current="true" öğeyi ölçer.
+ * İlk konumlandırma animasyonsuz, sonrakiler transform geçişiyle.
+ */
+function useIndicator(ref: RefObject<HTMLElement | null>, deps: unknown[]) {
+  const [box, setBox] = useState<{ y: number; h: number; moved: boolean } | null>(null);
+  useLayoutEffect(() => {
+    const measure = () => {
+      const el = ref.current?.querySelector<HTMLElement>('[aria-current="true"]');
+      setBox((prev) => (el ? { y: el.offsetTop, h: el.offsetHeight, moved: !!prev } : null));
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    if (ref.current) ro.observe(ref.current);
+    return () => ro.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, deps);
+  return box ? (
+    <span className={`side-ind ${box.moved ? 'moved' : ''}`} aria-hidden style={{ transform: `translateY(${box.y}px)`, height: box.h }} />
+  ) : null;
+}
 
 export function Sidebar({ route, onNavigate, onNew }: { route: Route; onNavigate: Navigate; onNew: () => void }) {
   const { t } = useI18n();
@@ -11,6 +34,11 @@ export function Sidebar({ route, onNavigate, onNew }: { route: Route; onNavigate
   const version = useStore((s) => s.info?.version);
   const update = useStore((s) => s.update);
   const showUpdate = update && (update.status === 'downloading' || update.status === 'ready');
+  const listRef = useRef<HTMLUListElement>(null);
+  const navRef = useRef<HTMLElement>(null);
+  const routeKey = route.view === 'server' ? `s:${route.id}` : route.view;
+  const listInd = useIndicator(listRef, [routeKey, summaries.length]);
+  const navInd = useIndicator(navRef, [routeKey]);
 
   return (
     <aside className="sidebar">
@@ -24,7 +52,8 @@ export function Sidebar({ route, onNavigate, onNew }: { route: Route; onNavigate
           {t('app.newServer')}
         </button>
       </div>
-      <ul className="server-list">
+      <ul className="server-list" ref={listRef}>
+        {listInd && <li className="side-ind-li">{listInd}</li>}
         {summaries.map((s) => {
           const st = statuses[s.id] ?? s.status;
           const current = route.view === 'server' && route.id === s.id;
@@ -60,7 +89,8 @@ export function Sidebar({ route, onNavigate, onNew }: { route: Route; onNavigate
           );
         })}
       </ul>
-      <nav className="side-nav">
+      <nav className="side-nav" ref={navRef}>
+        {navInd}
         <button aria-current={route.view === 'hosts'} onClick={() => onNavigate({ view: 'hosts' })}>
           {t('app.hosts')}
         </button>

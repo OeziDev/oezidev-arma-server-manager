@@ -831,5 +831,13 @@ export const en: Dict = {
   'set.launchAtLogin': 'Start the app when Windows starts (in tray)',
   'help.set.launchAtLogin': 'Together with servers set to "start when the app opens", your servers come back up on their own after a reboot.',
 
+  // animations
+  'set.motion': 'Animations',
+  'help.set.motion': 'Transitions, the start screen and highlight effects. Always off when "reduce motion" is enabled in your operating system.',
+  'splash.boot': 'Starting systems…',
+  'splash.scan': 'Scanning servers…',
+  'splash.ready': 'Ready',
+  'splash.skip': 'Click to skip',
+
   'err.generic': 'Something went wrong',
 };

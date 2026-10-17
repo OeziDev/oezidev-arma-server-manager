@@ -1,6 +1,7 @@
 import { createContext, type ReactNode, useContext, useEffect, useId, useRef, useState } from 'react';
 import { useI18n } from '../i18n';
 import { api, errorText, toast } from '../state';
+import { useChangeCount } from './motion';
 
 /**
  * Açık sunucu formunun yerel geçerlilik kaydı: metin alanları taslağa yazılamayan (geçersiz) bir değer
@@ -365,7 +366,14 @@ export function useConfirm() {
 }
 
 export function StatusMark({ status, large }: { status: string; large?: boolean }) {
-  return <span className={`mark ${large ? 'lg' : ''}`} data-s={status} aria-hidden />;
+  const changes = useChangeCount(status);
+  if (!large) return <span className="mark" data-s={status} aria-hidden />;
+  // Büyük işaret: nişangâh köşeleri; durum değişince köşeler yeniden kilitlenir ve bir halka yayılır
+  return (
+    <span key={changes} className={`reticle ${changes ? 'pulse' : ''}`} data-s={status} aria-hidden>
+      <span className="mark lg" data-s={status} />
+    </span>
+  );
 }
 
 export function Empty({ title, children }: { title: string; children?: ReactNode }) {

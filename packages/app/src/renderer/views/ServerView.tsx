@@ -3,6 +3,7 @@ import type { Issue, ServerProfile } from '../../shared/api';
 import type { Route } from '../App';
 import { DraftContext, setPath } from '../components/draft';
 import { Button, FormContext, StatusMark, useConfirm } from '../components/ui';
+import { Sweep, TypeTitle, useChangeCount } from '../components/motion';
 import { useI18n } from '../i18n';
 import { api, attempt, draftGuard, errorText, formatDuration, formatMem, fpsClass, hostLabel, toast, useStore } from '../state';
 import { OverviewTab } from '../tabs/OverviewTab';
@@ -97,6 +98,7 @@ export function ServerView({ id, tab, onTab, onNavigate }: { id: string; tab: Ta
   const [invalid, setInvalid] = useState<Record<string, true>>({});
   const [hiddenError, setHiddenError] = useState<string | null>(null);
   const { confirm, node: confirmNode } = useConfirm();
+  const statusChanges = useChangeCount(status?.status ?? 'stopped');
   const invalidCount = Object.keys(invalid).length;
   const draftDirty = useMemo(() => !!draft && !!saved && !same(draft, saved), [draft, saved]);
   const dirty = draftDirty || invalidCount > 0;
@@ -271,7 +273,7 @@ export function ServerView({ id, tab, onTab, onNavigate }: { id: string; tab: Ta
         <div className="server-head-row">
           <StatusMark status={st} large />
           <h1 className="server-title" title={saved.name}>
-            {saved.name}
+            <TypeTitle text={saved.name} />
           </h1>
           <div className="head-actions">
             {jobActive && <span className="small warn head-hint">{t('job.activeShort')}</span>}
@@ -305,7 +307,7 @@ export function ServerView({ id, tab, onTab, onNavigate }: { id: string; tab: Ta
         <div className="server-facts">
           <div className="fact">
             <span className="fact-label">{t('head.status')}</span>
-            <span className="fact-value" data-s={st}>
+            <span key={statusChanges} className={`fact-value ${statusChanges ? 'pulse' : ''}`} data-s={st}>
               {t(`status.${st}`)}
             </span>
           </div>
@@ -383,12 +385,13 @@ export function ServerView({ id, tab, onTab, onNavigate }: { id: string; tab: Ta
         </div>
       )}
       <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+        <Sweep key={tab} />
         {tab === 'console' ? (
           <div className="content flush">
             <ConsoleTab id={id} />
           </div>
         ) : (
-          <div className="content">
+          <div className="content" key={tab}>
             {tab === 'overview' && <OverviewTab id={id} profile={saved} issues={issues} errors={errors} onFix={goTo} onPerf={() => onTab('performance')} />}
             {tab === 'performance' && <PerformanceTab id={id} />}
             {tab === 'backups' && <BackupsTab id={id} />}
