@@ -184,14 +184,15 @@ describe('komut satırı', () => {
     expect(quoteWindowsArg('-name=R&D')).toBe('"-name=R&D"');
   });
 
-  it('Windows: sondaki ters bölü kırpılır, -bepath yine üretilir', () => {
+  it('Windows: sondaki ters bölü kırpılır, -bepath verilmez (TADST gibi)', () => {
     const p = createProfile({ paths: { serverDir: 'C:\\Arma 3\\', profilesDir: 'C:\\Users\\Halit Özcan\\Arma Profiles\\' } });
     const rp = resolvePaths(p, 'windows');
     expect(rp.serverDir).toBe('C:\\Arma 3');
     expect(rp.profilesDir).toBe('C:\\Users\\Halit Özcan\\Arma Profiles');
     const spec = buildServerLaunch(p, 'windows');
     expect(spec.args).toContain('-profiles=C:\\Users\\Halit Özcan\\Arma Profiles');
-    expect(spec.args).toContain('-bepath=C:\\Users\\Halit Özcan\\Arma Profiles\\BattlEye');
+    expect(spec.args.some((a) => a.startsWith('-bepath'))).toBe(false);
+    expect(buildServerLaunch(createProfile({ paths: { serverDir: '/srv/a3' } }), 'linux').args.some((a) => a.startsWith('-bepath='))).toBe(true);
     expect(formatCommandLine(spec, 'windows')).toContain('"-profiles=C:\\Users\\Halit Özcan\\Arma Profiles" ');
     // kök klasör korunur
     expect(resolvePaths(createProfile({ paths: { serverDir: 'D:\\', profilesDir: 'D:\\' } }), 'windows').profilesDir).toBe('D:\\');

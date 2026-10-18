@@ -123,7 +123,9 @@ export function buildServerLaunch(profile: ServerProfile, os: HostOs, paths?: Re
   ];
   if (profile.network.bindIp.trim()) args.push(`-ip=${profile.network.bindIp.trim()}`);
   // BattlEye klasörünü açıkça ver: Linux'ta büyük/küçük harf belirsizliği kalmasın, cfg'yi yazdığımız yerden okusun
-  if (profile.security.battlEye) args.push(`-bepath=${rp.beDir}`);
+  // Windows'ta -bepath verilmez (TADST gibi): BattlEye kendi varsayılan klasörünü ve kurulumdaki BEServer_x64.dll'i kullanır.
+  // Özel -bepath ile BattlEye oyuncu kaydını tamamlayamayabiliyor ("BEServer: cannot find channel", "Player without identity").
+  if (profile.security.battlEye && os !== 'windows') args.push(`-bepath=${rp.beDir}`);
   const mods = modListArg(l.mods);
   if (mods) args.push(`-mod=${mods}`);
   const serverMods = modListArg(l.serverMods);

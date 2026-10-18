@@ -667,8 +667,13 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       for (const e of await this.host.list(rp.beDir).catch(() => [])) {
         if (/^beserver(_x64)?_active_.*\.cfg$/i.test(e.name)) await this.host.remove(L.join(rp.beDir, e.name)).catch(() => undefined);
       }
-      await write(rp.beCfg, generateBeServerCfg(p), true);
-      await this.copyBattlEyeLibrary(rp).catch((err) => this.appLog(`BattlEye kütüphanesi kopyalanamadı: ${(err as Error).message}`));
+      const beText = generateBeServerCfg(p);
+      await write(rp.beCfg, beText, true);
+      if (this.host.os === 'windows') {
+        await this.deployWindowsBattlEye(rp, beText).catch((err) => this.appLog(`BattlEye cfg sunucu klasörüne yazılamadı: ${(err as Error).message}`));
+      } else {
+        await this.copyBattlEyeLibrary(rp).catch((err) => this.appLog(`BattlEye kütüphanesi kopyalanamadı: ${(err as Error).message}`));
+      }
     }
     for (let i = 1; i <= p.headless.count; i++) await this.host.mkdirp(rp.headlessProfilesDir(i));
     await this.deployMonitorMod(rp);
@@ -769,6 +774,39 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
         serverMods: [...p.launch.serverMods, { id: 'oezi-monitor', path: MONITOR_MOD_FOLDER, enabled: true, displayName: 'OeziDev Monitor', source: 'local' as const }],
       },
     };
+  }
+
+  /**
+   * Windows'ta -bepath kullanılmaz; BattlEye cfg'yi hangi varsayılan klasörden okursa okusun bulsun diye
+   * aynı cfg sunucu klasöründeki BattlEye klasörüne de yazılır (oradaki eski dosya bir kez yedeklenir).
+   * Eski sürümlerin profil klasörüne kopyaladığı BEServer_x64.dll silinir (kurulumdaki güncel dll kullanılsın).
+   */
+  private async deployWindowsBattlEye(rp: ResolvedPaths, beText: string) {
+    const L = pathLib(this.host.os);
+    const norm = (x: string) => x.toLowerCase().replace(/[\\/]+$/, '');
+    const dirEntry = (await this.host.list(rp.serverDir).catch(() => [])).find((e) => e.isDir && /^battleye$/i.test(e.name));
+    const srcDir = L.join(rp.serverDir, dirEntry ? dirEntry.name : 'BattlEye');
+    if (norm(srcDir) !== norm(rp.beDir)) {
+      for (const e of await this.host.list(rp.beDir).catch(() => [])) {
+        if (!e.isDir && /^beserver(_x64)?\.dll$/i.test(e.name)) {
+          await this.host.remove(L.join(rp.beDir, e.name)).catch(() => undefined);
+          this.appLog(`Eski BattlEye kütüphanesi kopyası silindi: ${L.join(rp.beDir, e.name)}`);
+        }
+      }
+      await this.host.mkdirp(srcDir);
+      const cfgName = L.basename(rp.beCfg);
+      for (const e of await this.host.list(srcDir).catch(() => [])) {
+        if (/^beserver(_x64)?_active_.*\.cfg$/i.test(e.name)) await this.host.remove(L.join(srcDir, e.name)).catch(() => undefined);
+      }
+      const target = L.join(srcDir, cfgName);
+      const backup = `${target}.oezi-yedek`;
+      const existing = await this.host.readFile(target).then((b) => b.toString('utf8')).catch(() => null);
+      if (existing !== null && existing !== beText && !(await this.host.stat(backup).catch(() => null))) {
+        await this.host.writeFile(backup, existing);
+        this.appLog(`Mevcut ${cfgName} yedeklendi: ${backup}`);
+      }
+      if (existing !== beText) await this.host.writeFile(target, beText);
+    }
   }
 
   /**
