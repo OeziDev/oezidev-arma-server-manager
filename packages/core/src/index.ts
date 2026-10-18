@@ -9,6 +9,7 @@ export * from './host/types.js';
 export * from './host/local.js';
 export * from './host/ssh.js';
 export * from './host/systemd.js';
+export * from './host/ports.js';
 export * from './scan.js';
 export * from './rcon/battleye.js';
 export * from './supervisor/scheduler.js';

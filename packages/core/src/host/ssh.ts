@@ -20,6 +20,7 @@ import {
 } from './types.js';
 import { createSystemdApi } from './systemd.js';
 import { followWithRestart } from './follow.js';
+import { LINUX_UDP_PORTS_COMMAND, type UdpPortOwner, normalizePorts, parseLinuxUdpPortsOutput } from './ports.js';
 import { LinuxCpuTracker, type ProcessStat, linuxProcessStatsCommand, parseLinuxProcessStatsOutput } from '../monitor/procstat.js';
 
 const { Client } = ssh2;
@@ -390,6 +391,22 @@ export class SshHost implements Host {
     const remote = res.code === 0 ? parseRemoteDate(res.stdout) : null;
     if (remote === null) throw new HostError(`Sunucu saati okunamadı: ${(res.stderr || res.stdout).trim() || 'cevap yok'}`, 'query_failed');
     return remote + Math.round((t1 - t0) / 2);
+  }
+
+  /**
+   * UDP portlarını dinleyen süreçler (ss -Hlunp, yoksa netstat -lunp). root değilse başka kullanıcının
+   * süreçleri görünmez: sudo ayarlıysa önce sudo ile denenir, olmazsa süreçsiz (yalnız port) sonuç döner.
+   */
+  async udpPortOwners(ports: number[]): Promise<UdpPortOwner[]> {
+    const list = normalizePorts(ports);
+    if (!list.length) return [];
+    if (this.usesSudo(true)) {
+      const res = await this.runShell(this.withPrivilege(LINUX_UDP_PORTS_COMMAND, true), { timeoutMs: 15000 });
+      if (res.code === 0 && /TOOL:(ss|netstat)/.test(res.stdout)) return parseLinuxUdpPortsOutput(res.stdout, list);
+    }
+    const res = await this.runShell(LINUX_UDP_PORTS_COMMAND, { timeoutMs: 15000 });
+    if (res.code !== 0) throw new HostError(`Port sorgulanamadı: ${(res.stderr || res.stdout).trim() || 'bağlantı yok'}`, 'query_failed');
+    return parseLinuxUdpPortsOutput(res.stdout, list);
   }
 
   private async check(file: string, args: string[], what: string, privileged = false): Promise<ExecResult> {

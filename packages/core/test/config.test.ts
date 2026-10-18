@@ -128,7 +128,8 @@ describe('server.cfg üretimi', () => {
   it('oylama kapalıyken izinli oy komutlarını boşaltır', () => {
     const { entries } = parseConfig(generateServerCfg(createProfile({ voting: { enabled: false } }), fixed));
     expect(findValue(entries, 'allowedVoteCmds')).toEqual([]);
-    expect(findValue(entries, 'voteThreshold')).toBe(1.5);
+    // Arma 0..1 dışını reddedip 0.5'e düşer: 1 yazılmalı
+    expect(findValue(entries, 'voteThreshold')).toBe(1);
   });
 
   it('görevleri parametreleriyle yazar, kapalı görevleri atlar', () => {

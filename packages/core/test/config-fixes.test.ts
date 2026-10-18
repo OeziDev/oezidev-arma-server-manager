@@ -142,6 +142,32 @@ describe('2) oylama: #vote admin varsayılan olarak kapalı', () => {
     const base2 = createProfile({ voting: { enabled: true, allowAdminVote: false } });
     expect(importServerCfg('hostname = "x";', base2).profile.voting.allowAdminVote).toBe(false);
   });
+
+  it('oylama kapalı: voteThreshold 0..1 aralığında (1) yazılır, Arma 0.5\'e düşmez', () => {
+    const cfg = generateServerCfg(createProfile({ voting: { enabled: false, voteThreshold: 0.4 } }), fixed);
+    expect(cfg).toContain('voteThreshold = 1;');
+    expect(cfg).toContain('allowedVoteCmds[] = {};');
+    expect(cfg).not.toContain('1.5');
+    // Kapalı oylamanın eşiği (1) profildeki eşiği ezmez: oylama sonra açılırsa eski eşik kullanılır
+    const r = importServerCfg(cfg, createProfile({ voting: { voteThreshold: 0.4 } }));
+    expect(r.profile.voting).toMatchObject({ enabled: false, voteThreshold: 0.4 });
+    expect(generateServerCfg(r.profile, fixed)).toBe(cfg);
+  });
+
+  it('eski sürümlerin yazdığı voteThreshold = 1.5 hâlâ "oylama kapalı" sayılır', () => {
+    const r = importServerCfg('allowedVoteCmds[] = {};\nvoteThreshold = 1.5;');
+    expect(r.profile.voting.enabled).toBe(false);
+    expect(r.profile.voting.voteThreshold).toBe(0.33);
+    expect(importServerCfg('voteThreshold = 1.5;').profile.voting.enabled).toBe(false);
+    const cfg = generateServerCfg(r.profile, fixed);
+    expect(cfg).toContain('voteThreshold = 1;');
+    expect(r.profile.advanced.extraServerCfg).toBe('');
+  });
+
+  it('boş allowedVoteCmds + eşik 0.5 da oylama kapalı sayılır', () => {
+    const r = importServerCfg('allowedVoteCmds[] = {};\nvoteThreshold = 0.5;');
+    expect(r.profile.voting).toMatchObject({ enabled: false, voteThreshold: 0.5 });
+  });
 });
 
 describe('3) forcedDifficulty', () => {
@@ -424,5 +450,28 @@ describe('14) eski / yeni sürüm profilleri', () => {
     expect(errs).toEqual([]);
     expect(profile!.schemaVersion).toBe(1);
     expect(profile!.name).toBe('Yeni');
+  });
+});
+
+describe('Steam sorgu veri boyutu uyarısı', () => {
+  const mods = (n: number, prefix = '@m') => Array.from({ length: n }, (_, i) => ({ path: `${prefix}${i}` }));
+  const find = (p: ReturnType<typeof createProfile>) => validateProfile(p).find((i) => i.code === 'connection.steamQuerySize');
+
+  it('20\'den fazla açık mod (mods + serverMods) ve 1024 bayt: 4096 önerilir', () => {
+    const p = createProfile({ paths: { serverDir: '/srv/a3' }, launch: { mods: mods(18), serverMods: mods(3, '@s') } });
+    const i = find(p)!;
+    expect(i.severity).toBe('warning');
+    expect(i.path).toBe('connection.steamProtocolMaxDataSize');
+    expect(i.message.tr).toContain('21 mod');
+    expect(i.message.tr).toContain('4096');
+    expect(i.message.en).toContain('4096');
+  });
+
+  it('20 mod, kapalı modlar ya da yükseltilmiş boyut: uyarı yok', () => {
+    expect(find(createProfile({ launch: { mods: mods(20) } }))).toBeUndefined();
+    expect(find(createProfile({ launch: { mods: [...mods(20), { path: '@off', enabled: false }] } }))).toBeUndefined();
+    expect(find(createProfile({ launch: { mods: mods(61) }, connection: { steamProtocolMaxDataSize: 4096 } }))).toBeUndefined();
+    const cfg = generateServerCfg(createProfile({ connection: { steamProtocolMaxDataSize: 4096 } }), fixed);
+    expect(cfg).toContain('steamProtocolMaxDataSize = 4096;');
   });
 });

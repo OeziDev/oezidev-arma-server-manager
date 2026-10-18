@@ -208,7 +208,7 @@ export const en: Dict = {
   'help.connection.upnp': 'Tries to open router ports automatically. Keep off on a VPS.',
   'field.connection.loopback': 'Loopback (local testing)',
   'field.connection.steamProtocolMaxDataSize': 'Steam query data size',
-  'help.connection.steamProtocolMaxDataSize': 'Raise (e.g. 8192) if a heavily modded server does not show in the browser.',
+  'help.connection.steamProtocolMaxDataSize': 'Default 1024. Set it to 4096 for heavily modded servers (20+ mods): otherwise "Steam Query data overflow" happens, clients get an incomplete mod/signature list and the server may not show in the browser.',
   'field.missions.autoSelectMission': 'Auto-select mission',
   'field.missions.randomMissionOrder': 'Random order',
   'field.missions.forcedDifficulty': 'Forced difficulty',
@@ -584,6 +584,7 @@ export const en: Dict = {
   'nav.save': 'Save and continue',
 
   // start error
+  'head.serverWarning': 'Server warning',
   'head.lastError': 'Server failed to start',
   'head.lastErrorValidation': 'Start was blocked because the checks found errors. Fix the errors on the Overview tab and try again.',
   'head.showIssues': 'Show checks',

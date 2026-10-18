@@ -209,6 +209,12 @@ export interface Host {
    * Olmayan süreçler sonuçta yer almaz.
    */
   processStats?(pids: number[]): Promise<{ pid: number; cpuPercent: number; memMB: number }[]>;
+  /**
+   * Verilen UDP portlarından şu an dinlenenler ve sahibi olan süreç (biliniyorsa). Boş dizi: hepsi boş.
+   * Başlatmadan önce port çakışması kontrolü için (ör. TADST ile açılmış başka bir arma3server).
+   * Sorgunun kendisi başarısız olursa hata fırlatır.
+   */
+  udpPortOwners?(ports: number[]): Promise<{ port: number; pid?: number; process?: string }[]>;
 }
 
 export class HostError extends Error {

@@ -4,7 +4,8 @@ import { type Host, type TailHandle, processMatches } from '../host/types.js';
 import { generateSystemdUnit } from '../host/systemd.js';
 import { appendServerModToExtraArgs, buildHeadlessLaunch, buildServerLaunch } from '../launch/commandLine.js';
 import { type HostOs, type ResolvedPaths, pathLib, resolvePaths } from '../launch/paths.js';
-import { type ServerProfile, effectiveRconPort } from '../model/profile.js';
+import { type ServerProfile, effectiveRconPort, usedPorts } from '../model/profile.js';
+import { type UdpPortOwner, isArmaServerProcess } from '../host/ports.js';
 import type { Notifier, NotifyEvent } from '../notify/discord.js';
 import { DiscordStatusUpdater } from '../notify/discordStatus.js';
 import { FpsAlertTracker } from '../monitor/fpsAlert.js';
@@ -30,6 +31,8 @@ export interface StatusInfo {
   rcon: RconState;
   players: number;
   lastError?: string;
+  /** lastError'ın İngilizcesi (biliniyorsa; arayüz dili İngilizceyse gösterilir) */
+  lastErrorEn?: string;
   /** Makineye ulaşılamıyor (SSH koptu vb.) */
   unreachable?: boolean;
   /** Son performans ölçümü (izleme açıksa): FPS @oezi_monitor'dan, CPU/RAM süreçlerden */
@@ -105,6 +108,10 @@ export interface ManagerOptions {
     procStatMs: number;
     /** Duyuru aralığı; 0 ise profile.announcements.intervalMin */
     announceMs: number;
+    /** Port kontrolünde çakışma görülünce tekrar denemeden önceki bekleme (az önce kapanan süreç portu kısa süre tutabilir) */
+    portRecheckMs: number;
+    /** Port kontrolünde çakışma kalırsa kaç kez daha denensin */
+    portRecheckCount: number;
   }>;
 }
 
@@ -150,6 +157,60 @@ export class ValidationFailedError extends Error {
   }
 }
 
+/** Portları bir sahibe göre gruplayıp kullanıcıya gösterilecek açıklamayı üretir. */
+export function describePortConflicts(owners: UdpPortOwner[]): { tr: string; en: string } {
+  const groups = new Map<string, { pid?: number; process?: string; ports: number[] }>();
+  for (const o of owners) {
+    const key = `${o.pid ?? ''}|${o.process ?? ''}`;
+    const g = groups.get(key) ?? { ...(o.pid !== undefined ? { pid: o.pid } : {}), ...(o.process ? { process: o.process } : {}), ports: [] };
+    if (!g.ports.includes(o.port)) g.ports.push(o.port);
+    groups.set(key, g);
+  }
+  const tr: string[] = [];
+  const en: string[] = [];
+  for (const g of groups.values()) {
+    const list = g.ports.sort((a, b) => a - b).join(', ');
+    const many = g.ports.length > 1;
+    if (g.pid === undefined && !g.process) {
+      tr.push(`${many ? 'Portlar' : 'Port'} ${list} (UDP) kullanımda (süreç bilinmiyor; root yetkisi olmadan görünmeyebilir)`);
+      en.push(`${many ? 'Ports' : 'Port'} ${list} (UDP) ${many ? 'are' : 'is'} in use (unknown process; may not be visible without root)`);
+      continue;
+    }
+    const who = [g.process, g.pid !== undefined ? `(PID ${g.pid})` : ''].filter(Boolean).join(' ');
+    tr.push(`${many ? 'Portlar' : 'Port'} ${list} (UDP) kullanımda: ${who}`);
+    en.push(`${many ? 'Ports' : 'Port'} ${list} (UDP) ${many ? 'are' : 'is'} in use: ${who}`);
+  }
+  const arma = owners.some((o) => isArmaServerProcess(o.process));
+  const known = owners.some((o) => o.pid !== undefined || o.process);
+  const hintTr = arma
+    ? 'Başka bir Arma 3 sunucusu (ör. TADST ile açılmış ya da arkada kalmış bir arma3server) çalışıyor; önce onu kapat.'
+    : known
+      ? 'Bu portları kullanan programı kapat ya da profilde farklı bir oyun portu seç.'
+      : 'Başka bir Arma sunucusu (ör. TADST ile açılmış) çalışıyor olabilir; önce onu kapat ya da farklı bir oyun portu seç.';
+  const hintEn = arma
+    ? 'Another Arma 3 server (e.g. started by TADST or a leftover arma3server) is running; close it first.'
+    : known
+      ? 'Close the program using these ports or choose a different game port in the profile.'
+      : 'Another Arma server (e.g. started by TADST) may be running; close it first or choose a different game port.';
+  return { tr: `${tr.join('; ')}. ${hintTr}`, en: `${en.join('; ')}. ${hintEn}` };
+}
+
+/**
+ * Oyun/Steam/BattlEye/RCON portlarından biri başka bir süreç tarafından kullanılıyor: başlatma reddedildi.
+ * Bu durumda Arma başka portlara kayar ("Server failed to bind to BattlEye port", "Initializing Steam server failed"),
+ * oyuncular "Waiting"de kalır; RCON da eski sunucuya bağlanıp yeni sunucuyu "hazır" sanırdı.
+ */
+export class PortInUseError extends Error {
+  readonly code = 'PORT_IN_USE';
+  readonly messageEn: string;
+  constructor(readonly owners: UdpPortOwner[]) {
+    const { tr, en } = describePortConflicts(owners);
+    super(tr);
+    this.messageEn = en;
+    this.name = 'PortInUseError';
+  }
+}
+
 /** Süreç durumu sorgulanamadı: kapatıldığından emin olunamadı */
 class ProcessQueryError extends Error {
   constructor(
@@ -177,6 +238,10 @@ const READY_RES = [/Host identity created/i, /BattlEye Server: Initialized/i];
  */
 const CFG_ERROR_RE = /^\s*(?:\d+:\d+:\d+(?:\.\d+)?\s+)?File (.+?), line \d+: /;
 const ERROR_MESSAGE_RE = /\bErrorMessage:/;
+/** Uyarı satırları (ölümcül değil; sunucu kapatılmaz, kullanıcı bilgilendirilir) */
+const STEAM_INIT_FAILED_RE = /Initializing Steam server failed/i;
+const BE_BIND_FAILED_RE = /failed to bind to BattlEye port(?: on (\d+))?(?:,\s*server instead bound to (\d+))?/i;
+const STEAM_QUERY_OVERFLOW_RE = /Steam Query data overflow/i;
 const ERROR_MESSAGE_GRACE_MS = 60_000;
 /** journald zamanı VPS saatine göre karşılaştırır; uzak saat bilinmiyorsa bu kadar geriden başla */
 const JOURNAL_MARGIN_SEC = 120;
@@ -214,6 +279,8 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
   private monitoring = false;
   private deadStreak = 0;
   private lastError: string | undefined;
+  /** lastError'ın İngilizcesi: yalnızca lastError hâlâ bu Türkçe metinse geçerlidir */
+  private lastErrorI18n: { tr: string; en: string } | null = null;
   private unreachable = false;
   private lastLoggedError = { text: '', at: 0 };
   private scheduledFor: number | null = null;
@@ -239,6 +306,10 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
   private errorMessageTimer: NodeJS.Timeout | null = null;
   private startTimeoutSec = 0;
   private recentServerLines: string[] = [];
+  /** Bu çalıştırmada gösterilmiş log uyarıları (Steam/BattlEye port, Steam sorgu taşması): her biri bir kez */
+  private logWarningsShown = new Set<string>();
+  /** En son takip edilen sunucu/HC PID'leri (kapatıldıktan sonra port kontrolünde "bizim" sayılır) */
+  private lastOwnPids = new Set<number>();
   /** Durdurma doğrulanamadı: süreç kapandığında "durdu" say (çökme sayma) */
   private stopPending = false;
   private rconCfg: RconSnapshot | null = null;
@@ -281,6 +352,8 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       perfMs: 0,
       procStatMs: 0,
       announceMs: 0,
+      portRecheckMs: 1500,
+      portRecheckCount: 2,
       ...opts.timers,
     };
     this.schedulerTimer = setInterval(() => void this.schedulerTick(), this.t.schedulerMs);
@@ -408,6 +481,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       rcon: this.rcon?.state ?? 'disconnected',
       players: this.playerCount,
       ...(this.lastError ? { lastError: this.lastError } : {}),
+      ...(this.lastError && this.lastErrorI18n?.tr === this.lastError ? { lastErrorEn: this.lastErrorI18n.en } : {}),
       ...(this.unreachable ? { unreachable: true } : {}),
       ...(this.currentPerf && this.isActive() ? { perf: { ...this.currentPerf } } : {}),
     };
@@ -795,9 +869,12 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     this.lastPerf = undefined;
     this.lastProcStat = null;
     this.currentPerf = undefined;
+    this.logWarningsShown.clear();
     this.setStatus('starting');
     this.deadStreak = 0;
     try {
+      await this.checkPortsFree();
+      if (this.disposed) return;
       await this.deploy();
       if (this.disposed) return;
       const rp = this.paths;
@@ -838,9 +915,54 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       this.armReadiness();
     } catch (err) {
       this.lastError = (err as Error).message;
+      const en = err instanceof PortInUseError ? err.messageEn : (err as Error).message;
+      this.lastErrorI18n = { tr: this.lastError, en };
       this.setStatus('stopped');
-      this.notice('error', `Sunucu başlatılamadı: ${(err as Error).message}`, `Server failed to start: ${(err as Error).message}`);
+      this.notice('error', `Sunucu başlatılamadı: ${(err as Error).message}`, `Server failed to start: ${en}`);
       throw err;
+    }
+  }
+
+  /** Takip edilen süreci bırakır; PID'leri port kontrolü için hatırlanır. */
+  private clearDirect() {
+    const d = this.direct;
+    if (d) this.lastOwnPids = new Set([d.pid, ...d.headless.map((h) => h.pid)]);
+    this.direct = null;
+  }
+
+  /**
+   * Başlatmadan önce oyun/Steam/BattlEye (oyun portu..+4) ve RCON UDP portları boş mu?
+   * Başka bir arma3server (TADST ile açılmış ya da arkada kalmış) portları tutuyorsa yeni sunucu başka portlara kayar,
+   * Steam'e kaydolamaz ve oyuncular "Waiting"de kalır; RCON istemcisi de eski sunucuya bağlanıp yenisini "hazır" sanar.
+   * Kendi (az önce kapatılan) süreçlerimiz sayılmaz. Sorgunun kendisi başarısız olursa loglanır ve başlatılır.
+   */
+  private async checkPortsFree(): Promise<void> {
+    if (!this.host.udpPortOwners) return;
+    if (this.mode === 'systemd') {
+      // Kendi servisimiz zaten çalışıyorsa (systemctl start bir şey yapmaz) portları o tutuyordur
+      const st = await this.host.systemd!.status(this.unitName).catch(() => null);
+      if (st && (st.activeState === 'active' || st.activeState === 'activating' || st.activeState === 'deactivating')) return;
+    }
+    const ports = usedPorts(this.profile).map((p) => p.port);
+    const own = new Set<number>(this.lastOwnPids);
+    if (this.direct) [this.direct.pid, ...this.direct.headless.map((h) => h.pid)].forEach((p) => own.add(p));
+    // Yerelde uygulamanın kendi süreci de "bizim" (ör. testlerdeki sahte RCON sunucusu)
+    if (this.host.kind === 'local') own.add(process.pid);
+    for (let attempt = 0; ; attempt++) {
+      let owners: UdpPortOwner[];
+      try {
+        owners = await this.host.udpPortOwners(ports);
+      } catch (err) {
+        this.appLog(`Port kontrolü yapılamadı, yine de başlatılıyor: ${(err as Error)?.message ?? err}`);
+        return;
+      }
+      if (this.disposed) return;
+      const conflicts = owners.filter((o) => o.pid === undefined || !own.has(o.pid));
+      if (!conflicts.length) return;
+      if (attempt >= this.t.portRecheckCount) throw new PortInUseError(conflicts);
+      // Az önce kapanan bir süreç portu kısa süre tutabilir: biraz bekleyip yeniden bak
+      await sleep(this.t.portRecheckMs);
+      if (this.disposed) return;
     }
   }
 
@@ -918,7 +1040,58 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     return own.includes(base) || base.endsWith('.arma3profile');
   }
 
+  /**
+   * Başlatırken ve çalışırken sunucu logundaki bilinen sorunlar: kullanıcı uyarılır (her biri çalıştırma başına bir kez),
+   * sunucu kapatılmaz.
+   */
+  private detectLogWarnings(lines: string[]) {
+    if (this.status !== 'starting' && this.status !== 'running') return;
+    for (const line of lines) {
+      if (STEAM_INIT_FAILED_RE.test(line)) {
+        this.logWarning(
+          'steamInit',
+          true,
+          'Steam sunucusu başlatılamadı ("Initializing Steam server failed"): sunucu Steam\'e kaydolamadı, oyuncular "Waiting" ekranında kalıp giremeyebilir. Büyük olasılıkla oyun/Steam portları başka bir sunucu tarafından kullanılıyor (ör. TADST ile açılmış ya da arkada kalmış bir arma3server) ya da güvenlik duvarı engelliyor. Diğer sunucuyu kapatıp yeniden başlat.',
+          'Steam server failed to initialize ("Initializing Steam server failed"): the server could not register with Steam, players may get stuck on "Waiting" and fail to join. Most likely the game/Steam ports are used by another server (e.g. started by TADST or a leftover arma3server) or blocked by a firewall. Close the other server and restart.',
+        );
+        continue;
+      }
+      const be = BE_BIND_FAILED_RE.exec(line);
+      if (be) {
+        const want = be[1] ?? '?';
+        const got = be[2] ?? '?';
+        this.logWarning(
+          'beBind',
+          true,
+          `BattlEye portu ${want} kullanılamadı, sunucu ${got} portuna geçti: oyuncular bağlanamayabilir. Büyük olasılıkla portlar başka bir sunucu tarafından kullanılıyor (ör. TADST ile açılmış ya da arkada kalmış bir arma3server) ya da güvenlik duvarı engelliyor. Diğer sunucuyu kapatıp yeniden başlat.`,
+          `BattlEye port ${want} was not available, the server bound to ${got} instead: players may not be able to connect. Most likely the ports are used by another server (e.g. started by TADST or a leftover arma3server) or blocked by a firewall. Close the other server and restart.`,
+        );
+        continue;
+      }
+      if (STEAM_QUERY_OVERFLOW_RE.test(line)) {
+        this.logWarning(
+          'steamQueryOverflow',
+          false,
+          `Steam sorgu verisi taştı ("Steam Query data overflow"): mod/imza listesi oyunculara doğru gönderilemiyor. Bağlantı ayarlarındaki "Steam sorgu veri boyutu"nu (steamProtocolMaxDataSize, şu an ${this.profile.connection.steamProtocolMaxDataSize}) 4096 yap ya da kullanılmayan modları kaldır.`,
+          `Steam query data overflow ("Steam Query data overflow"): the mod/signature list cannot be sent to clients correctly. Raise "Steam query data size" (steamProtocolMaxDataSize, currently ${this.profile.connection.steamProtocolMaxDataSize}) in the connection settings to 4096 or remove unused mods.`,
+        );
+      }
+    }
+  }
+
+  private logWarning(key: string, setLastError: boolean, tr: string, en: string) {
+    if (this.logWarningsShown.has(key)) return;
+    this.logWarningsShown.add(key);
+    if (setLastError) {
+      this.lastError = tr;
+      this.lastErrorI18n = { tr, en };
+      this.emitStatus();
+    }
+    this.notice('warning', tr, en);
+  }
+
   private inspectServerLines(lines: string[]) {
+    this.detectLogWarnings(lines);
     const lateWindow = Date.now() < this.lateFatalUntil;
     // Ölümcül hata yalnızca başlatma sırasında (ya da süreç kapandıktan hemen sonra) aranır.
     // Çalışan bir sunucuya bağlanırken tekrar okunan eski satırlar sunucuyu öldürmemeli.
@@ -1147,7 +1320,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
         );
         throw new Error(`Sunucunun kapandığı doğrulanamadı; tekrar dene (${msg})`);
       }
-      this.direct = null;
+      this.clearDirect();
       await this.host.remove(this.paths.stateFile).catch(() => undefined);
     }
     this.stopPending = false;
@@ -1227,7 +1400,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       for (const hc of d.headless) await this.killAndWait(hc.pid, hc.marker ?? this.markerFor(hc.index), d.executable).catch(() => undefined);
     }
     if (this.direct !== d) return;
-    this.direct = null;
+    this.clearDirect();
     this.stopPending = false;
     await this.host.remove(this.paths.stateFile).catch(() => undefined);
     this.stopRcon();
@@ -1309,6 +1482,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
     }
     this.fatalDetail = null;
     this.recentServerLines = [];
+    this.logWarningsShown.clear();
     this.rconCfg = this.rconSnapshotFrom(this.profile);
     this.appLog('Çalışan sunucu bulundu, takip ediliyor');
     this.startTails('attach');
@@ -1708,7 +1882,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       this.autoRestarts++;
       this.notify('crash', title, `${text ? `${text}\n` : ''}Otomatik yeniden başlatılıyor (${sup.restartDelaySec} sn).`);
       this.setStatus('restarting');
-      this.direct = null;
+      this.clearDirect();
       await sleep(sup.restartDelaySec * 1000);
       if (this.cancelled(gen) || this.status !== 'restarting') return;
       // Yeni çalıştırmanın ölümcül hatası yakalanabilsin
@@ -1727,7 +1901,7 @@ export class ServerManager extends EventEmitter<ManagerEvents> {
       if (!fatal && sup.autoRestart) {
         this.notice('error', 'Bir saat içinde çok fazla çökme: otomatik restart durduruldu.', 'Too many crashes within an hour: auto restart paused.');
       }
-      this.direct = null;
+      this.clearDirect();
       await this.host.remove(this.paths.stateFile).catch(() => undefined);
       if (this.cancelled(gen)) return;
       this.stopTails();

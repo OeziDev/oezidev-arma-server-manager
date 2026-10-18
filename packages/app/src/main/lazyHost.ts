@@ -102,6 +102,9 @@ export class LazySshHost implements Host {
   getRemoteTime(): Promise<number> {
     return this.call((h) => h.getRemoteTime());
   }
+  udpPortOwners(ports: number[]): Promise<{ port: number; pid?: number; process?: string }[]> {
+    return this.call((h) => h.udpPortOwners(ports));
+  }
   exists(p: string): Promise<boolean> {
     return this.call((h) => h.exists(p));
   }

@@ -213,7 +213,7 @@ export const tr = {
   'help.connection.upnp': 'Modemde portları otomatik açmayı dener. Sunucu bir VPS ise kapalı bırak.',
   'field.connection.loopback': 'Loopback (yerel test)',
   'field.connection.steamProtocolMaxDataSize': 'Steam sorgu veri boyutu',
-  'help.connection.steamProtocolMaxDataSize': 'Çok modlu sunucular listede görünmüyorsa artır (ör. 8192).',
+  'help.connection.steamProtocolMaxDataSize': 'Varsayılan 1024. Çok modlu sunucularda (20+ mod) 4096 yap: yoksa "Steam Query data overflow" olur, oyuncular mod/imza listesini eksik alır ve sunucu listede görünmeyebilir.',
   'field.missions.autoSelectMission': 'Görevi otomatik seç',
   'field.missions.randomMissionOrder': 'Rastgele sıra',
   'field.missions.forcedDifficulty': 'Zorunlu zorluk',
@@ -601,6 +601,7 @@ export const tr = {
   'nav.save': 'Kaydet ve devam et',
 
   // başlatma hatası
+  'head.serverWarning': 'Sunucu uyarısı',
   'head.lastError': 'Sunucu başlatılamadı',
   'head.lastErrorValidation': 'Kontrollerde hata olduğu için başlatma engellendi. Genel bakış sekmesindeki hataları düzeltip tekrar dene.',
   'head.showIssues': 'Kontrolleri göster',

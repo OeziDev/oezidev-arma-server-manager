@@ -15,6 +15,9 @@ export interface Issue {
   message: Record<Lang, string>;
 }
 
+/** Bu kadar moddan fazlasında steamProtocolMaxDataSize = 1024 genelde yetmez */
+const STEAM_QUERY_MOD_LIMIT = 20;
+
 const issue = (code: string, severity: Severity, tr: string, en: string, path?: string): Issue => ({
   code,
   severity,
@@ -137,6 +140,21 @@ export function validateProfile(p: ServerProfile, os?: HostOs, others: ServerPro
   const both = p.launch.mods.filter((m) => m.enabled && p.launch.serverMods.some((s) => s.enabled && s.path.toLowerCase() === m.path.toLowerCase()));
   for (const m of both) {
     out.push(issue('mods.inBoth', 'warning', `"${m.path}" hem -mod hem -serverMod listesinde.`, `"${m.path}" is in both -mod and -serverMod.`, 'launch.serverMods'));
+  }
+
+  // Steam sorgu verisi: çok modlu sunucuda varsayılan 1024 bayt yetmez. Sunucu logunda
+  // "Steam Query data overflow" çıkar, oyunculara mod/imza listesi eksik gider ("Waiting"/bağlanamama).
+  const enabledModCount = p.launch.mods.filter((m) => m.enabled).length + p.launch.serverMods.filter((m) => m.enabled).length;
+  if (enabledModCount > STEAM_QUERY_MOD_LIMIT && p.connection.steamProtocolMaxDataSize <= 1024) {
+    out.push(
+      issue(
+        'connection.steamQuerySize',
+        'warning',
+        `${enabledModCount} mod açık ama "Steam sorgu veri boyutu" ${p.connection.steamProtocolMaxDataSize}: Steam sorgu verisi taşabilir ("Steam Query data overflow"), oyunculara mod/imza listesi eksik gider. 4096 yap.`,
+        `${enabledModCount} mods are enabled but "Steam query data size" is ${p.connection.steamProtocolMaxDataSize}: the Steam query data may overflow ("Steam Query data overflow") and clients get an incomplete mod/signature list. Set it to 4096.`,
+        'connection.steamProtocolMaxDataSize',
+      ),
+    );
   }
 
   // Ağ / performans

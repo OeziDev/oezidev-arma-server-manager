@@ -20,6 +20,16 @@ import {
 } from './types.js';
 import { createSystemdApi } from './systemd.js';
 import { followWithRestart } from './follow.js';
+import {
+  LINUX_UDP_PORTS_COMMAND,
+  type UdpPortOwner,
+  normalizePorts,
+  parseLinuxUdpPortsOutput,
+  parseTasklistCsv,
+  parseWinNetstat,
+  parseWinUdpPortsOutput,
+  winUdpPortsScript,
+} from './ports.js';
 import os from 'node:os';
 import {
   LinuxCpuTracker,
@@ -529,6 +539,33 @@ export class LocalHost implements Host {
 
   async getRemoteTime(): Promise<number> {
     return Date.now();
+  }
+
+  /**
+   * UDP portlarını dinleyen süreçler. Windows: tek PowerShell (Get-NetUDPEndpoint + Get-Process),
+   * yoksa netstat -ano + tasklist. Linux: ss -Hlunp (yoksa netstat -lunp).
+   */
+  async udpPortOwners(ports: number[]): Promise<UdpPortOwner[]> {
+    const list = normalizePorts(ports);
+    if (!list.length) return [];
+    if (isWin) {
+      const ps = await this.exec('powershell', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encodePowerShellCommand(winUdpPortsScript(list))], {
+        timeoutMs: 20000,
+      }).catch(() => null);
+      const parsed = ps ? parseWinUdpPortsOutput(ps.stdout, list) : null;
+      if (Array.isArray(parsed)) return parsed;
+      // Get-NetUDPEndpoint yok ya da PowerShell çalışmadı: netstat
+      const ns = await this.exec('netstat', ['-ano', '-p', 'UDP'], { timeoutMs: 20000 });
+      if (ns.code !== 0) throw new HostError(`Port sorgulanamadı (netstat): ${(ns.stderr || ns.stdout).trim()}`, 'query_failed');
+      const rows = parseWinNetstat(ns.stdout, list);
+      if (!rows.some((r) => r.pid)) return rows;
+      const tl = await this.exec('tasklist', ['/FO', 'CSV', '/NH'], { timeoutMs: 15000 }).catch(() => null);
+      const names = tl && tl.code === 0 ? parseTasklistCsv(tl.stdout) : new Map<number, string>();
+      return rows.map((r) => (r.pid && names.has(r.pid) ? { ...r, process: names.get(r.pid)! } : r));
+    }
+    const res = await this.exec('sh', ['-c', LINUX_UDP_PORTS_COMMAND], { timeoutMs: 15000 });
+    if (res.code !== 0) throw new HostError(`Port sorgulanamadı: ${(res.stderr || res.stdout).trim()}`, 'query_failed');
+    return parseLinuxUdpPortsOutput(res.stdout, list);
   }
 
   private linuxCpu = new LinuxCpuTracker();

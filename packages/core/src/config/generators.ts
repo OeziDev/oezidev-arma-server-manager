@@ -216,9 +216,10 @@ export function generateServerCfg(p: ServerProfile, opts: GenerateOptions = {}):
       e.push(v('allowedVotedAdminCmds', []));
     }
   } else {
-    // Oylamayı tamamen kapat: izinli oy komutu yok + eşik %150 (ulaşılamaz).
+    // Oylamayı tamamen kapat: izinli oy komutu yok (asıl kapatan budur) + eşik %100.
+    // Arma 0..1 dışındaki eşiği reddedip 0.5'e düşer ("VoteThreshold must be in 0..1 range"), bu yüzden 1.5 yazılmaz.
     e.push(v('allowedVoteCmds', []));
-    e.push(v('voteThreshold', 1.5));
+    e.push(v('voteThreshold', 1));
   }
 
   e.push(blank(), comment('--- Sesli iletişim (VoN) ---'));

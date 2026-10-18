@@ -204,9 +204,11 @@ function importServerCfgUnsafe(text: string, base?: ServerProfile): ImportResult
   let voteCmdsMapped = Array.isArray(voteCmds) && voteCmds.length === 0;
   // Oylama ayarlarına sadece cfg oylamadan bahsediyorsa dokun (mevcut profilin ayarı korunur).
   if (threshold !== undefined || voteCmds !== undefined) {
+    // Eski sürümlerin yazdığı 1.5 (eşik > 1) ve boş allowedVoteCmds[] oylamanın kapalı olduğu anlamına gelir.
     const votingOff = (threshold !== undefined && threshold > 1) || (Array.isArray(voteCmds) && voteCmds.length === 0);
     voting.enabled = !votingOff;
-    if (threshold !== undefined && threshold <= 1) voting.voteThreshold = threshold;
+    // Kapalı oylamanın yazdığı eşik 1, profildeki (oylama açılınca kullanılacak) eşiği ezmesin.
+    if (threshold !== undefined && threshold <= 1 && !(votingOff && threshold === 1)) voting.voteThreshold = threshold;
     if (!votingOff) {
       if (voteCmds === undefined) {
         // Liste yoksa Arma her oy komutuna, #vote admin dahil, izin verir.

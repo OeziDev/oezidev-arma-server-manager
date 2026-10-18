@@ -247,7 +247,7 @@ export function ServerView({ id, tab, onTab, onNavigate }: { id: string; tab: Ta
   const hostAddr = saved.hostId === 'local' ? '127.0.0.1' : hosts.find((h) => h.id === saved.hostId)?.host ?? '?';
   const errorCount = Object.keys(errors).length + issues.filter((i) => i.severity === 'error').length;
   const jobHint = jobActive ? t('job.activeHint') : undefined;
-  const lastError = status?.lastError;
+  const lastError = lang === 'en' && status?.lastErrorEn ? status.lastErrorEn : status?.lastError;
 
   const ensureSaved = async () => !dirty || (await save());
 
@@ -370,7 +370,8 @@ export function ServerView({ id, tab, onTab, onNavigate }: { id: string; tab: Ta
       {lastError && hiddenError !== lastError && (
         <div className="error-box" role="alert">
           <div className="error-box-head">
-            <strong>{t('head.lastError')}</strong>
+            {/* Çalışırken (ör. Steam/BattlEye port uyarısı) "başlatılamadı" yazmasın */}
+            <strong>{t(running && lastError !== 'validation' ? 'head.serverWarning' : 'head.lastError')}</strong>
             <span className="spacer" />
             {lastError === 'validation' && tab !== 'overview' && (
               <Button size="sm" onClick={() => onTab('overview')}>
