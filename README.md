@@ -4,6 +4,8 @@
 
 # OeziDev Arma Server Manager
 
+**🇹🇷 Türkçe** · [🇬🇧 English](README.en.md) · [🇩🇪 Deutsch](README.de.md)
+
 Arma 3 dedicated sunucularını tek yerden kurmak, yapılandırmak, başlatmak ve izlemek için masaüstü uygulaması.<br>
 Windows'ta çalışır; aynı uygulamadan hem bu bilgisayardaki sunucuları hem de SSH ile uzaktaki Linux VPS sunucularını yönetir.
 
@@ -39,7 +41,7 @@ Windows'ta çalışır; aynı uygulamadan hem bu bilgisayardaki sunucuları hem 
 
 **Yapılandırma**
 - server.cfg, basic.cfg, Arma3Profile (zorluk) ve BattlEye cfg'yi tek profilden üretir. Tırnaklar doğru kaçırılır, sayılar her dilde nokta ile yazılır.
-- Zorluk ayarları Arma 3'ün gerçek değerleriyle: 0/1/2 (kapalı / yakında / her zaman, 3. şahıs "sadece araç" dahil).
+- Zorluk ayarları Arma 3'ün gerçek değerleriyle: 0/1/2 (kapalı / yakın mesafe / her zaman, 3. şahıs "sadece araç" dahil).
 - `kickClientsOnSlowNetwork[]`, `kickTimeout[]`, `admins[]`, `AdvancedOptions`, görev parametreleri (`class Params`), izinli görev listesi.
 - Arayüzde olmayan her şey için "ek satırlar": yazarken sözdizimi kontrol edilir, bozuk config sunucuya gitmez.
 - Mevcut server.cfg (TADST dahil) ve Arma3Profile içe aktarma. Tanınmayan satırlar kaybolmaz.
@@ -53,13 +55,15 @@ Windows'ta çalışır; aynı uygulamadan hem bu bilgisayardaki sunucuları hem 
 - Zamanlı restart: günlük saatler, oyunculara RCON ile geri sayım mesajları, istenirse restart sırasında SteamCMD ile güncelleme.
 - Uygulama yeniden açılınca çalışan sunucuları bulur ve takibe devam eder. Aynı exe ile çalışan başka profillerin süreçleri karıştırılmaz.
 
-**Performans ve takip** (1.1)
+**Performans ve takip**
 - Performans paneli: sunucu FPS'i, CPU, RAM, oyuncu, AI, grup ve araç sayısı; 15 dk ile 24 saat arası grafikler. FPS, uygulamanın kendi eklediği küçük sunucu modu `@oezi_monitor` ile ölçülür (imza gerektirmez, oyuncular indirmez).
 - FPS uzun süre düşük kalırsa uyarı (isteğe bağlı Discord bildirimi).
 - Discord durum mesajı: kanalda kendini güncelleyen tek mesaj (durum, oyuncular, FPS, sonraki restart).
 - Oyuncu geçmişi: kim ne zaman girdi/çıktı, toplam süre, kullandığı isimler, notlar; GUID/IP ile tek sunucuda ya da bütün sunucularda ban.
 - Zamanlı yedekleme: profil, görevler, BattlEye, anahtarlar, ek klasörler ve MySQL dökümü; eski yedekler otomatik silinir.
 - Otomatik duyurular (RCON), Windows açılınca uygulamayı başlatma, uygulama açılınca sunucuyu otomatik başlatma.
+- Başlatmadan önce port kontrolü: oyun/RCON portlarını başka bir program (ör. TADST ile açılmış bir sunucu) tutuyorsa hangisi olduğunu söyler ve başlatmaz.
+- Askeri tarzda geçiş animasyonları, açılış ekranı ve vurgu efektleri (Ayarlar → Animasyonlar ile kapatılabilir).
 
 **Konsol ve RCON**
 - Canlı log (Windows'ta RPT, Linux'ta journald), filtre, hata/uyarı renklendirme, RCON komut satırı.
